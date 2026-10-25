@@ -194,12 +194,29 @@ pub fn write_all(run_dir: &Path, config: &Config, facts: &Facts) -> Result<(), S
     Ok(())
 }
 
+/// What to do when the running policy is stale. Only the drift messages use it.
+const RESTART: &str = "restart the gateway (docker compose restart gateway)";
+
 /// How a network's running policy compares with the one the config now gives.
 #[derive(Debug)]
 pub enum Drift {
     Matches,
     Differs,
     Unreadable(io::Error),
+}
+
+impl Drift {
+    /// The one wording of this outcome for network `key`, whose config is at `config`.
+    pub fn message(&self, key: &str, config: &Path) -> String {
+        let config = config.display();
+        match self {
+            Drift::Matches => format!("network {key}: running policy matches {config}"),
+            Drift::Differs => {
+                format!("network {key}: running policy differs from {config}; {RESTART}")
+            }
+            Drift::Unreadable(e) => format!("network {key}: cannot read the running policy: {e}"),
+        }
+    }
 }
 
 /// Compares each configured network's running policy with the one `config` now gives,
@@ -214,7 +231,7 @@ pub fn drift(
     let running: Vec<&str> = facts.networks.keys().map(String::as_str).collect();
     if configured != running {
         return Err(format!(
-            "networks [{}] differ from the running networks [{}]",
+            "networks [{}] differ from the running networks [{}]; {RESTART}",
             configured.join(", "),
             running.join(", ")
         ));
@@ -593,7 +610,25 @@ mod tests {
         let err = drift(&config(TWO), &f, dir.path()).unwrap_err();
         assert_eq!(
             err,
-            "networks [api, workers] differ from the running networks [workers]"
+            "networks [api, workers] differ from the running networks [workers]; restart the gateway (docker compose restart gateway)"
+        );
+    }
+
+    #[test]
+    fn drift_messages() {
+        let config = Path::new("/etc/egress/config.local.yaml");
+        assert_eq!(
+            Drift::Matches.message("workers", config),
+            "network workers: running policy matches /etc/egress/config.local.yaml"
+        );
+        assert_eq!(
+            Drift::Differs.message("workers", config),
+            "network workers: running policy differs from /etc/egress/config.local.yaml; restart the gateway (docker compose restart gateway)"
+        );
+        let missing = io::Error::new(io::ErrorKind::NotFound, "gone");
+        assert_eq!(
+            Drift::Unreadable(missing).message("mini-op", config),
+            "network mini-op: cannot read the running policy: gone"
         );
     }
 }

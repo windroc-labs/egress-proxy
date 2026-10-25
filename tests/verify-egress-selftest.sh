@@ -374,9 +374,9 @@ expect old_gateway "$out" 1 "FAIL plan egress-gateway: the gateway image has no 
 
 scenario drift_message
 echo 2 >"$FAKE/plan.rc"
-echo "gateway: network workers: running policy differs from the config; restart the gateway (docker compose restart gateway)" >"$FAKE/plan.err"
+echo "gateway: network workers: running policy differs from /etc/egress/config.local.yaml; restart the gateway (docker compose restart gateway)" >"$FAKE/plan.err"
 out=$(run workers)
-expect drift_message "$out" 1 "FAIL plan egress-gateway: gateway: network workers: running policy differs from the config; restart the gateway (docker compose restart gateway), want a plan"
+expect drift_message "$out" 1 "FAIL plan egress-gateway: gateway: network workers: running policy differs from /etc/egress/config.local.yaml; restart the gateway (docker compose restart gateway), want a plan"
 
 # malformed <case> <plan line> <reason>: the line fails `plan` before any probe runs.
 malformed() {

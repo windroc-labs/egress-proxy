@@ -101,7 +101,10 @@ fn drift_refused() {
     assert!(out.stdout.is_empty());
     assert_eq!(
         text(&out.stderr),
-        "gateway: network mini-op: running policy differs from the config; restart the gateway (docker compose restart gateway)\n"
+        format!(
+            "gateway: network mini-op: running policy differs from {}; restart the gateway (docker compose restart gateway)\n",
+            state.config.display()
+        )
     );
 }
 

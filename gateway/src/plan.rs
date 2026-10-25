@@ -12,7 +12,6 @@ use ipnet::IpNet;
 use crate::cli::Opts;
 use crate::config::{self, Config, HostPort, Mode, Network, listen_alias};
 use crate::facts::{self, Facts, HOST_DOCKER_INTERNAL};
-use crate::health::RESTART;
 use crate::policy::{self, DENY_FLOOR, Drift};
 
 /// What verify-egress learns on the host.
@@ -416,22 +415,9 @@ fn make(opts: &Opts) -> Result<Vec<Check>, String> {
     let config = config::load_served(&opts.config, opts.advertised.as_deref())?;
     let facts =
         facts::read(&opts.run_dir.join("facts.json")).map_err(|e| format!("not started: {e}"))?;
-    let outcomes =
-        policy::drift(&config, &facts, &opts.run_dir).map_err(|e| format!("{e}; {RESTART}"))?;
-    for (network, outcome) in outcomes {
-        match outcome {
-            Drift::Matches => {}
-            Drift::Differs => {
-                return Err(format!(
-                    "network {network}: running policy differs from the config; {RESTART}"
-                ));
-            }
-            Drift::Unreadable(e) => {
-                return Err(format!(
-                    "network {network}: cannot read the running policy: {e}"
-                ));
-            }
-        }
+    let outcomes = policy::drift(&config, &facts, &opts.run_dir)?;
+    if let Some((network, outcome)) = outcomes.iter().find(|(_, o)| !matches!(o, Drift::Matches)) {
+        return Err(outcome.message(network, &opts.config));
     }
     plan(key, &config, &facts, &opts.host)
 }

@@ -16,7 +16,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// may still be connecting when this runs out.
 const PROBE_WAIT: Duration = Duration::from_secs(3);
 const DENIED: u16 = 407;
-pub const RESTART: &str = "restart the gateway (docker compose restart gateway)";
 
 struct Line {
     ok: bool,
@@ -51,7 +50,7 @@ fn check(opts: &Opts) -> Vec<Line> {
     };
     let outcomes = match policy::drift(&config, &facts, &opts.run_dir) {
         Ok(o) => o,
-        Err(e) => return vec![fail(format!("{e}; {RESTART}"))],
+        Err(e) => return vec![fail(e)],
     };
     let mut lines: Vec<Line> = outcomes
         .into_iter()
@@ -76,18 +75,11 @@ fn check(opts: &Opts) -> Vec<Line> {
 }
 
 fn policy_line(opts: &Opts, key: &str, outcome: Drift) -> Line {
-    match outcome {
-        Drift::Matches => ok(format!(
-            "network {key}: running policy matches {}",
-            opts.config.display()
-        )),
-        Drift::Differs => fail(format!(
-            "network {key}: running policy differs from {}; {RESTART}",
-            opts.config.display()
-        )),
-        Drift::Unreadable(e) => fail(format!(
-            "network {key}: cannot read the running policy: {e}"
-        )),
+    let text = outcome.message(key, &opts.config);
+    if matches!(outcome, Drift::Matches) {
+        ok(text)
+    } else {
+        fail(text)
     }
 }
 
