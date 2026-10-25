@@ -266,3 +266,27 @@ fn network_added_without_restart_fails() {
         "{out}"
     );
 }
+
+#[test]
+fn exception_drift_fails() {
+    let with_exception = |entry: &str| {
+        format!(
+            "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"{entry}\"]\n"
+        )
+    };
+    let s = started(
+        &with_exception("192.168.1.20:11434"),
+        fake_proxy(Answer::Policy),
+    );
+    let (code, out) = check(&s);
+    assert_eq!(code, Some(0), "{out}");
+    for changed in ["192.168.1.20:11435", "nas.lan:11434"] {
+        fs::write(&s.config, with_exception(changed)).unwrap();
+        let (code, out) = check(&s);
+        assert_eq!(code, Some(1), "{changed}: {out}");
+        assert!(
+            out.contains("FAIL network workers: running policy differs from"),
+            "{changed}: {out}"
+        );
+    }
+}
