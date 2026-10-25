@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use gateway::cli::{self, Mode};
-use gateway::{health, render, supervise};
+use gateway::{health, plan, render, supervise};
 
 fn main() -> ExitCode {
     let opts = match cli::parse_args(
@@ -18,6 +18,7 @@ fn main() -> ExitCode {
         Mode::Run => supervise::run(&opts),
         Mode::Health => health::run(&opts),
         Mode::Compose => render::run(&opts),
+        Mode::Plan => plan::run(&opts),
     };
     ExitCode::from(code)
 }

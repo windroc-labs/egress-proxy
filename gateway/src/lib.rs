@@ -6,6 +6,7 @@ pub mod config;
 pub mod facts;
 pub mod files;
 pub mod health;
+pub mod plan;
 pub mod policy;
 pub mod render;
 pub mod supervise;
