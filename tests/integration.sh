@@ -190,7 +190,7 @@ state() {
   docker network inspect --format '{{.Id}}' egress-workers egress-uplink
 }
 before=$(state)
-compose up -d --build --quiet-pull
+compose up -d --quiet-pull
 [[ $(state) == "$before" ]] || fail up_idempotent "before: $before; after: $(state)"
 ok up_idempotent
 

@@ -17,10 +17,11 @@ There is no management command: the gateway applies its config at start.
 
 1. Copy the example config and edit it:
    `mkdir -p ~/.egress && cp config.example.yaml ~/.egress/config.local.yaml`
-2. From this checkout: `docker compose up -d --build`
+2. From this checkout: `docker compose up -d` (builds the image the first time)
 
-The start command is idempotent: run it again (or after pulling a new version of this
-repo) and it changes only what changed. `restart: unless-stopped` brings the gateway back
+The start command is idempotent: running it again changes nothing. After pulling a new
+version of this repo, upgrade with `docker compose up -d --build`, which rebuilds the
+image and recreates the container. `restart: unless-stopped` brings the gateway back
 after a crash, a Docker Desktop restart, or a Mac restart (with Docker Desktop set to start
 at login).
 
@@ -28,7 +29,8 @@ at login).
 
 | Task | Command |
 | --- | --- |
-| Start or upgrade | `docker compose up -d --build` |
+| Start (idempotent) | `docker compose up -d` |
+| Upgrade after a pull | `docker compose up -d --build` |
 | Apply a config change | `docker compose restart gateway` |
 | Health | `docker ps --filter name=egress-gateway` (status column), `docker inspect --format '{{json .State.Health}}' egress-gateway` |
 | Logs (config errors name the network and key) | `docker logs egress-gateway` |
