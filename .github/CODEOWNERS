@@ -1,0 +1,5 @@
+# Changes to CI, the repo checks, and the toolchain pin need the user's review.
+/.github/ @windroc
+/tests/check-repo.sh @windroc
+/tests/check-repo-selftest.sh @windroc
+/rust-toolchain.toml @windroc

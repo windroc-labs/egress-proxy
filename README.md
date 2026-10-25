@@ -161,9 +161,11 @@ run `./verify-egress workers`, `./verify-egress mini-op` and `./verify-egress --
   daemon).
 - Docker end-to-end: `tests/integration.sh` runs in CI only (Linux; it restarts the
   Docker daemon and uses a throwaway Docker client config).
-- CI (`.github/workflows/ci.yml`) runs the jobs `rust`, `lint` and `integration` on every
-  pull request. Make all three required status checks for `main` in the repo's branch
-  protection settings.
+- CI (`.github/workflows/ci.yml`) runs on every pull request and push to `main`.
+  Set `CI` as the only required status check in the `main` branch ruleset. It aggregates
+  `rust`, `lint` and `integration`, and fails if any dependency fails, is cancelled or is
+  skipped. When adding a job, add it to `ci.needs`; the `lint` job checks completeness
+  with `.github/check_ci_needs.py` (requires `PyYAML==6.0.2`).
 
 ## Manual checks (Mac)
 

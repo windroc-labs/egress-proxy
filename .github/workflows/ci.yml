@@ -1,5 +1,5 @@
 # Every pull request: build and test the entrypoint, lint the repo, build the image and
-# run the Docker end-to-end checks. Every job must pass before merge.
+# run the Docker end-to-end checks. CI aggregates every job for branch protection.
 name: ci
 
 on:
@@ -41,6 +41,11 @@ jobs:
         with:
           persist-credentials: false
       - run: shellcheck tests/*.sh start.sh verify-egress
+      - name: Check aggregate job dependencies
+        run: |
+          python3 -m pip install PyYAML==6.0.2
+          python3 -B -m unittest discover -s .github -p test_ci_needs.py -v
+          python3 -B .github/check_ci_needs.py
       - run: tests/check-repo.sh
       - run: tests/check-repo-selftest.sh
       - run: tests/verify-egress-selftest.sh
@@ -65,3 +70,17 @@ jobs:
         with:
           persist-credentials: false
       - run: tests/integration.sh
+
+  ci:
+    name: CI
+    needs: [rust, lint, integration]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fail when a needed job failed, was cancelled or was skipped
+        if: >-
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled') ||
+          contains(needs.*.result, 'skipped')
+        run: exit 1
