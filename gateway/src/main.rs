@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use gateway::cli::{self, Mode};
-use gateway::supervise;
+use gateway::{health, supervise};
 
 fn main() -> ExitCode {
     let opts = match cli::parse_args(std::env::args().skip(1)) {
@@ -13,10 +13,7 @@ fn main() -> ExitCode {
     };
     let code = match opts.mode {
         Mode::Run => supervise::run(&opts),
-        Mode::Health => {
-            eprintln!("gateway: health is not available yet");
-            2
-        }
+        Mode::Health => health::run(&opts),
     };
     ExitCode::from(code)
 }

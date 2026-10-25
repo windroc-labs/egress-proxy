@@ -208,6 +208,15 @@ pub fn check_advertised(
     })
 }
 
+/// Loads the config at `path` and checks it serves exactly the networks in
+/// `advertised` (the unparsed `EGRESS_NETWORKS`).
+pub fn load_served(path: &Path, advertised: Option<&str>) -> Result<Config, String> {
+    let advertised = parse_advertised(advertised)?;
+    let config = load(path).map_err(|e| e.to_string())?;
+    check_advertised(path, &config, &advertised).map_err(|e| e.to_string())?;
+    Ok(config)
+}
+
 /// Parses `EGRESS_NETWORKS`: comma-separated network keys.
 pub fn parse_advertised(value: Option<&str>) -> Result<Vec<String>, String> {
     let value = value.ok_or("EGRESS_NETWORKS is not set (compose.yaml sets it)")?;

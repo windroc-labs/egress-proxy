@@ -28,7 +28,8 @@ struct Child {
 /// Runs the gateway; returns the process exit code: 0 after SIGTERM or SIGINT, 1 when
 /// a smokescreen exits or cannot start, 2 on a config or environment error.
 pub fn run(opts: &Opts) -> u8 {
-    let config = match load_checked(opts) {
+    let advertised = std::env::var("EGRESS_NETWORKS").ok();
+    let config = match config::load_served(&opts.config, advertised.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("gateway: {e}");
@@ -107,13 +108,6 @@ pub fn run(opts: &Opts) -> u8 {
             }
         }
     }
-}
-
-fn load_checked(opts: &Opts) -> Result<Config, String> {
-    let advertised = config::parse_advertised(std::env::var("EGRESS_NETWORKS").ok().as_deref())?;
-    let config = config::load(&opts.config).map_err(|e| e.to_string())?;
-    config::check_advertised(&opts.config, &config, &advertised).map_err(|e| e.to_string())?;
-    Ok(config)
 }
 
 fn prepare(opts: &Opts, config: &Config) -> Result<Facts, String> {
