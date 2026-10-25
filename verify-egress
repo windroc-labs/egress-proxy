@@ -291,14 +291,14 @@ allowed_from() {
 }
 
 run_tools() {
-  local user version tool_c tool_ip out i tool line start end status result differs="" skipped="" date
+  local user image_id tool_c tool_ip out i tool line start end status result differs="" skipped="" date
   user=$(docker image inspect --format '{{.Config.User}}' "$image" 2>/dev/null) ||
     stop tools_image "$image" "image $image is not local" "a local image"
   user=${user%%:*}
   [[ -n $user && $user != root && $user != 0 ]] || stop tools_image "$image" "image runs as root" "a non-root user"
-  version=$(docker image inspect --format "{{index .Config.Labels \"$version_label\"}}" "$image" 2>/dev/null || true)
-  [[ -n $version && $version != "<no value>" ]] || version=unknown
-  pass tools_image "$image" "user $user, version $version"
+  image_id=$(docker image inspect --format '{{.Id}}' "$image" 2>/dev/null || true)
+  [[ -n $image_id ]] || image_id=unknown
+  pass tools_image "$image" "user $user, id $image_id"
 
   tool_c=$(docker run -d --pull never --network "$net_name" \
     -e "HTTP_PROXY=$proxy" -e "HTTPS_PROXY=$proxy" -e "http_proxy=$proxy" -e "https_proxy=$proxy" \
@@ -316,7 +316,7 @@ run_tools() {
   pass tools_run "$image" "$tool_ip on $net_name"
 
   date=$(date -u +%Y-%m-%d)
-  echo "| Tool | Expected | Result | Image version | Date |"
+  echo "| Tool | Expected | Result | Image ID | Date |"
   echo "| --- | --- | --- | --- | --- |"
   i=0
   while ((i < ${#tools[@]})); do
@@ -360,7 +360,7 @@ run_tools() {
         fi
         ;;
     esac
-    echo "| $tool | ${expects[$i]} | $result | $version | $date |"
+    echo "| $tool | ${expects[$i]} | $result | $image_id | $date |"
     i=$((i + 1))
   done
   echo "differs from expected: ${differs:-none}"
@@ -368,10 +368,6 @@ run_tools() {
 }
 
 if [[ $mode == tools ]]; then
-  # The worker image's version label, assembled so tests/check-repo.sh does not take it
-  # for a reference to that repo.
-  a=ensem b=ble
-  version_label="${a}${b}.version"
   run_tools
   exit 0
 fi

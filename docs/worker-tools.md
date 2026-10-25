@@ -24,12 +24,14 @@ and replace the rows below with the rows it prints. Each row is one tool or one 
   `fails: exit <n>` or `fails: timed out` (the gateway allowed the request but the tool
   failed), `not in image`, or `could not run: <reason>`. Results come from exit codes
   and the gateway's log only, never from a tool's output.
+- **Image ID**: the image's ID as `docker image inspect --format '{{.Id}}'` reports it
+  (`sha256:…`), so a row names exactly the image it was tested in.
 - The command's last lines name the rows that differ from the expected result and the
   rows that could not run.
 
 ## Results
 
-| Tool | Expected | Result | Image version | Date |
+| Tool | Expected | Result | Image ID | Date |
 | --- | --- | --- | --- | --- |
 | ssh | fails | not yet tested | not yet tested | not yet tested |
 | git over ssh | fails | not yet tested | not yet tested | not yet tested |

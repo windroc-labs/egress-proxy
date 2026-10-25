@@ -28,7 +28,7 @@ mkdir -p "$work/bin" "$DOCKER_CONFIG"
 #   open       host:port targets a CONNECT tunnel reaches
 #   body       when present, curl also writes a body and a token-like line
 #   calls      every call, with the DOCKER_CONFIG and DOCKER_HOST it saw
-#   image_user, image_version, image_missing   what `docker image inspect` reports
+#   image_user, image_id, image_missing   what `docker image inspect` reports
 #   rows       what the tool container prints; tool_run the `docker run` of it
 #   gwlog      "<unix time>\t<line>" lines `docker logs --since --until` of the gateway serves
 cat >"$work/bin/docker" <<'FAKE'
@@ -92,7 +92,7 @@ case $1 in
     [[ ! -f $FAKE/image_missing ]] || exit 1
     case $4 in
       *'.Config.User'*) cat "$FAKE/image_user" 2>/dev/null || echo 1000:1000 ;;
-      *'.version"'*) cat "$FAKE/image_version" 2>/dev/null || echo 1.2.3 ;;
+      *'{{.Id}}'*) cat "$FAKE/image_id" 2>/dev/null || echo sha256:feedc0de0123456789abcdef ;;
     esac
     ;;
   wait) echo 0 ;;
@@ -431,22 +431,22 @@ scenario tools_results
 } >"$FAKE/gwlog"
 out=$(EGRESS_SELFTEST_TOKEN=sk-ant-SELFTEST-TOKEN run --tools worker:test)
 expect tools_results "$out" 0 \
-  "ok tools_image worker:test user 1000, version 1.2.3" \
-  "| Tool | Expected | Result | Image version | Date |" \
-  "| curl | works | works | 1.2.3 | $today |" \
-  "| wget | works | fails: no proxy used | 1.2.3 | $today |" \
-  "| npm | works | fails: no proxy used | 1.2.3 | $today |" \
-  "| gh | works | works | 1.2.3 | $today |" \
-  "| Claude Code | works | fails: no proxy used | 1.2.3 | $today |" \
-  "| Node fetch | fails | fails: no proxy used | 1.2.3 | $today |" \
-  "| apt-get | works | fails: exit 100 | 1.2.3 | $today |" \
-  "| ssh | fails | not in image | 1.2.3 | $today |" \
-  "| QUIC / HTTP/3 | fails | could not run: no HTTP/3 in curl | 1.2.3 | $today |" \
-  "| Node http | fails | could not run: no runtime | 1.2.3 | $today |" \
-  "| self-resolving program | fails | works | 1.2.3 | $today |" \
-  "| pip | works | fails: timed out | 1.2.3 | $today |" \
-  "| uv | works | fails: no proxy used | 1.2.3 | $today |" \
-  "| Node fetch, NODE_USE_ENV_PROXY=1 | works | fails: exit 1 | 1.2.3 | $today |" \
+  "ok tools_image worker:test user 1000, id sha256:feedc0de0123456789abcdef" \
+  "| Tool | Expected | Result | Image ID | Date |" \
+  "| curl | works | works | sha256:feedc0de0123456789abcdef | $today |" \
+  "| wget | works | fails: no proxy used | sha256:feedc0de0123456789abcdef | $today |" \
+  "| npm | works | fails: no proxy used | sha256:feedc0de0123456789abcdef | $today |" \
+  "| gh | works | works | sha256:feedc0de0123456789abcdef | $today |" \
+  "| Claude Code | works | fails: no proxy used | sha256:feedc0de0123456789abcdef | $today |" \
+  "| Node fetch | fails | fails: no proxy used | sha256:feedc0de0123456789abcdef | $today |" \
+  "| apt-get | works | fails: exit 100 | sha256:feedc0de0123456789abcdef | $today |" \
+  "| ssh | fails | not in image | sha256:feedc0de0123456789abcdef | $today |" \
+  "| QUIC / HTTP/3 | fails | could not run: no HTTP/3 in curl | sha256:feedc0de0123456789abcdef | $today |" \
+  "| Node http | fails | could not run: no runtime | sha256:feedc0de0123456789abcdef | $today |" \
+  "| self-resolving program | fails | works | sha256:feedc0de0123456789abcdef | $today |" \
+  "| pip | works | fails: timed out | sha256:feedc0de0123456789abcdef | $today |" \
+  "| uv | works | fails: no proxy used | sha256:feedc0de0123456789abcdef | $today |" \
+  "| Node fetch, NODE_USE_ENV_PROXY=1 | works | fails: exit 1 | sha256:feedc0de0123456789abcdef | $today |" \
   "differs from expected: self-resolving program, Node fetch, NODE_USE_ENV_PROXY=1, wget, pip, uv, npm, apt-get, Claude Code"
 [[ $out != *SECRET-BODY* && $out != *sk-ant-SELFTEST* ]] || fail tools_no_body_no_token "$out"
 [[ $(grep -c '^| ' <<<"$out") == 33 ]] || fail tools_results "want a header, a separator and 31 rows: $out"

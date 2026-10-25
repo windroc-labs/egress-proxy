@@ -147,7 +147,7 @@ IPv4 address, which verify-egress cannot discover behind NAT.
 
 `./verify-egress --tools <image>` runs each tool of the [worker tool table](docs/worker-tools.md)
 in one container of `<image>` (local only, non-root) on `egress-workers`, with the proxy
-variables a worker gets, and prints that table's rows with today's date.
+variables a worker gets, and prints that table's rows with the image's ID and today's date.
 
 Acceptance runs on the test Mac mini through mini-op, never on a developer's Mac: there
 run `./verify-egress workers`, `./verify-egress mini-op` and `./verify-egress --tools

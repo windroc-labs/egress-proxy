@@ -528,10 +528,11 @@ grep -qxF "FAIL proxy_deny example.com:443: connect=200, want connect=407" <<<"$
 grep -qx "1 of [0-9]* checks failed: proxy_deny" <<<"$verify_out" ||
   fail verify_egress_mismatch "the summary does not name proxy_deny"
 ok verify_egress_mismatch
-# The tool check with the probe image as the worker image: non-root, no worker label.
+# The tool check with the probe image as the worker image (non-root): rows carry its ID.
 verify verify_egress_tools 0 --tools "$PROBE_IMAGE"
-for line in "| curl | works | works | unknown | $(date -u +%Y-%m-%d) |" \
-  "| ssh | fails | not in image | unknown | $(date -u +%Y-%m-%d) |"; do
+probe_id=$(docker image inspect --format '{{.Id}}' "$PROBE_IMAGE")
+for line in "| curl | works | works | $probe_id | $(date -u +%Y-%m-%d) |" \
+  "| ssh | fails | not in image | $probe_id | $(date -u +%Y-%m-%d) |"; do
   grep -qxF "$line" <<<"$verify_out" || fail verify_egress_tools "no '$line'"
 done
 ok verify_egress_tools
