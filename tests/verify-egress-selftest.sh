@@ -27,6 +27,9 @@ mkdir -p "$work/bin" "$DOCKER_CONFIG"
 #   open       host:port targets a CONNECT tunnel reaches
 #   body       when present, curl also writes a body and a token-like line
 #   calls      every call, with the DOCKER_CONFIG and DOCKER_HOST it saw
+#   image_user, image_version, image_missing   what `docker image inspect` reports
+#   rows       what the tool container prints; tool_run the `docker run` of it
+#   gwlog      "<unix time>\t<line>" lines `docker logs --since --until` of the gateway serves
 cat >"$work/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -84,6 +87,21 @@ fake_curl() {
 }
 case $1 in
   context) echo unix:///fake-context.sock ;;
+  image)
+    [[ ! -f $FAKE/image_missing ]] || exit 1
+    case $4 in
+      *'.Config.User'*) cat "$FAKE/image_user" 2>/dev/null || echo 1000:1000 ;;
+      *'.version"'*) cat "$FAKE/image_version" 2>/dev/null || echo 1.2.3 ;;
+    esac
+    ;;
+  wait) echo 0 ;;
+  logs)
+    if [[ $2 == --since ]]; then
+      awk -F '\t' -v s="$3" -v e="$5" '$1 >= s && $1 <= e { print $2 }' "$FAKE/gwlog" 2>/dev/null || true
+    else
+      cat "$FAKE/rows" 2>/dev/null || true
+    fi
+    ;;
   ps) cat "$FAKE/ids" 2>/dev/null || echo gw1 ;;
   inspect)
     fmt=$3 id=$4
@@ -110,6 +128,7 @@ case $1 in
     done
     mkdir -p "$FAKE/c"
     echo "$net" >"$FAKE/c/c$n"
+    [[ " $* " != *" --entrypoint sh "* ]] || echo "$*" >"$FAKE/tool_run"
     echo "c$n"
     ;;
   exec)
@@ -355,8 +374,82 @@ malformed unknown_method $'x\tbogus\tt' "unknown method"
 malformed two_fields $'a\tproxy_deny' "not three tab-separated fields"
 malformed four_fields $'a\tproxy_deny\tt\textra' "not three tab-separated fields"
 
+# -------- --tools --------
+today=$(date -u +%Y-%m-%d)
+allow_line() { printf '%s\t{"level":"info","msg":"CANONICAL-PROXY-DECISION","allow":%s,"requested_host":"%s:443","inbound_remote_addr":"%s:40000"}\n' "$1" "$2" "$3" "$4"; }
+
+scenario tools_results
+{
+  printf 'curl\t100\t101\t0\n'
+  printf 'wget\t110\t111\t0\n'
+  printf 'npm\t120\t121\t0\n'
+  printf 'gh\t130\t131\t1\n'
+  printf 'Claude Code\t140\t141\t1\n'
+  printf 'Node fetch\t150\t151\t1\n'
+  printf 'apt-get\t160\t161\t100\n'
+  printf 'ssh\t170\t170\tmissing\n'
+  printf 'QUIC / HTTP/3\t171\t171\tnohttp3\n'
+  printf 'Node http\t172\t173\tSECRET-BODY-0123\n'
+  printf 'bogus\t1\t2\t0\n'
+  printf 'SECRET-BODY-0123 token=sk-ant-SELFTEST\n'
+} >"$FAKE/rows"
+{
+  allow_line 101 true example.com 172.31.1.5
+  allow_line 115 true example.com 172.31.1.5
+  allow_line 120 true registry.npmjs.org 172.31.9.9
+  allow_line 131 true api.github.com 172.31.1.5
+  allow_line 141 false api.anthropic.com 172.31.1.5
+  allow_line 160 true deb.debian.org 172.31.1.5
+  printf '161\tSECRET-BODY-0123 token=sk-ant-SELFTEST\n'
+} >"$FAKE/gwlog"
+out=$(EGRESS_SELFTEST_TOKEN=sk-ant-SELFTEST-TOKEN run --tools worker:test)
+expect tools_results "$out" 0 \
+  "ok tools_image worker:test user 1000, version 1.2.3" \
+  "| Tool | Expected | Result | Image version | Date |" \
+  "| curl | works | works | 1.2.3 | $today |" \
+  "| wget | works | fails: no proxy used | 1.2.3 | $today |" \
+  "| npm | works | fails: no proxy used | 1.2.3 | $today |" \
+  "| gh | works | works | 1.2.3 | $today |" \
+  "| Claude Code | works | fails: no proxy used | 1.2.3 | $today |" \
+  "| Node fetch | fails | fails: no proxy used | 1.2.3 | $today |" \
+  "| apt-get | works | fails: exit 100 | 1.2.3 | $today |" \
+  "| ssh | fails | not in image | 1.2.3 | $today |" \
+  "| QUIC / HTTP/3 | fails | could not run: no HTTP/3 in curl | 1.2.3 | $today |" \
+  "| Node http | fails | could not run: no runtime | 1.2.3 | $today |" \
+  "differs from expected: wget, npm, apt-get, Claude Code"
+[[ $out != *SECRET-BODY* && $out != *sk-ant-SELFTEST* ]] || fail tools_no_body_no_token "$out"
+[[ $(grep -c '^| ' <<<"$out") == 33 ]] || fail tools_results "want a header, a separator and 31 rows: $out"
+grep -q '^could not run: .*QUIC / HTTP/3.*Node http' <<<"$out" || fail tools_results "could not run line: $out"
+run_args=$(cat "$FAKE/tool_run" 2>/dev/null || true)
+# The docker options: everything before the image and its script.
+run_args=${run_args%% --entrypoint sh *}
+for want in "--pull never" "--network egress-workers" "--cap-drop ALL" "--security-opt no-new-privileges" \
+  "-e HTTP_PROXY=http://egress-proxy-workers:4750" "-e https_proxy=http://egress-proxy-workers:4750" \
+  "-e NO_PROXY=localhost,127.0.0.1,::1" "-e no_proxy=localhost,127.0.0.1,::1"; do
+  [[ " $run_args " == *" $want "* ]] || fail tools_run_args "no '$want' in: $run_args"
+done
+[[ " $run_args " != *" -v "* && " $run_args " != *" --mount "* ]] || fail tools_run_args "a mount: $run_args"
+[[ " $run_args " != *" --rm "* ]] || fail tools_run_args "--rm: the container must outlive its run for docker logs"
+ok tools_run_args
+
+scenario tools_root_user
+echo 0:0 >"$FAKE/image_user"
+out=$(run --tools worker:test)
+expect tools_root_user "$out" 1 "FAIL tools_image worker:test: image runs as root, want a non-root user"
+
+scenario tools_root_id
+echo root >"$FAKE/rows"
+out=$(run --tools worker:test)
+expect tools_root_id "$out" 1 "FAIL tools_image worker:test: image runs as root, want a non-root user"
+
+scenario tools_not_local
+touch "$FAKE/image_missing"
+out=$(run --tools worker:test)
+expect tools_not_local "$out" 1 "FAIL tools_image worker:test: image worker:test is not local, want a local image"
+[[ ! -f $FAKE/tool_run ]] || fail tools_not_local "the tool container ran"
+
 scenario usage
-for args in "" "a b" "--bogus" "Bad_Key"; do
+for args in "" "a b" "--bogus" "Bad_Key" "--tools" "--tools -x" "--tools a b"; do
   # shellcheck disable=SC2086 # word splitting builds each argument list
   out=$(run $args)
   if [[ $(tail -n 1 <<<"$out") != exit=2 || $out != *"usage: verify-egress"* ]]; then

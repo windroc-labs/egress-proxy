@@ -64,6 +64,12 @@ dir=$(tree sibling_ref)
 printf 'see windroc/%s\n' "${c}${d}" >"$dir/notes.txt"
 expect_only_failure sibling_ref "$dir" "FAIL no_sibling_repo_refs: notes.txt:1:see windroc/${c}${d}"
 
+dir=$(tree tool_row)
+sed 's/^| curl | works |/| curl | fails |/' "$repo/docs/worker-tools.md" >"$dir/docs/worker-tools.md"
+row=$(grep -n "^row 'curl' " "$repo/verify-egress" | cut -d: -f1)
+n=$((row - $(grep -n "^row 'ssh' " "$repo/verify-egress" | cut -d: -f1) + 1))
+expect_only_failure tool_row "$dir" "FAIL tool_rows_documented: row $n: verify-egress 'curl|works', docs/worker-tools.md 'curl|fails'"
+
 dir=$(tree network_key)
 printf 'networks:\n  %s:\n    mode: allowlist\n' "${c}${d}" >"$dir/notes.yaml"
 out=$(run_check "$dir")

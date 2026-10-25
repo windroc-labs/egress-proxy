@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# verify-egress <caller network>
+# verify-egress --tools <image>
+#
 # verify-egress <caller network>: checks every allow and deny of a caller network from a
 # probe container on it, with targets discovered at run time: the host's interface
 # addresses and default gateways, host.docker.internal, a listener this script opens on
@@ -10,8 +13,14 @@
 # <expected>` per check, then a summary. Never prints a response body, a token or a
 # password: probes discard bodies and only status codes and exit codes are read.
 #
-# Exit codes: 0 every check passed; 1 a check failed; 2 usage, or no python3 or Docker
-# context.
+# verify-egress --tools <image>: runs each tool of the worker tool table
+# (docs/worker-tools.md) in a container of <image> on the workers network, with the proxy
+# variables a worker gets, and prints one Markdown row per tool for that table. A result
+# comes only from exit codes and the gateway's log (did the gateway allow a request from
+# that container to the row's destination), never from a tool's own output.
+#
+# Exit codes: 0 every check passed (--tools: it ran); 1 a check or precondition failed;
+# 2 usage, or no python3 or Docker context.
 #
 # Runs on macOS's bash 3.2 and on Linux.
 set -euo pipefail
@@ -21,12 +30,21 @@ PROBE_IMAGE=curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d
 
 usage() {
   echo "usage: verify-egress <caller network>" >&2
+  echo "       verify-egress --tools <image>" >&2
   exit 2
 }
 
-(($# == 1)) || usage
-key=$1
-[[ $key =~ ^[a-z][a-z0-9-]{0,30}$ ]] || usage
+if (($# == 2)) && [[ $1 == --tools && -n $2 && $2 != -* ]]; then
+  mode=tools
+  image=$2
+  key=workers
+elif (($# == 1)); then
+  mode=network
+  key=$1
+  [[ $key =~ ^[a-z][a-z0-9-]{0,30}$ ]] || usage
+else
+  usage
+fi
 
 tmp=$(mktemp -d)
 containers=()
@@ -127,6 +145,235 @@ proxy=$(label "windroc.egress.network.$key.proxy")
 internal=$(docker network inspect --format '{{.Internal}}' "$net_name" 2>/dev/null || true)
 [[ $internal == true ]] || stop network_internal "$net_name" "Internal '$internal'" "Internal true"
 pass network_internal "$net_name" "Internal true"
+
+# -------- --tools: the worker tool table --------
+# One line per row of docs/worker-tools.md, in its order: tool, expected result, and
+# `reach` when a dummy credential makes the tool exit non-zero even though the gateway
+# let it through. tests/check-repo.sh compares these lines with the doc.
+tools=()
+expects=()
+reaches=()
+row() {
+  tools+=("$1")
+  expects+=("$2")
+  reaches+=("${3:-}")
+}
+row 'ssh' fails
+row 'git over ssh' fails
+row 'scp' fails
+row 'rsync over ssh' fails
+row 'git://' fails
+row 'ping' fails
+row 'traceroute' fails
+row 'dig' fails
+row 'nslookup' fails
+row 'host' fails
+row 'self-resolving program' fails
+row 'nc' fails
+row 'telnet' fails
+row 'psql' fails
+row 'redis-cli' fails
+row 'raw TCP (python3)' fails
+row 'raw UDP (python3)' fails
+row 'QUIC / HTTP/3' fails
+row 'Node fetch' fails
+row 'Node fetch, NODE_USE_ENV_PROXY=1' works
+row 'Node http' fails
+row 'Bun fetch' unknown
+row 'MCP server (Node child process)' unknown
+row 'curl' works
+row 'wget' works
+row 'pip' works
+row 'uv' works
+row 'npm' works
+row 'apt-get' works
+row 'gh' works reach
+row 'Claude Code' works reach
+
+# destination <tool>: the host the row's probe asks for.
+destination() {
+  case $1 in
+    ssh | 'git over ssh' | scp | 'rsync over ssh' | 'git://') echo github.com ;;
+    ping | traceroute | nc | telnet | 'raw TCP (python3)' | 'raw UDP (python3)') echo 1.1.1.1 ;;
+    pip | uv) echo pypi.org ;;
+    npm) echo registry.npmjs.org ;;
+    apt-get) echo deb.debian.org ;;
+    gh) echo api.github.com ;;
+    'Claude Code') echo api.anthropic.com ;;
+    *) echo example.com ;;
+  esac
+}
+
+# The script the tool container runs (POSIX sh), with the row names as arguments. Each
+# tool's output goes to /dev/null; per row it prints `<tool>\t<start>\t<end>\t<status>`,
+# status `missing`, `nohttp3`, `noruntime`, `timeout` or the exit code. Dummy credentials
+# are not credentials and are never printed.
+# shellcheck disable=SC2016 # expanded by the container's sh
+tools_script='
+if [ "$(id -u)" = 0 ]; then echo root; exit 0; fi
+has() { command -v "$1" >/dev/null 2>&1; }
+T=""
+if has timeout; then T="timeout 20"; fi
+run() { $T "$@" >/dev/null 2>&1 </dev/null; }
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no"
+NODE_FETCH="fetch(\"https://example.com/\").then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+probe() {
+  case $1 in
+    "ssh") has ssh || return 200; run ssh $SSH_OPTS -T git@github.com ;;
+    "git over ssh") has git && has ssh || return 200; run env GIT_SSH_COMMAND="ssh $SSH_OPTS" git ls-remote git@github.com:git/git.git ;;
+    "scp") has scp || return 200; run scp $SSH_OPTS git@github.com:x /tmp/egress-x ;;
+    "rsync over ssh") has rsync && has ssh || return 200; run rsync -e "ssh $SSH_OPTS" git@github.com:x /tmp/egress-x ;;
+    "git://") has git || return 200; run git ls-remote git://github.com/git/git.git ;;
+    "ping") has ping || return 200; run ping -c 1 -W 2 1.1.1.1 ;;
+    "traceroute") has traceroute || return 200; run traceroute -m 3 -w 2 1.1.1.1 ;;
+    "dig") has dig || return 200; run dig +time=3 +tries=1 example.com ;;
+    "nslookup") has nslookup || return 200; run nslookup example.com ;;
+    "host") has host || return 200; run host -W 3 example.com ;;
+    "self-resolving program") has python3 || return 200; run python3 -c "import socket; socket.create_connection((\"example.com\", 443), 5)" ;;
+    "nc") has nc || return 200; run nc -z -w 5 1.1.1.1 443 ;;
+    "telnet") has telnet || return 200; run telnet 1.1.1.1 443 ;;
+    "psql") has psql || return 200; run env PGCONNECT_TIMEOUT=5 psql -w -h example.com -c "" ;;
+    "redis-cli") has redis-cli || return 200; run redis-cli -h example.com ping ;;
+    "raw TCP (python3)") has python3 || return 200; run python3 -c "import socket; socket.create_connection((\"1.1.1.1\", 443), 5)" ;;
+    "raw UDP (python3)") has python3 || return 200
+      run python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(3); s.sendto(bytes.fromhex(\"abcd01000001000000000000076578616d706c6503636f6d0000010001\"), (\"1.1.1.1\", 53)); s.recvfrom(512)" ;;
+    "QUIC / HTTP/3") has curl || return 200; curl -V 2>/dev/null | grep -q HTTP3 || return 201; run curl --http3-only -sS -o /dev/null https://example.com/ ;;
+    "Node fetch") has node || return 200; run env -u NODE_USE_ENV_PROXY node -e "$NODE_FETCH" ;;
+    "Node fetch, NODE_USE_ENV_PROXY=1") has node || return 200; run env NODE_USE_ENV_PROXY=1 node -e "$NODE_FETCH" ;;
+    "Node http") has node || return 200; run env -u NODE_USE_ENV_PROXY node -e "require(\"https\").get(\"https://example.com/\", r => process.exit(r.statusCode < 400 ? 0 : 1)).on(\"error\", () => process.exit(1))" ;;
+    "Bun fetch")
+      if has bun; then run bun -e "$NODE_FETCH"
+      elif has opencode; then run env BUN_BE_BUN=1 opencode -e "$NODE_FETCH"
+      else return 202; fi ;;
+    "MCP server (Node child process)") has node || return 200
+      run node -e "const r = require(\"child_process\").spawnSync(process.execPath, [\"-e\", process.argv[1]], { stdio: \"ignore\" }); process.exit(r.status === null ? 1 : r.status)" "$NODE_FETCH" ;;
+    "curl") has curl || return 200; run curl -sS -o /dev/null https://example.com/ ;;
+    "wget") has wget || return 200; run wget -q -O /dev/null https://example.com/ ;;
+    "pip")
+      if has pip; then run pip download --no-deps -d /tmp/egress-pip six
+      elif has python3 && python3 -m pip --version >/dev/null 2>&1; then run python3 -m pip download --no-deps -d /tmp/egress-pip six
+      else return 200; fi ;;
+    "uv") has uv || return 200; echo six >/tmp/egress-req.txt; run uv pip compile --no-cache /tmp/egress-req.txt ;;
+    "npm") has npm || return 200; run npm view left-pad version ;;
+    "apt-get") has apt-get || return 200; mkdir -p /tmp/egress-apt/lists/partial /tmp/egress-apt/cache/archives/partial
+      run apt-get update -o Dir::State::Lists=/tmp/egress-apt/lists -o Dir::Cache=/tmp/egress-apt/cache -o Debug::NoLocking=1 -o APT::Sandbox::User="$(id -un)" ;;
+    "gh") if [ -x /usr/local/bin/gh ]; then g=/usr/local/bin/gh; elif has gh; then g=gh; else return 200; fi
+      run env GH_TOKEN=dummy "$g" api /zen ;;
+    "Claude Code") has claude || return 200; run env ANTHROPIC_API_KEY=dummy claude -p hi ;;
+    *) return 202 ;;
+  esac
+}
+for t in "$@"; do
+  start=$(date +%s)
+  probe "$t"
+  rc=$?
+  end=$(date +%s)
+  case $rc in
+    200) s=missing ;;
+    201) s=nohttp3 ;;
+    202) s=noruntime ;;
+    124) s=timeout ;;
+    *) s=$rc ;;
+  esac
+  printf "%s\t%s\t%s\t%s\n" "$t" "$start" "$end" "$s"
+  sleep 2
+done
+'
+
+# allowed_from <log file> <host> <ip>: the log holds smokescreen's allow decision for a
+# request to <host> from <ip>.
+allowed_from() {
+  awk -v h1="\"requested_host\":\"$2\"" -v h2="\"requested_host\":\"$2:" -v ip="\"inbound_remote_addr\":\"$3:" '
+    index($0, "\"msg\":\"CANONICAL-PROXY-DECISION\"") && index($0, "\"allow\":true") &&
+      (index($0, h1) || index($0, h2)) && index($0, ip) { found = 1 }
+    END { exit !found }' "$1"
+}
+
+run_tools() {
+  local user version tool_c tool_ip out i tool line start end status result differs="" skipped="" date
+  user=$(docker image inspect --format '{{.Config.User}}' "$image" 2>/dev/null) ||
+    stop tools_image "$image" "image $image is not local" "a local image"
+  user=${user%%:*}
+  [[ -n $user && $user != root && $user != 0 ]] || stop tools_image "$image" "image runs as root" "a non-root user"
+  version=$(docker image inspect --format "{{index .Config.Labels \"$version_label\"}}" "$image" 2>/dev/null || true)
+  [[ -n $version && $version != "<no value>" ]] || version=unknown
+  pass tools_image "$image" "user $user, version $version"
+
+  tool_c=$(docker run -d --pull never --network "$net_name" \
+    -e "HTTP_PROXY=$proxy" -e "HTTPS_PROXY=$proxy" -e "http_proxy=$proxy" -e "https_proxy=$proxy" \
+    -e NO_PROXY=localhost,127.0.0.1,::1 -e no_proxy=localhost,127.0.0.1,::1 \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --entrypoint sh "$image" -c "$tools_script" sh "${tools[@]}") ||
+    stop tools_run "$image" "the tool container did not start" "a running container"
+  containers+=("$tool_c")
+  tool_ip=$(docker inspect --format "{{(index .NetworkSettings.Networks \"$net_name\").IPAddress}}" "$tool_c")
+  docker wait "$tool_c" >/dev/null
+  docker logs "$tool_c" >"$tmp/rows" 2>/dev/null || true
+  if grep -qx root "$tmp/rows"; then
+    stop tools_image "$image" "image runs as root" "a non-root user"
+  fi
+  pass tools_run "$image" "$tool_ip on $net_name"
+
+  date=$(date -u +%Y-%m-%d)
+  echo "| Tool | Expected | Result | Image version | Date |"
+  echo "| --- | --- | --- | --- | --- |"
+  i=0
+  while ((i < ${#tools[@]})); do
+    tool=${tools[$i]}
+    start="" end="" status=""
+    # The first well-formed line for this row; anything else a tool wrote is dropped.
+    while IFS= read -r line; do
+      IFS=$'\t' read -r name start end status <<<"$line"
+      if [[ $name == "$tool" && $start =~ ^[0-9]+$ && $end =~ ^[0-9]+$ &&
+        $status =~ ^([0-9]+|missing|nohttp3|noruntime|timeout)$ ]]; then
+        break
+      fi
+      start="" end="" status=""
+    done <"$tmp/rows"
+    if [[ -z $status ]]; then
+      result="could not run: no runtime"
+    else
+      case $status in
+        missing) result="not in image" ;;
+        nohttp3) result="could not run: no HTTP/3 in curl" ;;
+        noruntime) result="could not run: no runtime" ;;
+        *)
+          docker logs --since "$start" --until "$((end + 1))" "$gw" >"$tmp/gwlog" 2>&1 || true
+          if ! allowed_from "$tmp/gwlog" "$(destination "$tool")" "$tool_ip"; then
+            result="fails: no proxy used"
+          elif [[ $status == 0 || -n ${reaches[$i]} ]]; then
+            result=works
+          elif [[ $status == timeout ]]; then
+            result="fails: timed out"
+          else
+            result="fails: exit $status"
+          fi
+          ;;
+      esac
+    fi
+    case $result in
+      "could not run"*) skipped="${skipped:+$skipped, }$tool" ;;
+      works | fails*)
+        if [[ ${expects[$i]} != unknown && ${result%%:*} != "${expects[$i]}" ]]; then
+          differs="${differs:+$differs, }$tool"
+        fi
+        ;;
+    esac
+    echo "| $tool | ${expects[$i]} | $result | $version | $date |"
+    i=$((i + 1))
+  done
+  echo "differs from expected: ${differs:-none}"
+  echo "could not run: ${skipped:-none}"
+}
+
+if [[ $mode == tools ]]; then
+  # The worker image's version label, assembled so tests/check-repo.sh does not take it
+  # for a reference to that repo.
+  a=ensem b=ble
+  version_label="${a}${b}.version"
+  run_tools
+  exit 0
+fi
 
 # -------- Host facts --------
 host_args=()

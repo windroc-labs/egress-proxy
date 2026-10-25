@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Repo lint (CI `lint` job): no reference to the sibling repos outside the docs (NFR-3),
 # every base image and action pinned, no keychain or platform-TLS crates in the gateway,
-# and the docs and the Dockerfile agreeing with the files they describe.
+# and the docs and the Dockerfile agreeing with the files they describe (labels, worker
+# tool rows).
 # Prints `ok <check>` or `FAIL <check>: <detail>`; exits 1 if any check fails.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -93,6 +94,29 @@ elif [[ -n $missing ]]; then
   fail labels_documented "$missing"
 else
   ok labels_documented
+fi
+
+# The worker tool rows in verify-egress (`row '<tool>' <expected> [reach]` lines) and the
+# Results table in docs/worker-tools.md list the same tools with the same expected
+# results, in the same order.
+script_rows=$(sed -nE "s/^row '(.+)' (works|fails|unknown)( reach)?$/\1|\2/p" verify-egress 2>/dev/null || true)
+doc_rows=$(sed -nE '/^## Results/,$ s/^\| ([^|]+) \| (works|fails|unknown) \|.*/\1|\2/p' docs/worker-tools.md 2>/dev/null || true)
+if [[ -z $script_rows ]]; then
+  fail tool_rows_documented "no row lines in verify-egress"
+elif [[ $script_rows == "$doc_rows" ]]; then
+  ok tool_rows_documented
+else
+  n=0 detail=""
+  while true; do
+    n=$((n + 1))
+    s=$(sed -n "${n}p" <<<"$script_rows")
+    d=$(sed -n "${n}p" <<<"$doc_rows")
+    if [[ $s != "$d" ]]; then
+      detail="row $n: verify-egress '${s:-none}', docs/worker-tools.md '${d:-none}'"
+      break
+    fi
+  done
+  fail tool_rows_documented "$detail"
 fi
 
 exit "$status"
