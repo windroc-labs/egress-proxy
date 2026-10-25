@@ -275,7 +275,7 @@ fn opened_by_exception(network: &Network, facts: &Facts, target: &HostPort) -> b
 /// cover (a name by the addresses the gateway resolved for it at start).
 fn denies(network: &Network, facts: &Facts, target: &HostPort) -> bool {
     if network.mode == Mode::Allowlist {
-        return true;
+        return !allowed_by(&network.allow, &target.host);
     }
     let addrs = match target.ip() {
         Some(ip) => vec![ip],
@@ -747,6 +747,19 @@ mod tests {
             &mini_op,
             "exception_other_port\tproxy_deny\t198.51.100.10:23"
         ));
+        // An allowlist allows every port of an allowed domain: no deny for it.
+        let c = config(
+            "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"github.com:22\"]\n  mini-op:\n    mode: allowlist\n    allow: [github.com]\n",
+        );
+        let mini_op: Vec<String> = plan("mini-op", &c, &facts(), &host())
+            .unwrap()
+            .iter()
+            .map(Check::to_string)
+            .collect();
+        assert!(
+            !mini_op.iter().any(|l| l.contains("github.com:22")),
+            "{mini_op:#?}"
+        );
     }
 
     #[test]
