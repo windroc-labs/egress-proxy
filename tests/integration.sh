@@ -416,7 +416,15 @@ tunneled mini_op_exception egress-mini-op "$MPROXY" "http://$lan_ip:2222/"
 
 # AC3: neither network gets the other's allows.
 denied workers_no_mini_op_allow egress-workers "$PROXY" "https://$lan_ip:2222/"
-denied mini_op_no_workers_exception egress-mini-op "$MPROXY" https://host.docker.internal:11434/
+# The gateway resolves host.docker.internal to the default bridge's gateway (host-gateway).
+hdi_ip=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+denied mini_op_no_workers_exception egress-mini-op "$MPROXY" "https://$hdi_ip:11434/"
+
+# A named allowlist exception opens only its start-time address at its port: the ACL lists
+# the address, not the name, so smokescreen never re-resolves the name into a new opening.
+tunneled named_exception_by_address egress-mini-op "$MPROXY" "http://$hdi_ip:2222/"
+denied named_exception_other_port egress-mini-op "$MPROXY" "https://$hdi_ip:11435/"
+denied named_exception_by_name egress-mini-op "$MPROXY" https://host.docker.internal:2222/
 
 # AC7: the workers exception opens that port of that host only.
 tunneled workers_exception egress-workers "$PROXY" http://host.docker.internal:11434/

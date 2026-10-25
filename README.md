@@ -50,11 +50,12 @@ Wi-Fi), restart the gateway.
 ## Policy
 
 The config (`~/.egress/config.local.yaml`, mounted read-only) has one section per caller
-network; see `config.example.yaml`. Section `<key>` is Docker network `egress-<key>`, where
-the gateway's alias is `egress-proxy-<key>` and its proxy `http://egress-proxy-<key>:4750`.
-Key `uplink` is reserved (the gateway's own network `egress-uplink`). These names do not
-collide with mini-op's `mini-op`, `mini-op-net` and `mini-op-proxy`. Removing a section
-detaches the gateway; its Docker network stays until `docker network rm egress-<key>`.
+network; see `config.example.yaml`. Section `<key>` is Docker network `egress-<key>`,
+where the gateway's alias is `egress-proxy-<key>` and its proxy
+`http://egress-proxy-<key>:4750`. Key `uplink` is reserved (the gateway's own network
+`egress-uplink`). These names do not collide with mini-op's `mini-op`, `mini-op-net` and
+`mini-op-proxy`. Removing a section detaches the gateway; its Docker network stays until
+`docker network rm egress-<key>`.
 
 - **denylist**: public destinations are allowed; denied are the floor
   `0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12,
@@ -67,12 +68,14 @@ detaches the gateway; its Docker network stays until `docker network rm egress-<
 - **exceptions** (either mode): `host:port` entries allowed even though a deny rule covers
   their address, e.g. `host.docker.internal:11434` for Ollama on `workers`, or the mini's
   ssh port on `mini-op`. The gateway resolves each name at start and opens only that port
-  of those addresses (smokescreen `allow_addresses`), for every caller on that network. In
-  allowlist mode the host also enters the ACL, which has no ports, so there an exception
-  must be an address a deny rule covers (e.g. a LAN address); list public hosts under
-  `allow`. A name that does not resolve, that resolves to the gateway or into a caller
-  network's subnet, or (allowlist) to an address no deny rule covers, stops the start. Names are not re-resolved: after an address changes, restart the
-  gateway.
+  of the addresses it had then (smokescreen `allow_addresses`), for every caller on that
+  network; after a name's address changes, restart the gateway. In allowlist mode the ACL,
+  which has no ports, lists those start-time addresses, not the name: callers connect to
+  the address (a CONNECT by name is denied), and a later DNS answer opens nothing. There
+  an exception must be an address a deny rule covers (e.g. a LAN address); list public
+  hosts under `allow`. A name that does not resolve, that resolves to the gateway or into
+  a caller network's subnet, or (allowlist) to an address no deny rule covers, stops the
+  start.
 
 The gateway cannot see the Mac's network interfaces: LAN ranges in RFC 1918 space are in
 the floor, but add the Mac's public IPv4 address and any global IPv6 prefix to

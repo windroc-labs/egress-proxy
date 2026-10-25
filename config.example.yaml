@@ -34,7 +34,8 @@ networks:
     # Optional, either mode. host:port destinations allowed even though a deny rule covers
     # their address, e.g. Ollama on the Mac or a LAN model provider. The gateway resolves
     # each name at start; only that port of those addresses opens, for every caller on
-    # this network. Restart the gateway after the name's address changes.
+    # this network. Restart the gateway after the name's address changes. In allowlist
+    # mode callers connect to the address: the ACL lists it, not the name.
     # example: exceptions
     # exceptions:
     #   - host.docker.internal:11434

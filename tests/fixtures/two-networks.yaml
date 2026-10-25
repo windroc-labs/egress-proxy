@@ -14,3 +14,5 @@ networks:
       - localtest.me
     exceptions:
       - LAN_IP:2222
+      # A name: the ACL lists its address at start, not the name.
+      - host.docker.internal:2222

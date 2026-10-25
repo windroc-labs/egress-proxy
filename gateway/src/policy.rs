@@ -96,9 +96,15 @@ pub fn generate(
         Mode::Denylist => acl_yaml.push_str("  action: open\n"),
         Mode::Allowlist => {
             acl_yaml.push_str("  action: enforce\n  allowed_domains:\n");
-            // An exception's host must pass the ACL too; its address stays limited to the
-            // listed port by the deny ranges (check_exceptions).
-            let exception_hosts = network.exceptions.iter().map(acl_host);
+            // An exception must pass the ACL too. The ACL lists its start-time addresses,
+            // not its name: smokescreen would re-resolve a name on every CONNECT, and the
+            // ACL has no ports. The deny ranges keep each address to its listed port
+            // (check_exceptions).
+            let exception_hosts = network
+                .exceptions
+                .iter()
+                .flat_map(|e| exception_addrs(e, facts))
+                .map(|ip| ip.to_string());
             let mut domains: Vec<String> = network
                 .allow
                 .iter()
@@ -133,13 +139,6 @@ fn deny_ranges(network: &Network, facts: &Facts) -> Vec<IpNet> {
     ranges
 }
 
-/// An exception's host as the ACL names it: the canonical IP, or the name.
-fn acl_host(exception: &HostPort) -> String {
-    exception
-        .ip()
-        .map_or_else(|| exception.host.clone(), |ip| ip.to_string())
-}
-
 /// The canonical addresses of `exception`: its IP literal, or what its name resolved to at
 /// start (none when the name is not in the facts).
 fn exception_addrs(exception: &HostPort, facts: &Facts) -> Vec<IpAddr> {
@@ -153,8 +152,9 @@ fn exception_addrs(exception: &HostPort, facts: &Facts) -> Vec<IpAddr> {
     }
 }
 
-/// Refuses an allowlist exception whose address no deny rule covers: its host also enters
-/// the ACL, which has no ports, so such an address would be open on every port.
+/// Refuses an allowlist exception whose address no deny rule covers: its start-time
+/// addresses also enter the ACL, which has no ports, so such an address would be open on
+/// every port.
 pub fn check_exceptions(config: &Config, facts: &Facts) -> Result<(), String> {
     for (key, network) in &config.networks {
         if network.mode != Mode::Allowlist {
@@ -411,12 +411,27 @@ mod tests {
         let p = generated("api", EXCEPTIONS, &exception_facts());
         assert_eq!(
             yaml(&p.acl_yaml)["default"]["allowed_domains"],
-            yaml("[\"192.168.1.9\", \"example.com\", \"fd00::7\", \"nas.lan\"]")
+            yaml("[\"192.168.1.30\", \"192.168.1.9\", \"example.com\", \"fd00::30\", \"fd00::7\"]")
         );
         assert_eq!(
             yaml(&p.config_yaml)["allow_addresses"],
             yaml("[\"192.168.1.30:22\", \"192.168.1.9:22\", \"[fd00::30]:22\", \"[fd00::7]:22\"]")
         );
+    }
+
+    /// A name with no recorded address opens nothing, in the ACL or in allow_addresses.
+    #[test]
+    fn allowlist_unresolved_name_adds_nothing() {
+        let mut f = exception_facts();
+        f.exceptions.remove("nas.lan");
+        let text = "version: 1\nnetworks:\n  api:\n    mode: allowlist\n    allow: [example.com]\n    exceptions: [\"nas.lan:22\"]\n";
+        let p = generated("api", text, &f);
+        assert_eq!(
+            yaml(&p.acl_yaml)["default"]["allowed_domains"],
+            yaml("[example.com]")
+        );
+        assert!(yaml(&p.config_yaml).get("allow_addresses").is_none());
+        assert!(p.config_yaml.contains("# exception nas.lan:22\n"));
     }
 
     #[test]
