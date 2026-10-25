@@ -84,8 +84,7 @@ do not collide with mini-op's `mini-op`, `mini-op-net` and `mini-op-proxy`.
 ## Development
 
 - Entrypoint: `cd gateway && cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`.
-- Repo lint: `tests/check-repo.sh` (no dependency on ensemble or mini-op, pinned images
-  and actions, no keychain crates).
+- Repo lint: `tests/check-repo.sh`; its comments describe each check.
 - Docker end-to-end: `tests/integration.sh` runs in CI only (Linux; it restarts the
   Docker daemon and uses a throwaway Docker client config).
 - CI (`.github/workflows/ci.yml`) runs the jobs `rust`, `lint` and `integration` on every
