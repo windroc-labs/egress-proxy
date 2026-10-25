@@ -84,6 +84,8 @@ fn started(config_text: &str, port: u16) -> State {
             .collect::<BTreeMap<_, _>>(),
         host_docker_internal: vec!["192.168.65.254".parse().unwrap()],
         own_addrs: vec!["127.0.0.1".parse().unwrap()],
+        exceptions: BTreeMap::new(),
+        subnets: BTreeMap::new(),
     };
     let run_dir = dir.path().join("run");
     policy::write_all(&run_dir, &cfg, &facts).unwrap();

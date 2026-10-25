@@ -152,6 +152,8 @@ mod tests {
                 "172.20.0.2".parse().unwrap(),
                 "172.21.0.2".parse().unwrap(),
             ],
+            exceptions: BTreeMap::new(),
+            subnets: BTreeMap::new(),
         }
     }
 
