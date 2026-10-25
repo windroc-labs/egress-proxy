@@ -1,17 +1,20 @@
 //! Command line of the image's entrypoint. Not a management command: the image runs
-//! `gateway run`, and its `HEALTHCHECK` runs `gateway health`.
+//! `gateway run`, its `HEALTHCHECK` runs `gateway health`, and only start.sh runs
+//! `gateway compose`, in a throwaway container with `--network none`.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
 
 use crate::facts::Resolver;
 
-pub const USAGE: &str = "usage: gateway [run|health] [--config <path>] [--run-dir <dir>] [--smokescreen <path>] [--port <n>] [--resolve <host>=<ip>[,<ip>...]]...";
+pub const USAGE: &str = "usage: gateway [run|health|compose] [--config <path>] [--run-dir <dir>] [--smokescreen <path>] [--port <n>] [--resolve <host>=<ip>[,<ip>...]]...";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Run,
     Health,
+    /// Print the compose override for the config's caller networks.
+    Compose,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +61,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(
         }
         Some("health") => {
             opts.mode = Mode::Health;
+            args.next();
+        }
+        Some("compose") => {
+            opts.mode = Mode::Compose;
             args.next();
         }
         _ => {}
@@ -158,5 +165,10 @@ mod tests {
                 .starts_with("--resolve: bad")
         );
         assert_eq!(parse(&["status"]).unwrap_err(), "unknown option status");
+    }
+
+    #[test]
+    fn compose_mode() {
+        assert_eq!(parse(&["compose"]).unwrap().mode, Mode::Compose);
     }
 }
