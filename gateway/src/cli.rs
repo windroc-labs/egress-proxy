@@ -23,6 +23,9 @@ pub struct Opts {
     pub port: u16,
     /// Fixed answers for name resolution; tests only, the image never passes them.
     pub resolver: Resolver,
+    /// The advertised caller networks, unparsed: the `EGRESS_NETWORKS` environment
+    /// variable, which compose.yaml sets next to the labels.
+    pub advertised: Option<String>,
 }
 
 impl Default for Opts {
@@ -34,12 +37,20 @@ impl Default for Opts {
             smokescreen: PathBuf::from("/smokescreen"),
             port: 4750,
             resolver: Resolver::default(),
+            advertised: None,
         }
     }
 }
 
-pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Opts, String> {
-    let mut opts = Opts::default();
+/// Parses the arguments; `advertised` is the value of `EGRESS_NETWORKS`.
+pub fn parse_args<I: IntoIterator<Item = String>>(
+    args: I,
+    advertised: Option<String>,
+) -> Result<Opts, String> {
+    let mut opts = Opts {
+        advertised,
+        ..Opts::default()
+    };
     let mut args = args.into_iter().peekable();
     match args.peek().map(String::as_str) {
         Some("run") => {
@@ -89,7 +100,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Opts, String> {
-        parse_args(args.iter().map(|s| s.to_string()))
+        parse_args(args.iter().map(|s| s.to_string()), Some("workers".into()))
     }
 
     #[test]
@@ -101,6 +112,7 @@ mod tests {
         assert_eq!(opts.smokescreen, PathBuf::from("/smokescreen"));
         assert_eq!(opts.port, 4750);
         assert!(opts.resolver.overrides.is_empty());
+        assert_eq!(opts.advertised.as_deref(), Some("workers"));
     }
 
     #[test]

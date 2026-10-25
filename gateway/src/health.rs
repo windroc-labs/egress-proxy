@@ -45,8 +45,7 @@ fn check(opts: &Opts) -> Vec<Line> {
         Ok(f) => f,
         Err(e) => return vec![fail(format!("not started: {e}"))],
     };
-    let advertised = std::env::var("EGRESS_NETWORKS").ok();
-    let config = match config::load_served(&opts.config, advertised.as_deref()) {
+    let config = match config::load_served(&opts.config, opts.advertised.as_deref()) {
         Ok(c) => c,
         Err(e) => return vec![fail(e)],
     };

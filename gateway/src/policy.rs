@@ -2,16 +2,16 @@
 //! generated from the local config and the start facts.
 
 use std::fmt::Write as _;
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Write as _};
+use std::fs;
+use std::io;
 use std::net::IpAddr;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use ipnet::IpNet;
 
 use crate::config::{Config, Mode, Network};
 use crate::facts::Facts;
+use crate::files::{make_private_dir, write_private};
 
 /// Ranges every denylist and allowlist network denies (FR-7), listed even where
 /// smokescreen denies them by default, so a default change cannot open them.
@@ -125,21 +125,6 @@ pub fn read_running(run_dir: &Path, key: &str) -> io::Result<Policy> {
     })
 }
 
-/// Writes `text` to `path`, readable only by this user.
-pub fn write_private(path: &Path, text: &str) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(text.as_bytes())
-}
-
-fn make_private_dir(path: &Path) -> io::Result<()> {
-    DirBuilder::new().recursive(true).mode(0o700).create(path)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -228,6 +213,26 @@ mod tests {
             yaml("[\"*.example.org\", example.com]")
         );
         assert_eq!(yaml(&p.config_yaml)["ip"], "172.21.0.2");
+    }
+
+    #[test]
+    fn readme_lists_the_floor() {
+        let readme =
+            fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../README.md")).unwrap();
+        let start = readme
+            .find("denied are the floor")
+            .expect("README floor sentence");
+        let listed: String = readme[start..]
+            .split('`')
+            .nth(1)
+            .expect("floor in backticks")
+            .split_whitespace()
+            .collect();
+        assert_eq!(
+            listed,
+            DENY_FLOOR.join(","),
+            "README.md floor differs from DENY_FLOOR"
+        );
     }
 
     #[test]

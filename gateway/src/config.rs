@@ -139,11 +139,23 @@ pub fn parse(path: &Path, text: &str) -> Result<Config, ConfigError> {
     match top.get("version") {
         None => return Err(fail(None, "missing key version".into())),
         Some(Value::Number(n)) if n.as_u64() == Some(FORMAT_VERSION) => {}
+        Some(Value::Number(n)) => {
+            return Err(fail(
+                None,
+                format!("version {n} is not supported (known: {FORMAT_VERSION})"),
+            ));
+        }
+        Some(Value::String(s)) => {
+            return Err(fail(
+                None,
+                format!("version: want the number {FORMAT_VERSION}, got the string \"{s}\""),
+            ));
+        }
         Some(v) => {
             return Err(fail(
                 None,
                 format!(
-                    "version {} is not supported (known: {FORMAT_VERSION})",
+                    "version: want the number {FORMAT_VERSION}, got {}",
                     scalar_text(v)
                 ),
             ));
@@ -471,6 +483,14 @@ mod tests {
                 "version: 2\nnetworks: {}\n",
                 "config /c.yaml: version 2 is not supported (known: 1)",
             ),
+            (
+                "version: \"1\"\nnetworks: {}\n",
+                "config /c.yaml: version: want the number 1, got the string \"1\"",
+            ),
+            (
+                "version: [1]\nnetworks: {}\n",
+                "config /c.yaml: version: want the number 1, got",
+            ),
             ("version: 1\n", "config /c.yaml: missing key networks"),
             (
                 "version: 1\nnetworks: {}\n",
@@ -562,15 +582,58 @@ mod tests {
         }
     }
 
+    const EXAMPLE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../config.example.yaml");
+
     #[test]
     fn example_config_is_valid() {
-        let path = Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../config.example.yaml"
-        ));
-        let config = load(path).unwrap();
+        let config = load(Path::new(EXAMPLE)).unwrap();
         assert_eq!(config.networks.keys().collect::<Vec<_>>(), ["workers"]);
         assert_eq!(config.networks["workers"].mode, Mode::Denylist);
+    }
+
+    /// The example with every commented example block (between `# example:` and
+    /// `# end example`) uncommented: one `# ` removed from each line.
+    fn uncomment_examples(text: &str) -> (String, usize) {
+        let mut out = String::new();
+        let (mut inside, mut blocks) = (false, 0);
+        for line in text.lines() {
+            let body = line.trim_start();
+            if body.starts_with("# example:") {
+                inside = true;
+                blocks += 1;
+                continue;
+            }
+            if body == "# end example" {
+                inside = false;
+                continue;
+            }
+            if inside {
+                let indent = &line[..line.len() - body.len()];
+                let rest = body.strip_prefix("# ").or_else(|| body.strip_prefix('#'));
+                out.push_str(indent);
+                out.push_str(rest.expect("example lines are commented"));
+            } else {
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        assert!(!inside, "unterminated example block");
+        (out, blocks)
+    }
+
+    #[test]
+    fn example_blocks_are_valid() {
+        let text = std::fs::read_to_string(EXAMPLE).unwrap();
+        let (text, blocks) = uncomment_examples(&text);
+        assert_eq!(blocks, 3, "example blocks in config.example.yaml");
+        let config = parse(Path::new(EXAMPLE), &text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        let workers = &config.networks["workers"];
+        assert_eq!(workers.deny_ranges.len(), 2);
+        assert_eq!(workers.health.allow_probe.to_string(), "example.com:443");
+        assert_eq!(workers.health.deny_probe.to_string(), "169.254.169.254:80");
+        let api = &config.networks["api"];
+        assert_eq!(api.mode, Mode::Allowlist);
+        assert_eq!(api.allow, ["example.com", "*.example.org"]);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Repo lint (CI `lint` job): no reference to the sibling repos outside the docs (NFR-3),
-# every base image and action pinned, no keychain or platform-TLS crates in the gateway.
+# every base image and action pinned, no keychain or platform-TLS crates in the gateway,
+# and the docs and the Dockerfile agreeing with the files they describe.
 # Prints `ok <check>` or `FAIL <check>: <detail>`; exits 1 if any check fails.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -12,13 +13,22 @@ fail() {
   status=1
 }
 
+# none_found <check> <search command...>: the search (grep-like: 0 found, 1 none, other
+# exit = error) finds nothing.
+none_found() {
+  local name=$1 hits rc=0
+  shift
+  hits=$("$@") || rc=$?
+  case $rc in
+    0) fail "$name" "$hits" ;;
+    1) ok "$name" ;;
+    *) fail "$name" "$1 exited $rc" ;;
+  esac
+}
+
 # The two names, assembled from pieces so this file does not match itself.
 a=ensem b=ble c=mini d=-op
-if hits=$(git grep -nIiE "${a}${b}|${c}${d}" -- . ':!docs/' ':!README.md'); then
-  fail no_sibling_repo_refs "$hits"
-else
-  ok no_sibling_repo_refs
-fi
+none_found no_sibling_repo_refs git grep -nIiE "${a}${b}|${c}${d}" -- . ':!docs/' ':!README.md'
 
 # Every FROM names an earlier stage or an image pinned by digest. A FROM using
 # ${TARGETARCH} must name a stage for each architecture the Dockerfile supports.
@@ -40,11 +50,7 @@ else
   fail from_pinned "${unpinned:-cannot read Dockerfile}"
 fi
 
-if hits=$(grep -niE '^#[[:space:]]*syntax[[:space:]]*=' Dockerfile); then
-  fail no_syntax_directive "$hits"
-else
-  ok no_syntax_directive
-fi
+none_found no_syntax_directive grep -niE '^#[[:space:]]*syntax[[:space:]]*=' Dockerfile
 
 # Every `uses:` in a workflow is pinned to a full commit SHA.
 unpinned=""
@@ -59,10 +65,30 @@ else
 fi
 
 # Tests must never reach the macOS keychain or Security API: no crate that links them.
-if hits=$(grep -nE '^name = "(security-framework|security-framework-sys|native-tls|keyring|rustls-platform-verifier)"$' gateway/Cargo.lock); then
-  fail no_keychain_crates "$hits"
+none_found no_keychain_crates grep -nE '^name = "(security-framework|security-framework-sys|native-tls|keyring|rustls-platform-verifier)"$' gateway/Cargo.lock
+
+# The image builds the entrypoint with the toolchain CI tests it with.
+channel=$(sed -nE 's/^channel = "([^"]+)"$/\1/p' rust-toolchain.toml)
+if [[ -n $channel ]] && grep -qE "^FROM rust:${channel//./\\.}-" Dockerfile; then
+  ok rust_version_matches
 else
-  ok no_keychain_crates
+  fail rust_version_matches "Dockerfile's rust image is not rust-toolchain.toml's channel '${channel}'"
+fi
+
+# Every label compose.yaml sets is documented in the label contract, with its value
+# (per-network labels with <key> in place of the network key; an alias value is skipped).
+missing=""
+while read -r key value; do
+  doc_key=$(sed -E 's/^windroc\.egress\.network\.[a-z0-9-]+\./windroc.egress.network.<key>./' <<<"$key")
+  value=${value#\"}
+  value=${value%\"}
+  grep -qF "\`$doc_key\`" docs/label-contract.md || missing+="$key (as $doc_key); "
+  [[ $value == \** ]] || grep -qF "\`$value\`" docs/label-contract.md || missing+="$key value $value; "
+done < <(sed -nE 's/^[[:space:]]+(windroc\.egress\.[^:]+):[[:space:]]*(.*)$/\1 \2/p' compose.yaml)
+if [[ -n $missing ]]; then
+  fail labels_documented "$missing"
+else
+  ok labels_documented
 fi
 
 exit "$status"

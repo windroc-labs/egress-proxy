@@ -118,11 +118,23 @@ unreachable() {
   [[ $out == 000000\ * ]] || fail "$name" "curl $* from $net got '$out', want no connection"
 }
 
-# no_dns <check> <network> [server]: an external name does not resolve.
+# lookup <network> [server]: nslookup example.com from <network>; returns its exit code
+# (0 resolved, 1 nslookup failed; anything else: docker could not run it).
+lookup() {
+  local rc=0
+  docker run --rm --network "$1" --entrypoint nslookup "$PROBE_IMAGE" example.com ${2:+"$2"} >/dev/null 2>&1 || rc=$?
+  return "$rc"
+}
+
+# no_dns <check> <network> [server]: nslookup ran and could not resolve an external name.
 no_dns() {
-  if docker run --rm --network "$2" --entrypoint nslookup "$PROBE_IMAGE" example.com ${3:+"$3"} >/dev/null 2>&1; then
-    fail "$1" "example.com resolved from $2${3:+ via $3}"
-  fi
+  local rc=0
+  lookup "$2" ${3:+"$3"} || rc=$?
+  case $rc in
+    0) fail "$1" "example.com resolved from $2${3:+ via $3}" ;;
+    1) ;;
+    *) fail "$1" "nslookup did not run from $2 (exit $rc)" ;;
+  esac
 }
 
 # The documented start command (README.md).
@@ -172,6 +184,10 @@ for ip in "$workers_ip" "$uplink_ip"; do
 done
 ok bridge_cannot_reach
 ok uplink_cannot_reach
+
+# Positive control for no_dns: the probe's nslookup does resolve where DNS exists.
+lookup bridge || fail dns_control "nslookup example.com failed from bridge (exit $?)"
+ok dns_control
 
 # AC1: public through the proxy; every FR-7 class denied; nothing without the proxy.
 allowed workers_public_ok egress-workers "$PROXY" https://example.com/
@@ -284,6 +300,11 @@ compose_files+=(-f "$repo/tests/compose.test.yaml")
 use_config two-networks.yaml
 start
 wait_health healthy || fail allowlist_allows "the two-network gateway did not become healthy"
+[[ $(inspect '{{index .Config.Labels "windroc.egress.networks"}}') == workers,testallow ]] ||
+  fail labels_two_networks "the networks label is not workers,testallow"
+inspect '{{range .Config.Env}}{{println .}}{{end}}' | grep -qx 'EGRESS_NETWORKS=workers,testallow' ||
+  fail labels_two_networks "EGRESS_NETWORKS is not workers,testallow"
+ok labels_two_networks
 allowed allowlist_allows egress-testallow http://egress-proxy-testallow:4750 https://example.com/
 denied allowlist_denies egress-testallow http://egress-proxy-testallow:4750 https://www.wikipedia.org/
 allowed workers_unaffected egress-workers "$PROXY" https://www.wikipedia.org/

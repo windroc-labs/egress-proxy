@@ -119,7 +119,7 @@ fn own_addrs() -> Result<Vec<IpAddr>, String> {
 /// Writes the facts as JSON.
 pub fn write(path: &Path, facts: &Facts) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(facts).expect("facts serialize");
-    crate::policy::write_private(path, &json)
+    crate::files::write_private(path, &json)
 }
 
 /// Reads facts written by [`write`].

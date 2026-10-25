@@ -28,8 +28,19 @@ struct Child {
 /// Runs the gateway; returns the process exit code: 0 after SIGTERM or SIGINT, 1 when
 /// a smokescreen exits or cannot start, 2 on a config or environment error.
 pub fn run(opts: &Opts) -> u8 {
-    let advertised = std::env::var("EGRESS_NETWORKS").ok();
-    let config = match config::load_served(&opts.config, advertised.as_deref()) {
+    // Block first, so a SIGTERM during start (alias lookups can take 10 s) waits for
+    // sigwait instead of being dropped: PID 1 ignores signals left at their default.
+    // Children get the default mask back before exec.
+    let mut mask = SigSet::empty();
+    for sig in [Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT] {
+        mask.add(sig);
+    }
+    if let Err(e) = mask.thread_block() {
+        eprintln!("gateway: cannot block signals: {e}");
+        return 1;
+    }
+
+    let config = match config::load_served(&opts.config, opts.advertised.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("gateway: {e}");
@@ -43,16 +54,6 @@ pub fn run(opts: &Opts) -> u8 {
             return 1;
         }
     };
-
-    // Signals are taken with sigwait; children get the default mask back before exec.
-    let mut mask = SigSet::empty();
-    for sig in [Signal::SIGCHLD, Signal::SIGTERM, Signal::SIGINT] {
-        mask.add(sig);
-    }
-    if let Err(e) = mask.thread_block() {
-        eprintln!("gateway: cannot block signals: {e}");
-        return 1;
-    }
 
     let mut children = Vec::new();
     for (key, network) in &config.networks {
