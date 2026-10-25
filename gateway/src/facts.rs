@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{Config, listen_alias};
 
 pub const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const ALIAS_WAIT: Duration = Duration::from_secs(10);
@@ -25,11 +25,6 @@ pub struct Facts {
     pub host_docker_internal: Vec<IpAddr>,
     /// The gateway's own interface addresses.
     pub own_addrs: Vec<IpAddr>,
-}
-
-/// The listen alias of a caller network: the gateway's DNS name on it.
-pub fn listen_alias(network: &str) -> String {
-    format!("egress-proxy-{network}")
 }
 
 /// Name resolution, with fixed answers for the names given by `--resolve` (tests only).
@@ -79,7 +74,7 @@ fn resolve_listen_ip(alias: &str, resolver: &Resolver, own: &[IpAddr]) -> Result
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "cannot resolve {alias}; the gateway is not attached to that network (see compose.yaml)"
+                "cannot resolve {alias}; the gateway is not attached to that network (run ./start.sh)"
             ));
         }
         sleep(ALIAS_RETRY);

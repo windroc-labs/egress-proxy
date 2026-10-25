@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 
 use ipnet::{IpNet, Ipv6Net};
@@ -15,7 +15,9 @@ use serde_yaml::{Mapping, Value};
 pub const FORMAT_VERSION: u64 = 1;
 
 const TOP_KEYS: &[&str] = &["version", "networks"];
-const NETWORK_KEYS: &[&str] = &["mode", "deny_ranges", "allow", "health"];
+const NETWORK_KEYS: &[&str] = &["mode", "deny_ranges", "allow", "exceptions", "health"];
+/// The compose key of the gateway's own way out; its Docker name would collide.
+const RESERVED_KEY: &str = "uplink";
 const HEALTH_KEYS: &[&str] = &["allow_probe", "deny_probe"];
 const DEFAULT_DENY_PROBE: &str = "169.254.169.254:80";
 const DEFAULT_DENYLIST_ALLOW_PROBE: &str = "example.com:443";
@@ -32,6 +34,8 @@ pub struct Network {
     pub deny_ranges: Vec<IpNet>,
     /// Allowed domains or `*.domain` globs (allowlist only).
     pub allow: Vec<String>,
+    /// Destinations opened through the deny rules, sorted and deduplicated.
+    pub exceptions: Vec<HostPort>,
     pub health: Health,
 }
 
@@ -59,7 +63,7 @@ pub struct Health {
 }
 
 /// A `host:port` or `[v6]:port` target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HostPort {
     pub host: String,
     pub port: u16,
@@ -81,6 +85,16 @@ impl HostPort {
         };
         Some(HostPort { host, port })
     }
+}
+
+/// The Docker network of caller network `key`.
+pub fn network_name(key: &str) -> String {
+    format!("egress-{key}")
+}
+
+/// The listen alias of caller network `key`: the gateway's DNS name on it.
+pub fn listen_alias(key: &str) -> String {
+    format!("egress-proxy-{key}")
 }
 
 impl fmt::Display for HostPort {
@@ -190,6 +204,15 @@ pub fn parse(path: &Path, text: &str) -> Result<Config, ConfigError> {
                 ));
             }
         };
+        if key == RESERVED_KEY {
+            return Err(fail(
+                None,
+                format!(
+                    "network key {key} is reserved (the gateway's own network {})",
+                    network_name(key)
+                ),
+            ));
+        }
         let network = parse_network(section).map_err(|p| fail(Some(key), p))?;
         out.insert(key.to_string(), network);
     }
@@ -213,7 +236,7 @@ pub fn check_advertised(
         path: path.to_path_buf(),
         network: None,
         problem: format!(
-            "networks [{}] differ from the gateway's networks [{}] (compose.yaml)",
+            "networks [{}] differ from the gateway's networks [{}]; run ./start.sh",
             have.join(", "),
             want.join(", ")
         ),
@@ -231,7 +254,7 @@ pub fn load_served(path: &Path, advertised: Option<&str>) -> Result<Config, Stri
 
 /// Parses `EGRESS_NETWORKS`: comma-separated network keys.
 pub fn parse_advertised(value: Option<&str>) -> Result<Vec<String>, String> {
-    let value = value.ok_or("EGRESS_NETWORKS is not set (compose.yaml sets it)")?;
+    let value = value.ok_or("EGRESS_NETWORKS is not set (./start.sh sets it)")?;
     let keys: Vec<String> = value
         .split(',')
         .map(str::trim)
@@ -239,7 +262,7 @@ pub fn parse_advertised(value: Option<&str>) -> Result<Vec<String>, String> {
         .map(str::to_string)
         .collect();
     if keys.is_empty() {
-        return Err("EGRESS_NETWORKS is empty (compose.yaml sets it)".into());
+        return Err("EGRESS_NETWORKS is empty (./start.sh sets it)".into());
     }
     if let Some(bad) = keys.iter().find(|k| !valid_network_key(k)) {
         return Err(format!(
@@ -252,7 +275,7 @@ pub fn parse_advertised(value: Option<&str>) -> Result<Vec<String>, String> {
 fn parse_network(section: &Value) -> Result<Network, String> {
     let section = section
         .as_mapping()
-        .ok_or("want a mapping with keys mode, deny_ranges, allow, health")?;
+        .ok_or("want a mapping with keys mode, deny_ranges, allow, exceptions, health")?;
     check_keys(section, NETWORK_KEYS, "")?;
 
     let mode = match section.get("mode") {
@@ -286,11 +309,20 @@ fn parse_network(section: &Value) -> Result<Network, String> {
         }
     };
 
+    let mut exceptions = string_list(section, "exceptions")?
+        .unwrap_or_default()
+        .iter()
+        .map(|e| parse_exception(e))
+        .collect::<Result<Vec<_>, _>>()?;
+    exceptions.sort();
+    exceptions.dedup();
+
     let health = parse_health(section.get("health"), mode, &allow)?;
     Ok(Network {
         mode,
         deny_ranges,
         allow,
+        exceptions,
         health,
     })
 }
@@ -353,26 +385,35 @@ fn parse_deny_range(text: &str) -> Result<IpNet, String> {
     Ok(net)
 }
 
+/// An exception: `host:port` or `[v6]:port`, the host an IP address or a domain.
+fn parse_exception(entry: &str) -> Result<HostPort, String> {
+    HostPort::parse(entry)
+        .filter(|hp| hp.host.parse::<IpAddr>().is_ok() || valid_domain(&hp.host))
+        .ok_or_else(|| format!("exceptions: {entry} is not host:port"))
+}
+
 fn check_allow_entry(entry: &str) -> Result<(), String> {
     if entry.contains(':') {
         return Err(format!(
-            "allow: host:port entries are not supported yet ({entry})"
+            "allow: host:port entries go under exceptions ({entry})"
         ));
     }
-    let name = entry.strip_prefix("*.").unwrap_or(entry);
-    let ok = !name.is_empty()
+    if valid_domain(entry.strip_prefix("*.").unwrap_or(entry)) {
+        Ok(())
+    } else {
+        Err(format!("allow: {entry} is not a domain or *.domain glob"))
+    }
+}
+
+fn valid_domain(name: &str) -> bool {
+    !name.is_empty()
         && name.split('.').all(|label| {
             !label.is_empty()
                 && label.len() <= 63
                 && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
                 && !label.starts_with('-')
                 && !label.ends_with('-')
-        });
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("allow: {entry} is not a domain or *.domain glob"))
-    }
+        })
 }
 
 fn string_list(map: &Mapping, key: &str) -> Result<Option<Vec<String>>, String> {
@@ -509,12 +550,44 @@ mod tests {
                 "config /c.yaml: network key Workers is invalid (want [a-z][a-z0-9-]{0,30})",
             ),
             (
+                "version: 1\nnetworks:\n  uplink: {mode: denylist}\n",
+                "config /c.yaml: network key uplink is reserved (the gateway's own network egress-uplink)",
+            ),
+            (
                 "version: 1\nnetworks:\n  workers: {}\n",
                 "config /c.yaml: network workers: missing key mode",
             ),
             (
                 "version: 1\nnetworks:\n  workers: 3\n",
-                "config /c.yaml: network workers: want a mapping with keys mode, deny_ranges, allow, health",
+                "config /c.yaml: network workers: want a mapping with keys mode, deny_ranges, allow, exceptions, health",
+            ),
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, exceptions: \"a.b:1\"}\n",
+                "config /c.yaml: network workers: exceptions: want a list",
+            ),
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, exceptions: [11434]}\n",
+                "config /c.yaml: network workers: exceptions: want strings, got 11434",
+            ),
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, exceptions: [host.docker.internal]}\n",
+                "config /c.yaml: network workers: exceptions: host.docker.internal is not host:port",
+            ),
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, exceptions: [\"host.docker.internal:0\"]}\n",
+                "config /c.yaml: network workers: exceptions: host.docker.internal:0 is not host:port",
+            ),
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, exceptions: [\"*.lan:22\"]}\n",
+                "config /c.yaml: network workers: exceptions: *.lan:22 is not host:port",
+            ),
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, exceptions: [\"a_b:22\"]}\n",
+                "config /c.yaml: network workers: exceptions: a_b:22 is not host:port",
+            ),
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, exceptions: [\"::1:22\"]}\n",
+                "config /c.yaml: network workers: exceptions: ::1:22 is not host:port",
             ),
             (
                 "version: 1\nnetworks:\n  workers: {mode: open}\n",
@@ -554,7 +627,7 @@ mod tests {
             ),
             (
                 "version: 1\nnetworks:\n  api: {mode: allowlist, allow: [\"example.com:22\"]}\n",
-                "config /c.yaml: network api: allow: host:port entries are not supported yet (example.com:22)",
+                "config /c.yaml: network api: allow: host:port entries go under exceptions (example.com:22)",
             ),
             (
                 "version: 1\nnetworks:\n  api: {mode: allowlist, allow: [\"a.*.com\"]}\n",
@@ -654,7 +727,7 @@ mod tests {
         let err = check_advertised(path, &config, &["workers".into(), "api".into()]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "config /c.yaml: networks [workers] differ from the gateway's networks [api, workers] (compose.yaml)"
+            "config /c.yaml: networks [workers] differ from the gateway's networks [api, workers]; run ./start.sh"
         );
     }
 
@@ -664,13 +737,54 @@ mod tests {
             parse_advertised(Some("workers, api")).unwrap(),
             vec!["workers", "api"]
         );
-        assert!(parse_advertised(None).unwrap_err().contains("not set"));
-        assert!(parse_advertised(Some(" , ")).unwrap_err().contains("empty"));
+        assert_eq!(
+            parse_advertised(None).unwrap_err(),
+            "EGRESS_NETWORKS is not set (./start.sh sets it)"
+        );
+        assert_eq!(
+            parse_advertised(Some(" , ")).unwrap_err(),
+            "EGRESS_NETWORKS is empty (./start.sh sets it)"
+        );
         assert!(
             parse_advertised(Some("Bad"))
                 .unwrap_err()
                 .contains("invalid")
         );
+    }
+
+    #[test]
+    fn exceptions_parsed() {
+        let config = parse_ok(
+            "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"nas.lan:8080\", \"host.docker.internal:11434\", \"192.168.1.20:11434\", \"[fd00::1]:22\", \"nas.lan:8080\"]\n",
+        );
+        let got: Vec<String> = config.networks["workers"]
+            .exceptions
+            .iter()
+            .map(HostPort::to_string)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "192.168.1.20:11434",
+                "[fd00::1]:22",
+                "host.docker.internal:11434",
+                "nas.lan:8080"
+            ]
+        );
+        assert!(parse_ok(WORKERS).networks["workers"].exceptions.is_empty());
+        let api = parse_ok(
+            "version: 1\nnetworks:\n  api:\n    mode: allowlist\n    allow: [example.com]\n    exceptions: [\"192.0.2.10:22\"]\n",
+        );
+        assert_eq!(
+            api.networks["api"].exceptions[0].to_string(),
+            "192.0.2.10:22"
+        );
+    }
+
+    #[test]
+    fn names() {
+        assert_eq!(listen_alias("mini-op"), "egress-proxy-mini-op");
+        assert_eq!(network_name("mini-op"), "egress-mini-op");
     }
 
     #[test]
