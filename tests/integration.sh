@@ -190,8 +190,18 @@ state() {
   docker network inspect --format '{{.Id}}' egress-workers egress-uplink
 }
 before=$(state)
+labels_before=$(inspect '{{range $k, $v := .Config.Labels}}{{println $k $v}}{{end}}' | grep '^com\.docker\.compose\.')
 compose up -d --quiet-pull
-[[ $(state) == "$before" ]] || fail up_idempotent "before: $before; after: $(state)"
+if [[ $(state) != "$before" ]]; then
+  echo "--- compose labels before"
+  echo "$labels_before"
+  echo "--- compose labels after"
+  inspect '{{range $k, $v := .Config.Labels}}{{println $k $v}}{{end}}' | grep '^com\.docker\.compose\.' || true
+  echo "--- compose config --hash"
+  compose config --hash '*' || true
+  docker compose version || true
+  fail up_idempotent "before: $before; after: $(state)"
+fi
 ok up_idempotent
 
 # AC3 (NFR-1): with the gateway stopped, the network has no way out.
