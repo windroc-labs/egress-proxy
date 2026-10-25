@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# verify-egress <caller network>: checks every allow and deny of a caller network from a
+# probe container on it, with targets discovered at run time: the host's interface
+# addresses and default gateways, host.docker.internal, a listener this script opens on
+# the host's 127.0.0.1, one address per deny-floor range, each exception, the other caller
+# networks, and the config's verify.deny_targets. The running gateway computes the checks
+# (`gateway plan`, read-only, through docker exec); see README.md, Verify.
+#
+# Prints `ok <check> <target> <observed>` or `FAIL <check> <target>: <observed>, want
+# <expected>` per check, then a summary. Never prints a response body, a token or a
+# password: probes discard bodies and only status codes and exit codes are read.
+#
+# Exit codes: 0 every check passed; 1 a check failed; 2 usage, or no python3 or Docker
+# context.
+#
+# Runs on macOS's bash 3.2 and on Linux.
+set -euo pipefail
+
+# The probe image: curl, pinned by digest. tests/integration.sh reads this line.
+PROBE_IMAGE=curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
+
+usage() {
+  echo "usage: verify-egress <caller network>" >&2
+  exit 2
+}
+
+(($# == 1)) || usage
+key=$1
+[[ $key =~ ^[a-z][a-z0-9-]{0,30}$ ]] || usage
+
+tmp=$(mktemp -d)
+containers=()
+listener_pid=""
+cleanup() {
+  if ((${#containers[@]} > 0)); then
+    docker rm -f "${containers[@]}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n $listener_pid ]]; then
+    kill "$listener_pid" 2>/dev/null || true
+    wait "$listener_pid" 2>/dev/null || true
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+# Pin the daemon endpoint, then use a Docker client config with no credsStore or
+# credHelpers, so no registry credential or keychain is ever read.
+if [[ -z ${DOCKER_HOST:-} ]]; then
+  if ! DOCKER_HOST=$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null) ||
+    [[ -z $DOCKER_HOST ]]; then
+    echo "verify-egress: cannot read the current Docker context's endpoint" >&2
+    exit 2
+  fi
+  export DOCKER_HOST
+fi
+export DOCKER_CONFIG=$tmp/docker
+mkdir -p "$DOCKER_CONFIG"
+echo '{}' >"$DOCKER_CONFIG/config.json"
+
+total=0
+failures=0
+failed_names=""
+
+# pass <check> <target> <observed>
+pass() {
+  total=$((total + 1))
+  echo "ok $1 $2 $3"
+}
+
+# mismatch <check> <target> <observed> <expected>
+mismatch() {
+  total=$((total + 1))
+  failures=$((failures + 1))
+  case " $failed_names " in
+    *" $1 "*) ;;
+    *) failed_names="${failed_names:+$failed_names }$1" ;;
+  esac
+  echo "FAIL $1 $2: $3, want $4"
+}
+
+summary() {
+  if ((failures == 0)); then
+    echo "all $total checks passed"
+  else
+    echo "$failures of $total checks failed: $failed_names"
+  fi
+}
+
+# stop <check> <target> <observed> <expected>: a failed precondition ends the run.
+stop() {
+  mismatch "$@"
+  summary
+  exit 1
+}
+
+# -------- The gateway, found by the label contract (docs/label-contract.md) --------
+ids=$(docker ps -a --filter label=windroc.egress.contract --format '{{.ID}}' 2>/dev/null) ||
+  stop gateway_found "label windroc.egress.contract" "docker ps failed" "exactly one container"
+count=0
+for _ in $ids; do count=$((count + 1)); done
+((count == 1)) || stop gateway_found "label windroc.egress.contract" "$count containers" "exactly one"
+gw=$ids
+gw_name=$(docker inspect --format '{{.Name}}' "$gw")
+gw_name=${gw_name#/}
+pass gateway_found "label windroc.egress.contract" "$gw_name"
+
+label() { docker inspect --format "{{index .Config.Labels \"$1\"}}" "$gw"; }
+
+contract=$(label windroc.egress.contract)
+[[ $contract == 1 ]] || stop gateway_contract "$gw_name" "contract '$contract'" "contract 1"
+pass gateway_contract "$gw_name" "contract 1"
+
+health=$(docker inspect --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$gw")
+[[ $health == "true healthy" ]] || stop gateway_healthy "$gw_name" "running/health '$health'" "true healthy"
+pass gateway_healthy "$gw_name" healthy
+
+advertised=$(label windroc.egress.networks)
+case ",$advertised," in
+  *",$key,"*) pass network_advertised "$key" "networks $advertised" ;;
+  *) stop network_advertised "$key" "networks '$advertised'" "$key among them" ;;
+esac
+net_name=$(label "windroc.egress.network.$key.name")
+proxy=$(label "windroc.egress.network.$key.proxy")
+[[ -n $net_name && -n $proxy ]] || stop network_advertised "$key" "no .name or .proxy label" "both labels"
+
+internal=$(docker network inspect --format '{{.Internal}}' "$net_name" 2>/dev/null || true)
+[[ $internal == true ]] || stop network_internal "$net_name" "Internal '$internal'" "Internal true"
+pass network_internal "$net_name" "Internal true"
+
+# -------- Host facts --------
+host_args=()
+# prefix_of_mask <0xffffff00>: the prefix length of a hex netmask.
+prefix_of_mask() {
+  local mask=$(($1)) bits=0
+  while ((mask & 0x80000000)); do
+    bits=$((bits + 1))
+    mask=$(((mask << 1) & 0xffffffff))
+  done
+  echo "$bits"
+}
+add_gateway() {
+  local ip=${1%%%*}
+  if [[ -n $ip ]]; then host_args+=(--default-gateway "$ip"); fi
+}
+if [[ $(uname -s) == Darwin ]]; then
+  add_gateway "$(route -n get default 2>/dev/null | awk '$1 == "gateway:" { print $2; exit }' || true)"
+  add_gateway "$(route -n get -inet6 default 2>/dev/null | awk '$1 == "gateway:" { print $2; exit }' || true)"
+  while read -r kind addr mask; do
+    case $kind in
+      inet) host_args+=(--host-addr "$addr/$(prefix_of_mask "$mask")") ;;
+      inet6) host_args+=(--host-addr "${addr%%%*}/$mask") ;;
+    esac
+  done < <(ifconfig 2>/dev/null | awk '
+    $1 == "inet" { for (i = 3; i < NF; i++) if ($i == "netmask") print "inet", $2, $(i + 1) }
+    $1 == "inet6" { for (i = 3; i < NF; i++) if ($i == "prefixlen") print "inet6", $2, $(i + 1) }')
+else
+  add_gateway "$(ip -4 route show default 2>/dev/null | awk '$1 == "default" && $2 == "via" { print $3; exit }' || true)"
+  add_gateway "$(ip -6 route show default 2>/dev/null | awk '$1 == "default" && $2 == "via" { print $3; exit }' || true)"
+  while read -r addr; do
+    host_args+=(--host-addr "$addr")
+  done < <(ip -o addr show 2>/dev/null | awk '$3 == "inet" || $3 == "inet6" { print $4 }')
+fi
+
+# -------- The host listener on 127.0.0.1, serving an empty directory --------
+command -v python3 >/dev/null || {
+  echo "verify-egress: python3 is needed for the host listener" >&2
+  exit 2
+}
+listen_port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+mkdir -p "$tmp/www"
+python3 -m http.server --bind 127.0.0.1 --directory "$tmp/www" "$listen_port" >/dev/null 2>&1 &
+listener_pid=$!
+listening=no
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$listen_port/"; then
+    listening=yes
+    break
+  fi
+  sleep 0.5
+done
+[[ $listening == yes ]] || stop host_listener "127.0.0.1:$listen_port" "no answer" "an answer on the host"
+pass host_listener "127.0.0.1:$listen_port" "answers on the host"
+
+# -------- The plan --------
+plan_args=(plan "$key" --listener-port "$listen_port")
+if ((${#host_args[@]} > 0)); then plan_args+=("${host_args[@]}"); fi
+if ! docker exec "$gw" /gateway "${plan_args[@]}" >"$tmp/plan" 2>"$tmp/plan.err"; then
+  if grep -q 'unknown option plan' "$tmp/plan.err"; then
+    stop plan "$gw_name" "the gateway image has no plan mode; run ./start.sh" "a plan"
+  fi
+  stop plan "$gw_name" "$(head -n 1 "$tmp/plan.err" | cut -c 1-300)" "a plan"
+fi
+
+names=()
+methods=()
+targets=()
+lineno=0
+while IFS= read -r line || [[ -n $line ]]; do
+  lineno=$((lineno + 1))
+  IFS=$'\t' read -r name method target extra <<<"$line"
+  bad=""
+  if [[ -z ${target:-} || -n ${extra:-} || $line != *$'\t'*$'\t'* ]]; then
+    bad="not three tab-separated fields"
+  else
+    case $method in
+      proxy_allow | proxy_open | proxy_deny | direct_none | cross_none | dns_none) ;;
+      *) bad="unknown method" ;;
+    esac
+    case $method in
+      cross_none) parts=$(printf '%s\n' "$target" | tr ' ' '\n') ;;
+      dns_none) parts=$(printf '%s\n' "$target" | tr '@' '\n') ;;
+      *) parts=$target ;;
+    esac
+    while IFS= read -r part; do
+      [[ $part == -* || -z $part ]] && bad="a target element starts with - or is empty"
+    done <<<"$parts"
+    [[ $name =~ ^[a-z_]+$ ]] || bad="bad check name"
+  fi
+  [[ -z $bad ]] || stop plan "line $lineno" "$bad" "<name> <method> <target>"
+  names+=("$name")
+  methods+=("$method")
+  targets+=("$target")
+done <"$tmp/plan"
+((${#names[@]} > 0)) || stop plan "$gw_name" "an empty plan" "a plan"
+pass plan "$gw_name" "${#names[@]} checks"
+
+# -------- Probes --------
+# start <network> <args...>: a detached container on <network>; prints its ID. The
+# caller adds it to `containers` (this runs in a subshell).
+start() {
+  local net=$1
+  shift
+  docker run -d --rm --network "$net" --cap-drop ALL --security-opt no-new-privileges "$@"
+}
+probe=$(start "$net_name" --entrypoint sleep "$PROBE_IMAGE" 900) ||
+  stop probe "$net_name" "the probe container did not start" "a probe"
+containers+=("$probe")
+
+# run_curl <container> <curl args...>: curl's --write-out text, a space, its exit code.
+# Bodies go to /dev/null and curl's own messages are discarded.
+run_curl() {
+  local c=$1 out rc=0
+  shift
+  out=$(docker exec "$c" curl -sS -g -o /dev/null --connect-timeout 5 --max-time 15 "$@" 2>/dev/null) || rc=$?
+  echo "$out $rc"
+}
+
+# Only these shapes of curl output are ever read: three-digit codes and an exit code.
+codes_re='^([0-9]{3}) ([0-9]{3}) ([0-9]+)$'
+none_re='^([0-9]{6}) ([0-9]+)$'
+
+# check <name> <method> <target>
+check() {
+  local name=$1 method=$2 target=$3 out connect code rc server
+  case $method in
+    proxy_allow)
+      out=$(run_curl "$probe" -x "$proxy" -w '%{http_connect} %{http_code}' "$target")
+      if [[ $out =~ $codes_re ]]; then
+        connect=${BASH_REMATCH[1]} code=${BASH_REMATCH[2]}
+        if [[ $connect == 200 ]] && ((10#$code >= 200 && 10#$code < 400)); then
+          pass "$name" "$target" "connect=$connect http=$code"
+        else
+          mismatch "$name" "$target" "connect=$connect http=$code" "connect=200 http=2xx/3xx"
+        fi
+      else
+        mismatch "$name" "$target" "the probe did not run curl" "connect=200 http=2xx/3xx"
+      fi
+      ;;
+    proxy_open | proxy_deny)
+      local want=407
+      [[ $method == proxy_open ]] && want=200
+      out=$(run_curl "$probe" -p -x "$proxy" -w '%{http_connect} %{http_code}' "http://$target/")
+      if [[ $out =~ $codes_re ]]; then
+        connect=${BASH_REMATCH[1]}
+        if [[ $connect == "$want" ]]; then
+          pass "$name" "$target" "connect=$connect"
+        elif [[ $method == proxy_open && ($connect == 502 || $connect == 503) ]]; then
+          mismatch "$name" "$target" "connect=$connect: target did not answer; start it or remove the exception" "connect=200"
+        else
+          mismatch "$name" "$target" "connect=$connect" "connect=$want"
+        fi
+      else
+        mismatch "$name" "$target" "the probe did not run curl" "connect=$want"
+      fi
+      ;;
+    direct_none | cross_none)
+      if [[ $target == *" "* ]]; then
+        out=$(run_curl "$probe" -w '%{http_connect}%{http_code}' -x "${target%% *}" "${target#* }")
+      else
+        out=$(run_curl "$probe" -w '%{http_connect}%{http_code}' "$target")
+      fi
+      if [[ $out =~ $none_re ]]; then
+        code=${BASH_REMATCH[1]} rc=${BASH_REMATCH[2]}
+        if [[ $code == 000000 ]] && ((rc != 0 && rc < 100)); then
+          pass "$name" "$target" "no connection (curl exit $rc)"
+        elif [[ $code == 000000 ]]; then
+          mismatch "$name" "$target" "the probe did not run curl (exit $rc)" "no connection"
+        else
+          mismatch "$name" "$target" "connected (codes $code)" "no connection"
+        fi
+      else
+        mismatch "$name" "$target" "the probe did not run curl" "no connection"
+      fi
+      ;;
+    dns_none)
+      rc=0
+      if [[ $target == *@* ]]; then
+        server=${target#*@}
+        docker exec "$probe" nslookup "${target%%@*}" "$server" >/dev/null 2>&1 || rc=$?
+      else
+        docker exec "$probe" nslookup "$target" >/dev/null 2>&1 || rc=$?
+      fi
+      case $rc in
+        0) mismatch "$name" "$target" "resolved" "no resolution" ;;
+        1) pass "$name" "$target" "no resolution" ;;
+        *) mismatch "$name" "$target" "nslookup did not run (exit $rc)" "no resolution" ;;
+      esac
+      ;;
+  esac
+}
+
+i=0
+while ((i < ${#names[@]})); do
+  check "${names[$i]}" "${methods[$i]}" "${targets[$i]}"
+  i=$((i + 1))
+done
+
+# -------- Containers on the other caller networks are out of reach --------
+gw_image=$(docker inspect --format '{{.Config.Image}}' "$gw")
+IFS=, read -r -a others <<<"$advertised"
+for other in "${others[@]}"; do
+  [[ -n $other && $other != "$key" ]] || continue
+  other_net=$(label "windroc.egress.network.$other.name")
+  peer=$(start "$other_net" --pull never --entrypoint /smokescreen "$gw_image" --listen-ip 0.0.0.0 --listen-port 8080) || {
+    mismatch peer_control "$other_net" "the peer listener did not start" "an answer on its own network"
+    continue
+  }
+  containers+=("$peer")
+  control=$(start "$other_net" --entrypoint sleep "$PROBE_IMAGE" 900) || {
+    mismatch peer_control "$other_net" "the control probe did not start" "an answer on its own network"
+    continue
+  }
+  containers+=("$control")
+  peer_ip=$(docker inspect --format "{{(index .NetworkSettings.Networks \"$other_net\").IPAddress}}" "$peer")
+  url="http://$peer_ip:8080/"
+  answered=no
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    out=$(run_curl "$control" -w '%{http_connect}%{http_code}' "$url")
+    if [[ $out =~ $none_re && ${BASH_REMATCH[1]} != 000000 ]]; then
+      answered=yes
+      break
+    fi
+    sleep 1
+  done
+  if [[ $answered == yes ]]; then
+    pass peer_control "$url" "answers on $other_net"
+  else
+    mismatch peer_control "$url" "no answer on $other_net" "an answer on its own network"
+    continue
+  fi
+  check peer_none direct_none "$url"
+done
+
+summary
+((failures == 0))

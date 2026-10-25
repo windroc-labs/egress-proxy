@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# Self-test of verify-egress (CI `lint` job): runs the unmodified script against a fake
+# `docker` (and fake host tools) on PATH, so no Docker daemon, registry credential or
+# keychain is ever reached: DOCKER_HOST points at a socket that does not exist.
+# Prints `ok <case>` or `FAIL <case>: <detail>`; exits 1 if any case fails.
+set -euo pipefail
+repo=$(cd "$(dirname "$0")/.." && pwd)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+status=0
+ok() { echo "ok $1"; }
+fail() {
+  printf 'FAIL %s: %s\n' "$1" "$2"
+  status=1
+}
+
+export DOCKER_HOST=unix://$work/nonexistent.sock
+export DOCKER_CONFIG=$work/docker
+mkdir -p "$work/bin" "$DOCKER_CONFIG"
+
+# The fake docker. State and scenario live in $FAKE:
+#   ids        containers matching the contract label (default: gw1)
+#   health     "<running> <health>" (default: true healthy)
+#   plan       the plan `gateway plan` prints; plan.rc and plan.err make it fail
+#   answers    "<url>\t<write-out>\t<exit>" lines overriding curl's answer for a URL
+#   open       host:port targets a CONNECT tunnel reaches
+#   body       when present, curl also writes a body and a token-like line
+#   calls      every call, with the DOCKER_CONFIG and DOCKER_HOST it saw
+cat >"$work/bin/docker" <<'FAKE'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "DOCKER_CONFIG=${DOCKER_CONFIG:-} DOCKER_HOST=${DOCKER_HOST:-} $*" >>"$FAKE/calls"
+network_key() { sed -E 's/.*windroc\.egress\.network\.([a-z0-9-]+)\.(name|proxy).*/\1/' <<<"$1"; }
+peer_ip() {
+  case $1 in
+    egress-workers) echo 172.31.1.5 ;;
+    *) echo 172.31.2.5 ;;
+  esac
+}
+fake_curl() {
+  local container=$1 url x="" p="" write="" arg prev=""
+  shift
+  for arg in "$@"; do
+    case $prev in
+      -x) x=$arg ;;
+      -w) write=$arg ;;
+    esac
+    [[ $arg == -p ]] && p=yes
+    prev=$arg
+    url=$arg
+  done
+  if [[ -f $FAKE/body ]]; then
+    echo "SECRET-BODY-0123 token=sk-ant-SELFTEST" >&2
+  fi
+  local line
+  line=$(awk -F '\t' -v u="$url" '$1 == u { print; exit }' "$FAKE/answers" 2>/dev/null || true)
+  if [[ -n $line ]]; then
+    printf '%s' "$(cut -f 2 <<<"$line")"
+    exit "$(cut -f 3 <<<"$line")"
+  fi
+  if [[ -n $x && -n $p ]]; then
+    local target=${url#http://}
+    target=${target%/}
+    if grep -qxF "$target" "$FAKE/open" 2>/dev/null; then
+      printf '200 200'
+      exit 0
+    fi
+    printf '407 000'
+    exit 56
+  elif [[ -n $x && $x == "${PROXY:-http://egress-proxy-workers:4750}" ]]; then
+    printf '200 200'
+    exit 0
+  elif [[ -z $x && $url == http://172.31.*:8080/ ]]; then
+    local own
+    own=$(cat "$FAKE/c/$container")
+    if [[ $url == "http://$(peer_ip "$own"):8080/" ]]; then
+      printf '000404'
+      exit 0
+    fi
+  fi
+  [[ $write == *' '* ]] && printf '000 000' || printf '000000'
+  exit 7
+}
+case $1 in
+  context) echo unix:///fake-context.sock ;;
+  ps) cat "$FAKE/ids" 2>/dev/null || echo gw1 ;;
+  inspect)
+    fmt=$3 id=$4
+    case $fmt in
+      *'{{.Name}}'*) echo /egress-gateway ;;
+      *'"windroc.egress.contract"'*) echo 1 ;;
+      *'.State.Running'*) cat "$FAKE/health" 2>/dev/null || echo "true healthy" ;;
+      *'"windroc.egress.networks"'*) echo "mini-op,workers" ;;
+      *'.name"'*) echo "egress-$(network_key "$fmt")" ;;
+      *'.proxy"'*) echo "http://egress-proxy-$(network_key "$fmt"):4750" ;;
+      *'.Config.Image'*) echo egress-gateway-image ;;
+      *IPAddress*) peer_ip "$(cat "$FAKE/c/$id")" ;;
+      *) echo "fake docker: unknown inspect $fmt" >&2; exit 1 ;;
+    esac
+    ;;
+  network) echo true ;;
+  run)
+    n=$(($(cat "$FAKE/n" 2>/dev/null || echo 0) + 1))
+    echo "$n" >"$FAKE/n"
+    prev=""
+    for arg in "$@"; do
+      [[ $prev == --network ]] && net=$arg
+      prev=$arg
+    done
+    mkdir -p "$FAKE/c"
+    echo "$net" >"$FAKE/c/c$n"
+    echo "c$n"
+    ;;
+  exec)
+    container=$2
+    shift 2
+    case $1 in
+      /gateway)
+        if [[ -f $FAKE/plan.rc ]]; then
+          cat "$FAKE/plan.err" >&2
+          exit "$(cat "$FAKE/plan.rc")"
+        fi
+        cat "$FAKE/plan"
+        ;;
+      curl) shift; fake_curl "$container" "$@" ;;
+      nslookup) exit "$(cat "$FAKE/nslookup.rc" 2>/dev/null || echo 1)" ;;
+      *) echo "fake docker: unknown exec $1" >&2; exit 1 ;;
+    esac
+    ;;
+  rm) ;;
+  *) echo "fake docker: unknown command $1" >&2; exit 1 ;;
+esac
+FAKE
+# Fake host tools: a Linux host with one LAN address and a default gateway.
+cat >"$work/bin/uname" <<'FAKE'
+#!/usr/bin/env bash
+echo "${FAKE_UNAME:-Linux}"
+FAKE
+cat >"$work/bin/ip" <<'FAKE'
+#!/usr/bin/env bash
+case "$*" in
+  "-4 route show default") echo "default via 10.1.0.1 dev eth0 proto dhcp" ;;
+  "-6 route show default") ;;
+  "-o addr show")
+    echo "1: lo    inet 127.0.0.1/8 scope host lo"
+    echo "2: eth0    inet 10.1.0.4/16 brd 10.1.255.255 scope global eth0"
+    echo "2: eth0    inet6 2001:db8:1::4/64 scope global"
+    ;;
+esac
+FAKE
+cat >"$work/bin/route" <<'FAKE'
+#!/usr/bin/env bash
+case "$*" in
+  "-n get default") printf '   route to: default\n    gateway: 192.168.1.1\n  interface: en0\n' ;;
+  "-n get -inet6 default") printf '   route to: default\n    gateway: fe80::1%%en0\n' ;;
+esac
+FAKE
+cat >"$work/bin/ifconfig" <<'FAKE'
+#!/usr/bin/env bash
+cat <<'OUT'
+lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384
+	inet 127.0.0.1 netmask 0xff000000
+	inet6 ::1 prefixlen 128
+en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	inet6 fe80::1c2b:3d4e:5f60:7182%en0 prefixlen 64 secured scopeid 0x4
+	inet 192.168.1.20 netmask 0xffffff00 broadcast 192.168.1.255
+	inet6 2001:db8:1:2::20 prefixlen 64 autoconf secured
+OUT
+FAKE
+chmod +x "$work/bin/"*
+
+PLAN=$(printf '%s\n' \
+  $'proxy_deny\tproxy_deny\t10.0.0.1:443' \
+  $'proxy_allow\tproxy_allow\thttps://example.com/' \
+  $'exception_open\tproxy_open\thost.docker.internal:11434' \
+  $'exception_other_port\tproxy_deny\thost.docker.internal:11435' \
+  $'cross_none\tcross_none\thttp://172.21.0.2:4750/' \
+  $'cross_none\tcross_none\thttp://172.21.0.2:4750 https://example.com/' \
+  $'direct_none\tdirect_none\thttps://1.1.1.1/' \
+  $'dns_none\tdns_none\texample.com' \
+  $'dns_none\tdns_none\texample.com@1.1.1.1')
+# 7 preconditions (gateway_found .. plan), the 9 plan checks, peer_control and peer_none.
+TOTAL=18
+
+# scenario <name>: a fresh $FAKE with the passing defaults.
+scenario() {
+  FAKE=$work/fake-$1
+  mkdir -p "$FAKE"
+  printf '%s\n' "$PLAN" >"$FAKE/plan"
+  echo host.docker.internal:11434 >"$FAKE/open"
+  export FAKE
+}
+
+# run <args...>: verify-egress's combined output, then its exit code on the last line.
+run() {
+  local rc=0 out
+  out=$(PATH="$work/bin:$PATH" "$repo/verify-egress" "$@" 2>&1) || rc=$?
+  printf '%s\nexit=%s\n' "$out" "$rc"
+}
+
+expect() {
+  local name=$1 out=$2 want_exit=$3
+  shift 3
+  local line
+  [[ $(tail -n 1 <<<"$out") == "exit=$want_exit" ]] || {
+    fail "$name" "want exit $want_exit: $out"
+    return
+  }
+  for line in "$@"; do
+    grep -qxF -- "$line" <<<"$out" || {
+      fail "$name" "no line '$line' in: $out"
+      return
+    }
+  done
+  ok "$name"
+}
+
+curl_calls() { grep -c ' exec [^ ]* curl ' "$FAKE/calls" || true; }
+
+scenario all_pass
+out=$(run workers)
+expect all_pass "$out" 0 \
+  "ok gateway_healthy egress-gateway healthy" \
+  "ok proxy_deny 10.0.0.1:443 connect=407" \
+  "ok proxy_allow https://example.com/ connect=200 http=200" \
+  "ok exception_open host.docker.internal:11434 connect=200" \
+  "ok cross_none http://172.21.0.2:4750 https://example.com/ no connection (curl exit 7)" \
+  "ok dns_none example.com@1.1.1.1 no resolution" \
+  "ok peer_control http://172.31.2.5:8080/ answers on egress-mini-op" \
+  "ok peer_none http://172.31.2.5:8080/ no connection (curl exit 7)" \
+  "all $TOTAL checks passed"
+
+# The listener is gone once verify-egress has exited.
+port=$(sed -nE 's/.*--listener-port ([0-9]+).*/\1/p' "$FAKE/calls" | head -n 1)
+if [[ -z $port ]]; then
+  fail listener_removed "no --listener-port in the plan call"
+elif curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$port/"; then
+  fail listener_removed "127.0.0.1:$port still answers"
+else
+  ok listener_removed
+fi
+
+# Linux host facts reach the plan call.
+if grep -qF -- "--host-addr 10.1.0.4/16" "$FAKE/calls" &&
+  grep -qF -- "--host-addr 2001:db8:1::4/64" "$FAKE/calls" &&
+  grep -qF -- "--default-gateway 10.1.0.1" "$FAKE/calls"; then
+  ok linux_host_facts
+else
+  fail linux_host_facts "$(grep ' exec gw1 ' "$FAKE/calls")"
+fi
+
+# Every docker call saw the throwaway client config and the pinned endpoint.
+if grep -v "^DOCKER_CONFIG=/[^ ]*/docker DOCKER_HOST=unix://$work/nonexistent.sock " "$FAKE/calls" | grep -q . ||
+  grep -qF "DOCKER_CONFIG=$DOCKER_CONFIG " "$FAKE/calls"; then
+  fail docker_config_throwaway "$(head -n 3 "$FAKE/calls")"
+else
+  ok docker_config_throwaway
+fi
+
+scenario context_endpoint
+out=$(DOCKER_HOST='' run workers)
+if [[ $(tail -n 1 <<<"$out") == exit=0 ]] && grep -q '^DOCKER_CONFIG=[^ ]* DOCKER_HOST= context inspect' "$FAKE/calls" &&
+  ! grep -v ' context inspect' "$FAKE/calls" | grep -qv 'DOCKER_HOST=unix:///fake-context.sock '; then
+  ok context_endpoint
+else
+  fail context_endpoint "$out"
+fi
+
+scenario darwin_host_facts
+out=$(FAKE_UNAME=Darwin run workers)
+if [[ $(tail -n 1 <<<"$out") == exit=0 ]] &&
+  grep -qF -- "--default-gateway 192.168.1.1 --default-gateway fe80::1 --host-addr 127.0.0.1/8 --host-addr ::1/128 --host-addr fe80::1c2b:3d4e:5f60:7182/64 --host-addr 192.168.1.20/24 --host-addr 2001:db8:1:2::20/64" "$FAKE/calls"; then
+  ok darwin_host_facts
+else
+  fail darwin_host_facts "$out $(grep ' exec gw1 ' "$FAKE/calls" || true)"
+fi
+
+scenario mismatch_named
+printf 'http://10.0.0.1:443/\t200 200\t0\n' >"$FAKE/answers"
+out=$(run workers)
+expect mismatch_named "$out" 1 \
+  "FAIL proxy_deny 10.0.0.1:443: connect=200, want connect=407" \
+  "1 of $TOTAL checks failed: proxy_deny"
+
+scenario exception_not_answering
+printf 'http://host.docker.internal:11434/\t502 000\t56\n' >"$FAKE/answers"
+out=$(run workers)
+expect exception_not_answering "$out" 1 \
+  "FAIL exception_open host.docker.internal:11434: connect=502: target did not answer; start it or remove the exception, want connect=200"
+
+scenario direct_connected
+printf 'https://1.1.1.1/\t000200\t0\n' >"$FAKE/answers"
+out=$(run workers)
+expect direct_connected "$out" 1 "FAIL direct_none https://1.1.1.1/: connected (codes 000200), want no connection"
+
+scenario dns_resolved
+echo 0 >"$FAKE/nslookup.rc"
+out=$(run workers)
+expect dns_resolved "$out" 1 "FAIL dns_none example.com: resolved, want no resolution"
+
+scenario no_body_no_token
+touch "$FAKE/body"
+printf 'https://example.com/\tSECRET-BODY-0123 200 200\t0\n' >"$FAKE/answers"
+out=$(EGRESS_SELFTEST_TOKEN=sk-ant-SELFTEST-TOKEN run workers)
+if [[ $out == *SECRET-BODY* || $out == *sk-ant-SELFTEST* ]]; then
+  fail no_body_no_token "$out"
+elif ! grep -qxF "FAIL proxy_allow https://example.com/: the probe did not run curl, want connect=200 http=2xx/3xx" <<<"$out"; then
+  fail no_body_no_token "unparseable curl output is not reported as such: $out"
+else
+  ok no_body_no_token
+fi
+
+scenario unhealthy_stops
+echo "true unhealthy" >"$FAKE/health"
+out=$(run workers)
+expect unhealthy_stops "$out" 1 \
+  "FAIL gateway_healthy egress-gateway: running/health 'true unhealthy', want true healthy" \
+  "1 of 3 checks failed: gateway_healthy"
+[[ $(curl_calls) == 0 ]] || fail unhealthy_stops "probes ran"
+
+scenario two_gateways
+printf 'gw1\ngw2\n' >"$FAKE/ids"
+out=$(run workers)
+expect two_gateways "$out" 1 "FAIL gateway_found label windroc.egress.contract: 2 containers, want exactly one"
+
+scenario unknown_network
+out=$(run other)
+expect unknown_network "$out" 1 "FAIL network_advertised other: networks 'mini-op,workers', want other among them"
+
+scenario old_gateway
+echo 2 >"$FAKE/plan.rc"
+printf 'gateway: unknown option plan\nusage: gateway ...\n' >"$FAKE/plan.err"
+out=$(run workers)
+expect old_gateway "$out" 1 "FAIL plan egress-gateway: the gateway image has no plan mode; run ./start.sh, want a plan"
+
+scenario drift_message
+echo 2 >"$FAKE/plan.rc"
+echo "gateway: network workers: running policy differs from the config; restart the gateway (docker compose restart gateway)" >"$FAKE/plan.err"
+out=$(run workers)
+expect drift_message "$out" 1 "FAIL plan egress-gateway: gateway: network workers: running policy differs from the config; restart the gateway (docker compose restart gateway), want a plan"
+
+# malformed <case> <plan line> <reason>: the line fails `plan` before any probe runs.
+malformed() {
+  scenario "$1"
+  printf '%s\n' "$2" >"$FAKE/plan"
+  out=$(run workers)
+  expect "$1" "$out" 1 "FAIL plan line 1: $3, want <name> <method> <target>"
+  [[ $(curl_calls) == 0 ]] || fail "$1" "probes ran"
+}
+malformed leading_dash $'proxy_deny\tproxy_deny\t-K/x' "a target element starts with - or is empty"
+malformed cross_dash $'cross_none\tcross_none\thttp://a:1 -K/x' "a target element starts with - or is empty"
+malformed dns_dash $'dns_none\tdns_none\texample.com@-port=1' "a target element starts with - or is empty"
+malformed unknown_method $'x\tbogus\tt' "unknown method"
+malformed two_fields $'a\tproxy_deny' "not three tab-separated fields"
+malformed four_fields $'a\tproxy_deny\tt\textra' "not three tab-separated fields"
+
+scenario usage
+for args in "" "a b" "--bogus" "Bad_Key"; do
+  # shellcheck disable=SC2086 # word splitting builds each argument list
+  out=$(run $args)
+  if [[ $(tail -n 1 <<<"$out") != exit=2 || $out != *"usage: verify-egress"* ]]; then
+    fail usage "args '$args': $out"
+  fi
+done
+[[ ! -s $FAKE/calls ]] || fail usage "docker was called"
+ok usage
+
+exit "$status"
