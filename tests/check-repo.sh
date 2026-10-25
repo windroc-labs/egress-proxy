@@ -26,9 +26,10 @@ none_found() {
   esac
 }
 
-# The two names, assembled from pieces so this file does not match itself.
+# The two names, assembled from pieces so this file does not match itself. The bare
+# `mini-op` is a caller network key; its repo, paths and container names are references.
 a=ensem b=ble c=mini d=-op
-none_found no_sibling_repo_refs git grep -nIiE "${a}${b}|${c}${d}" -- . ':!docs/' ':!README.md'
+none_found no_sibling_repo_refs git grep -nIiE "${a}${b}|/${c}${d}|${c}${d}/|${c}${d}-(net|proxy)" -- . ':!docs/' ':!README.md'
 
 # Every FROM names an earlier stage or an image pinned by digest. A FROM using
 # ${TARGETARCH} must name a stage for each architecture the Dockerfile supports.
