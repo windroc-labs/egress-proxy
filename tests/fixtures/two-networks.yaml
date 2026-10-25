@@ -1,9 +1,16 @@
-# tests/integration.sh stage B: compose.yaml plus tests/compose.test.yaml.
+# tests/integration.sh stages B and C: workers with an exception for a host port, and
+# mini-op in allowlist mode. LAN_IP is replaced at run time with the runner's own LAN
+# address, whose port 2222 stands in for the mini's ssh port.
 version: 1
 networks:
   workers:
     mode: denylist
-  testallow:
+    exceptions:
+      - host.docker.internal:11434
+  mini-op:
     mode: allowlist
     allow:
       - example.com
+      - localtest.me
+    exceptions:
+      - LAN_IP:2222
