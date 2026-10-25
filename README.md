@@ -67,10 +67,11 @@ detaches the gateway; its Docker network stays until `docker network rm egress-<
 - **exceptions** (either mode): `host:port` entries allowed even though a deny rule covers
   their address, e.g. `host.docker.internal:11434` for Ollama on `workers`, or the mini's
   ssh port on `mini-op`. The gateway resolves each name at start and opens only that port
-  of those addresses (smokescreen `allow_addresses`), for every caller on that network; in
-  allowlist mode the host is allowed too (its public addresses on any port). A name that
-  does not resolve, or that resolves to the gateway or into a caller network's subnet,
-  stops the start. Names are not re-resolved: after an address changes, restart the
+  of those addresses (smokescreen `allow_addresses`), for every caller on that network. In
+  allowlist mode the host also enters the ACL, which has no ports, so there an exception
+  must be an address a deny rule covers (e.g. a LAN address); list public hosts under
+  `allow`. A name that does not resolve, that resolves to the gateway or into a caller
+  network's subnet, or (allowlist) to an address no deny rule covers, stops the start. Names are not re-resolved: after an address changes, restart the
   gateway.
 
 The gateway cannot see the Mac's network interfaces: LAN ranges in RFC 1918 space are in
@@ -101,7 +102,6 @@ the Mac is offline.
   could reach the gateway's listener on another network. Never grant those capabilities to
   a caller.
 - Containers on the same caller network can still reach each other directly.
-
 
 ## Development
 

@@ -14,14 +14,16 @@ set -euo pipefail
 
 repo=$(cd "$(dirname "$0")" && pwd)
 config_dir=${EGRESS_CONFIG_DIR:-$HOME/.egress}
-# compose.yaml mounts this directory.
-export EGRESS_CONFIG_DIR=$config_dir
-override=$config_dir/compose.networks.yaml
 
 if [[ ! -f $config_dir/config.local.yaml ]]; then
   echo "start.sh: $config_dir/config.local.yaml not found; copy config.example.yaml there (README.md)" >&2
   exit 2
 fi
+# Absolute: compose.yaml mounts this directory, and compose resolves a relative path
+# against the project directory, not ours.
+config_dir=$(cd "$config_dir" && pwd)
+export EGRESS_CONFIG_DIR=$config_dir
+override=$config_dir/compose.networks.yaml
 
 base=(docker compose --project-directory "$repo" -f "$repo/compose.yaml")
 

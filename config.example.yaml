@@ -50,7 +50,8 @@ networks:
     # end example
 
   # mini-op's network: Claude Code's API and claude.ai login, and the mini's ssh port.
-  # Replace 192.0.2.10 with the mini's LAN address in your local copy.
+  # Replace 192.0.2.10 with the mini's LAN address in your local copy: in allowlist mode an
+  # exception must be an address a deny rule covers, so the placeholder itself is refused.
   # example: mini-op network
   # mini-op:
   #   mode: allowlist

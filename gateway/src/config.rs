@@ -85,16 +85,11 @@ impl HostPort {
         };
         Some(HostPort { host, port })
     }
-}
 
-/// The Docker network of caller network `key`.
-pub fn network_name(key: &str) -> String {
-    format!("egress-{key}")
-}
-
-/// The listen alias of caller network `key`: the gateway's DNS name on it.
-pub fn listen_alias(key: &str) -> String {
-    format!("egress-proxy-{key}")
+    /// The host as a canonical IP address (IPv4-mapped IPv6 as IPv4), or `None` for a name.
+    pub fn ip(&self) -> Option<IpAddr> {
+        self.host.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
+    }
 }
 
 impl fmt::Display for HostPort {
@@ -105,6 +100,16 @@ impl fmt::Display for HostPort {
             write!(f, "{}:{}", self.host, self.port)
         }
     }
+}
+
+/// The Docker network of caller network `key`.
+pub fn network_name(key: &str) -> String {
+    format!("egress-{key}")
+}
+
+/// The listen alias of caller network `key`: the gateway's DNS name on it.
+pub fn listen_alias(key: &str) -> String {
+    format!("egress-proxy-{key}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,10 +390,15 @@ fn parse_deny_range(text: &str) -> Result<IpNet, String> {
     Ok(net)
 }
 
-/// An exception: `host:port` or `[v6]:port`, the host an IP address or a domain.
+/// An exception: `host:port` or `[v6]:port`, the host an IP address or a domain, which is
+/// lower-cased (smokescreen's ACL refuses a domain not in its normalized form).
 fn parse_exception(entry: &str) -> Result<HostPort, String> {
     HostPort::parse(entry)
         .filter(|hp| hp.host.parse::<IpAddr>().is_ok() || valid_domain(&hp.host))
+        .map(|hp| HostPort {
+            host: hp.host.to_ascii_lowercase(),
+            ..hp
+        })
         .ok_or_else(|| format!("exceptions: {entry} is not host:port"))
 }
 
@@ -772,7 +782,7 @@ mod tests {
     #[test]
     fn exceptions_parsed() {
         let config = parse_ok(
-            "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"nas.lan:8080\", \"host.docker.internal:11434\", \"192.168.1.20:11434\", \"[fd00::1]:22\", \"nas.lan:8080\"]\n",
+            "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"NAS.Lan:8080\", \"host.docker.internal:11434\", \"192.168.1.20:11434\", \"[fd00::1]:22\", \"nas.lan:8080\"]\n",
         );
         let got: Vec<String> = config.networks["workers"]
             .exceptions
@@ -796,6 +806,14 @@ mod tests {
             api.networks["api"].exceptions[0].to_string(),
             "192.0.2.10:22"
         );
+    }
+
+    #[test]
+    fn exception_ip() {
+        let ip = |s: &str| HostPort::parse(s).unwrap().ip();
+        assert_eq!(ip("192.0.2.1:1"), Some("192.0.2.1".parse().unwrap()));
+        assert_eq!(ip("[::ffff:10.0.0.1]:1"), Some("10.0.0.1".parse().unwrap()));
+        assert_eq!(ip("nas.lan:1"), None);
     }
 
     #[test]

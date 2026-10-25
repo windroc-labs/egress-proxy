@@ -118,9 +118,9 @@ fn resolve_exceptions(
     let mut resolved: BTreeMap<String, Vec<IpAddr>> = BTreeMap::new();
     for (key, network) in &config.networks {
         for exception in &network.exceptions {
-            let addrs = match exception.host.parse::<IpAddr>() {
-                Ok(ip) => vec![ip.to_canonical()],
-                Err(_) => match resolved.get(&exception.host) {
+            let addrs = match exception.ip() {
+                Some(ip) => vec![ip],
+                None => match resolved.get(&exception.host) {
                     Some(addrs) => addrs.clone(),
                     None => {
                         let addrs =
@@ -357,7 +357,10 @@ mod tests {
         let err = gather_with(
             &config_with(&[("workers", &[])]),
             4750,
-            &resolver(&[("egress-proxy-workers", &["172.20.0.2"])]),
+            &resolver(&[
+                ("egress-proxy-workers", &["172.20.0.2"]),
+                ("host.docker.internal", &[]),
+            ]),
             &["172.20.0.2/16".parse().unwrap()],
         );
         assert!(err.is_ok());

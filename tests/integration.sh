@@ -381,8 +381,10 @@ case $lan_ip in
   *) fail lan_ip_private "the runner's LAN address '$lan_ip' is not private" ;;
 esac
 # Host listeners: Ollama's port, a neighbouring port, and the mini's ssh port stand-in.
+# They serve an empty directory, so they expose no files.
+mkdir -p "$work/www"
 for port in 11434 11435 2222; do
-  python3 -m http.server --bind 0.0.0.0 "$port" >/dev/null 2>&1 &
+  python3 -m http.server --bind 0.0.0.0 --directory "$work/www" "$port" >/dev/null 2>&1 &
   host_listeners+=($!)
 done
 for port in 11434 11435 2222; do
