@@ -563,6 +563,17 @@ mod tests {
     }
 
     #[test]
+    fn example_config_is_valid() {
+        let path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../config.example.yaml"
+        ));
+        let config = load(path).unwrap();
+        assert_eq!(config.networks.keys().collect::<Vec<_>>(), ["workers"]);
+        assert_eq!(config.networks["workers"].mode, Mode::Denylist);
+    }
+
+    #[test]
     fn missing_file_is_named() {
         let err = load(Path::new("/nonexistent/egress/config.local.yaml")).unwrap_err();
         assert!(
