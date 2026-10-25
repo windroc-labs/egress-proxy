@@ -70,7 +70,7 @@ pub fn gather(config: &Config, port: u16, resolver: &Resolver) -> Result<Facts, 
 }
 
 /// [`gather`] with the gateway's interface addresses given.
-pub fn gather_with(
+fn gather_with(
     config: &Config,
     port: u16,
     resolver: &Resolver,
