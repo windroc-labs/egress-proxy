@@ -206,7 +206,8 @@ destination() {
 
 # The script the tool container runs (POSIX sh), with the row names as arguments. Each
 # tool's output goes to /dev/null; per row it prints `<tool>\t<start>\t<end>\t<status>`,
-# status `missing`, `nohttp3`, `noruntime`, `timeout` or the exit code. Dummy credentials
+# status `missing`, `nohttp3`, `noruntime`, `timeout` (coreutils 124, busybox 143 or 137)
+# or the exit code. Dummy credentials
 # are not credentials and are never printed.
 # shellcheck disable=SC2016 # expanded by the container's sh
 tools_script='
@@ -272,7 +273,7 @@ for t in "$@"; do
     200) s=missing ;;
     201) s=nohttp3 ;;
     202) s=noruntime ;;
-    124) s=timeout ;;
+    124 | 137 | 143) s=timeout ;;
     *) s=$rc ;;
   esac
   printf "%s\t%s\t%s\t%s\n" "$t" "$start" "$end" "$s"
@@ -505,13 +506,14 @@ check() {
       out=$(run_curl "$probe" -x "$proxy" -w '%{http_connect} %{http_code}' "$target")
       if [[ $out =~ $codes_re ]]; then
         connect=${BASH_REMATCH[1]} code=${BASH_REMATCH[2]}
-        if [[ $connect == 200 ]] && ((10#$code >= 200 && 10#$code < 400)); then
+        # Any HTTP answer: the site was reached (an API root may answer 403 or 404).
+        if [[ $connect == 200 && $code != 000 ]]; then
           pass "$name" "$target" "connect=$connect http=$code"
         else
-          mismatch "$name" "$target" "connect=$connect http=$code" "connect=200 http=2xx/3xx"
+          mismatch "$name" "$target" "connect=$connect http=$code" "connect=200 and an HTTP answer"
         fi
       else
-        mismatch "$name" "$target" "the probe did not run curl" "connect=200 http=2xx/3xx"
+        mismatch "$name" "$target" "the probe did not run curl" "connect=200 and an HTTP answer"
       fi
       ;;
     proxy_open | proxy_deny)
@@ -551,6 +553,11 @@ check() {
       fi
       ;;
     dns_none)
+      # docker exec also exits 1 when the probe is gone; that must not read as a pass.
+      if ! docker exec "$probe" true >/dev/null 2>&1; then
+        mismatch "$name" "$target" "the probe is not running" "no resolution"
+        return
+      fi
       rc=0
       if [[ $target == *@* ]]; then
         server=${target#*@}

@@ -23,7 +23,8 @@ mkdir -p "$work/bin" "$DOCKER_CONFIG"
 #   ids        containers matching the contract label (default: gw1)
 #   health     "<running> <health>" (default: true healthy)
 #   plan       the plan `gateway plan` prints; plan.rc and plan.err make it fail
-#   answers    "<url>\t<write-out>\t<exit>" lines overriding curl's answer for a URL
+#   answers    "<url>\t<write-out>\t<exit>" lines overriding curl's answer for a URL, or
+#              "<proxy> <url>\t…" for that URL through that proxy only
 #   open       host:port targets a CONNECT tunnel reaches
 #   body       when present, curl also writes a body and a token-like line
 #   calls      every call, with the DOCKER_CONFIG and DOCKER_HOST it saw
@@ -57,7 +58,7 @@ fake_curl() {
     echo "SECRET-BODY-0123 token=sk-ant-SELFTEST" >&2
   fi
   local line
-  line=$(awk -F '\t' -v u="$url" '$1 == u { print; exit }' "$FAKE/answers" 2>/dev/null || true)
+  line=$(awk -F '\t' -v u="$url" -v xu="$x $url" '$1 == xu || $1 == u { print; exit }' "$FAKE/answers" 2>/dev/null || true)
   if [[ -n $line ]]; then
     printf '%s' "$(cut -f 2 <<<"$line")"
     exit "$(cut -f 3 <<<"$line")"
@@ -144,6 +145,7 @@ case $1 in
         ;;
       curl) shift; fake_curl "$container" "$@" ;;
       nslookup) exit "$(cat "$FAKE/nslookup.rc" 2>/dev/null || echo 1)" ;;
+      true) [[ ! -f $FAKE/probe_gone ]] ;;
       *) echo "fake docker: unknown exec $1" >&2; exit 1 ;;
     esac
     ;;
@@ -302,6 +304,17 @@ expect mismatch_named "$out" 1 \
   "FAIL proxy_deny 10.0.0.1:443: connect=200, want connect=407" \
   "1 of $TOTAL checks failed: proxy_deny"
 
+# An allowed site that answers 404 at its root was still reached.
+scenario allow_any_answer
+printf 'http://egress-proxy-workers:4750 https://example.com/\t200 404\t0\n' >"$FAKE/answers"
+out=$(run workers)
+expect allow_any_answer "$out" 0 "ok proxy_allow https://example.com/ connect=200 http=404"
+
+scenario allow_no_answer
+printf 'http://egress-proxy-workers:4750 https://example.com/\t200 000\t35\n' >"$FAKE/answers"
+out=$(run workers)
+expect allow_no_answer "$out" 1 "FAIL proxy_allow https://example.com/: connect=200 http=000, want connect=200 and an HTTP answer"
+
 scenario exception_not_answering
 printf 'http://host.docker.internal:11434/\t502 000\t56\n' >"$FAKE/answers"
 out=$(run workers)
@@ -313,6 +326,12 @@ printf 'https://1.1.1.1/\t000200\t0\n' >"$FAKE/answers"
 out=$(run workers)
 expect direct_connected "$out" 1 "FAIL direct_none https://1.1.1.1/: connected (codes 000200), want no connection"
 
+scenario probe_gone
+printf 'proxy_deny\tproxy_deny\t10.0.0.1:443\ndns_none\tdns_none\texample.com\n' >"$FAKE/plan"
+touch "$FAKE/probe_gone"
+out=$(run workers)
+expect probe_gone "$out" 1 "FAIL dns_none example.com: the probe is not running, want no resolution"
+
 scenario dns_resolved
 echo 0 >"$FAKE/nslookup.rc"
 out=$(run workers)
@@ -320,11 +339,11 @@ expect dns_resolved "$out" 1 "FAIL dns_none example.com: resolved, want no resol
 
 scenario no_body_no_token
 touch "$FAKE/body"
-printf 'https://example.com/\tSECRET-BODY-0123 200 200\t0\n' >"$FAKE/answers"
+printf 'http://egress-proxy-workers:4750 https://example.com/\tSECRET-BODY-0123 200 200\t0\n' >"$FAKE/answers"
 out=$(EGRESS_SELFTEST_TOKEN=sk-ant-SELFTEST-TOKEN run workers)
 if [[ $out == *SECRET-BODY* || $out == *sk-ant-SELFTEST* ]]; then
   fail no_body_no_token "$out"
-elif ! grep -qxF "FAIL proxy_allow https://example.com/: the probe did not run curl, want connect=200 http=2xx/3xx" <<<"$out"; then
+elif ! grep -qxF "FAIL proxy_allow https://example.com/: the probe did not run curl, want connect=200 and an HTTP answer" <<<"$out"; then
   fail no_body_no_token "unparseable curl output is not reported as such: $out"
 else
   ok no_body_no_token
@@ -390,6 +409,10 @@ scenario tools_results
   printf 'ssh\t170\t170\tmissing\n'
   printf 'QUIC / HTTP/3\t171\t171\tnohttp3\n'
   printf 'Node http\t172\t173\tSECRET-BODY-0123\n'
+  printf 'self-resolving program\t180\t181\t0\n'
+  printf 'pip\t190\t191\ttimeout\n'
+  printf 'uv\t200\t201\t2\n'
+  printf 'Node fetch, NODE_USE_ENV_PROXY=1\t210\t211\t1\n'
   printf 'bogus\t1\t2\t0\n'
   printf 'SECRET-BODY-0123 token=sk-ant-SELFTEST\n'
 } >"$FAKE/rows"
@@ -401,6 +424,10 @@ scenario tools_results
   allow_line 141 false api.anthropic.com 172.31.1.5
   allow_line 160 true deb.debian.org 172.31.1.5
   printf '161\tSECRET-BODY-0123 token=sk-ant-SELFTEST\n'
+  allow_line 181 true example.com 172.31.1.5
+  allow_line 190 true pypi.org 172.31.1.5
+  allow_line 200 true example.com 172.31.1.5
+  allow_line 211 true example.com 172.31.1.5
 } >"$FAKE/gwlog"
 out=$(EGRESS_SELFTEST_TOKEN=sk-ant-SELFTEST-TOKEN run --tools worker:test)
 expect tools_results "$out" 0 \
@@ -416,7 +443,11 @@ expect tools_results "$out" 0 \
   "| ssh | fails | not in image | 1.2.3 | $today |" \
   "| QUIC / HTTP/3 | fails | could not run: no HTTP/3 in curl | 1.2.3 | $today |" \
   "| Node http | fails | could not run: no runtime | 1.2.3 | $today |" \
-  "differs from expected: wget, npm, apt-get, Claude Code"
+  "| self-resolving program | fails | works | 1.2.3 | $today |" \
+  "| pip | works | fails: timed out | 1.2.3 | $today |" \
+  "| uv | works | fails: no proxy used | 1.2.3 | $today |" \
+  "| Node fetch, NODE_USE_ENV_PROXY=1 | works | fails: exit 1 | 1.2.3 | $today |" \
+  "differs from expected: self-resolving program, Node fetch, NODE_USE_ENV_PROXY=1, wget, pip, uv, npm, apt-get, Claude Code"
 [[ $out != *SECRET-BODY* && $out != *sk-ant-SELFTEST* ]] || fail tools_no_body_no_token "$out"
 [[ $(grep -c '^| ' <<<"$out") == 33 ]] || fail tools_results "want a header, a separator and 31 rows: $out"
 grep -q '^could not run: .*QUIC / HTTP/3.*Node http' <<<"$out" || fail tools_results "could not run line: $out"

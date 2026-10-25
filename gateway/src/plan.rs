@@ -164,7 +164,9 @@ pub fn plan(
                 ..target.clone()
             };
             checks.push("exception_open", Method::ProxyOpen, target.to_string());
-            checks.deny("exception_other_port", other);
+            if denies(network, facts, &other) {
+                checks.deny("exception_other_port", other);
+            }
         }
     }
 
@@ -183,7 +185,9 @@ pub fn plan(
         checks.push("cross_none", Method::CrossNone, format!("{alias}/"));
         for exception in &other.exceptions {
             for target in exception_targets(other, exception, facts) {
-                checks.deny("proxy_deny", target);
+                if denies(network, facts, &target) {
+                    checks.deny("proxy_deny", target);
+                }
             }
         }
         if network.mode == Mode::Allowlist {
@@ -266,6 +270,29 @@ fn opened_by_exception(network: &Network, facts: &Facts, target: &HostPort) -> b
     })
 }
 
+/// Whether `network`'s policy denies `target` apart from its exceptions: an allowlist
+/// denies everything it does not allow; a denylist only the addresses its deny ranges
+/// cover (a name by the addresses the gateway resolved for it at start).
+fn denies(network: &Network, facts: &Facts, target: &HostPort) -> bool {
+    if network.mode == Mode::Allowlist {
+        return true;
+    }
+    let addrs = match target.ip() {
+        Some(ip) => vec![ip],
+        None if target.host == HOST_DOCKER_INTERNAL => facts.host_docker_internal.clone(),
+        None => facts
+            .exceptions
+            .get(&target.host)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let ranges = policy::deny_ranges(network, facts);
+    !addrs.is_empty()
+        && addrs
+            .iter()
+            .all(|ip| ranges.iter().any(|r| r.contains(&ip.to_canonical())))
+}
+
 /// Where to probe an exception: in allowlist mode the ACL lists its start-time addresses,
 /// so a named one is probed at each; otherwise as written.
 fn exception_targets(network: &Network, exception: &HostPort, facts: &Facts) -> Vec<HostPort> {
@@ -291,21 +318,22 @@ pub fn allowed_by(allow: &[String], host: &str) -> bool {
 
 /// The host's own addresses worth probing: not loopback, link-local or unspecified (the
 /// floor covers those classes).
+fn host_nets(host: &HostFacts) -> impl Iterator<Item = &IpNet> {
+    host.addrs.iter().filter(|net| {
+        let ip = net.addr();
+        !(ip.is_loopback() || ip.is_unspecified() || is_link_local(&ip))
+    })
+}
+
 fn host_addrs(host: &HostFacts) -> impl Iterator<Item = IpAddr> + '_ {
-    host.addrs
-        .iter()
-        .map(IpNet::addr)
-        .filter(|ip| !(ip.is_loopback() || ip.is_unspecified() || is_link_local(ip)))
+    host_nets(host).map(IpNet::addr)
 }
 
 /// The host's addresses plus one other address in each of their prefixes.
 fn host_targets(host: &HostFacts) -> Vec<IpAddr> {
     let mut out = Vec::new();
-    for net in &host.addrs {
+    for net in host_nets(host) {
         let ip = net.addr();
-        if ip.is_loopback() || ip.is_unspecified() || is_link_local(&ip) {
-            continue;
-        }
         out.push(ip);
         let wide_enough = match net {
             IpNet::V4(n) => n.prefix_len() <= 30,
@@ -682,6 +710,43 @@ mod tests {
         ] {
             assert!(has(&got, line), "{line} in {got:#?}");
         }
+    }
+
+    #[test]
+    fn only_addresses_the_policy_denies() {
+        // mini-op opens an address only its own deny_ranges cover; workers' open policy
+        // allows that address, so neither its port nor the next one is planned as a deny
+        // on workers. A denylist exception on an address no rule covers gets no
+        // exception_other_port either.
+        let c = config(
+            "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"198.18.0.5:8080\"]\n  mini-op:\n    mode: allowlist\n    allow: [api.anthropic.com]\n    deny_ranges: [198.51.100.0/24]\n    exceptions: [\"198.51.100.10:22\", \"192.168.1.30:22\"]\n",
+        );
+        let workers: Vec<String> = plan("workers", &c, &facts(), &host())
+            .unwrap()
+            .iter()
+            .map(Check::to_string)
+            .collect();
+        assert!(
+            !workers.iter().any(|l| l.contains("198.51.100.10:22")),
+            "{workers:#?}"
+        );
+        assert!(has(&workers, "proxy_deny\tproxy_deny\t192.168.1.30:22"));
+        assert!(has(&workers, "exception_open\tproxy_open\t198.18.0.5:8080"));
+        assert!(
+            !workers.iter().any(|l| l.contains("198.18.0.5:8081")),
+            "{workers:#?}"
+        );
+        // On the allowlist side everything not allowed is denied.
+        let mini_op: Vec<String> = plan("mini-op", &c, &facts(), &host())
+            .unwrap()
+            .iter()
+            .map(Check::to_string)
+            .collect();
+        assert!(has(&mini_op, "proxy_deny\tproxy_deny\t198.18.0.5:8080"));
+        assert!(has(
+            &mini_op,
+            "exception_other_port\tproxy_deny\t198.51.100.10:23"
+        ));
     }
 
     #[test]
