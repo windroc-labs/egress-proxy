@@ -125,9 +125,12 @@ no_dns() {
   fi
 }
 
+# The documented start command (README.md).
+start() { compose build --quiet && compose up -d --quiet-pull; }
+
 # -------- Stage A: compose.yaml, workers only --------
 use_config workers.yaml
-compose up -d --build --quiet-pull
+start
 wait_health healthy || fail healthy "the gateway did not become healthy"
 [[ $(docker ps --filter "name=^$GW\$" --format '{{.Status}}') == *"(healthy)"* ]] ||
   fail healthy "docker ps does not show (healthy)"
@@ -191,7 +194,7 @@ state() {
 }
 before=$(state)
 labels_before=$(inspect '{{range $k, $v := .Config.Labels}}{{println $k $v}}{{end}}' | grep '^com\.docker\.compose\.')
-compose up -d --quiet-pull
+start
 if [[ $(state) != "$before" ]]; then
   echo "--- compose labels before"
   echo "$labels_before"
@@ -279,7 +282,7 @@ ok restarts_after_daemon_restart
 # -------- Stage B: compose.yaml + tests/compose.test.yaml --------
 compose_files+=(-f "$repo/tests/compose.test.yaml")
 use_config two-networks.yaml
-compose up -d --build --quiet-pull
+start
 wait_health healthy || fail allowlist_allows "the two-network gateway did not become healthy"
 allowed allowlist_allows egress-testallow http://egress-proxy-testallow:4750 https://example.com/
 denied allowlist_denies egress-testallow http://egress-proxy-testallow:4750 https://www.wikipedia.org/

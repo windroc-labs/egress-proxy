@@ -1,5 +1,5 @@
-# The egress gateway: one container serving every caller network. Start with
-# `docker compose up -d`, upgrade with `docker compose up -d --build`; see README.md.
+# The egress gateway: one container serving every caller network. Start or upgrade with
+# `docker compose build && docker compose up -d`; see README.md.
 name: egress
 
 services:
