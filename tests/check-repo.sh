@@ -77,15 +77,18 @@ fi
 
 # Every label compose.yaml sets is documented in the label contract, with its value
 # (per-network labels with <key> in place of the network key; an alias value is skipped).
-missing=""
+missing="" found=0
 while read -r key value; do
+  found=$((found + 1))
   doc_key=$(sed -E 's/^windroc\.egress\.network\.[a-z0-9-]+\./windroc.egress.network.<key>./' <<<"$key")
   value=${value#\"}
   value=${value%\"}
   grep -qF "\`$doc_key\`" docs/label-contract.md || missing+="$key (as $doc_key); "
   [[ $value == \** ]] || grep -qF "\`$value\`" docs/label-contract.md || missing+="$key value $value; "
 done < <(sed -nE 's/^[[:space:]]+(windroc\.egress\.[^:]+):[[:space:]]*(.*)$/\1 \2/p' compose.yaml)
-if [[ -n $missing ]]; then
+if ((found == 0)); then
+  fail labels_documented "no windroc.egress.* labels found in compose.yaml"
+elif [[ -n $missing ]]; then
   fail labels_documented "$missing"
 else
   ok labels_documented
