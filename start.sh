@@ -12,7 +12,7 @@
 # gateway are left as they were.
 set -euo pipefail
 
-repo=$(cd "$(dirname "$0")" && pwd)
+repo=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 config_dir=${EGRESS_CONFIG_DIR:-$HOME/.egress}
 
 if [[ ! -f $config_dir/config.local.yaml ]]; then
@@ -21,7 +21,7 @@ if [[ ! -f $config_dir/config.local.yaml ]]; then
 fi
 # Absolute: compose.yaml mounts this directory, and compose resolves a relative path
 # against the project directory, not ours.
-config_dir=$(cd "$config_dir" && pwd)
+config_dir=$(CDPATH='' cd -- "$config_dir" && pwd)
 export EGRESS_CONFIG_DIR=$config_dir
 override=$config_dir/compose.networks.yaml
 
