@@ -225,6 +225,9 @@ ok up_idempotent
 
 # AC3 (NFR-1): with the gateway stopped, the network has no way out.
 compose stop
+code=$(inspect '{{.State.ExitCode}}')
+[[ $code == 0 ]] || fail stop_exits_0 "exit code $code after compose stop, want 0 (stop_grace_period: 20s)"
+ok stop_exits_0
 unreachable fail_closed egress-workers -x "$PROXY" https://example.com/
 unreachable fail_closed egress-workers https://example.com/
 unreachable fail_closed egress-workers https://1.1.1.1/
