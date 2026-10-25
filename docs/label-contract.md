@@ -6,15 +6,18 @@ uses nothing else and never probes the gateway itself.
 
 ## Labels
 
-| Label | Value in this version of compose.yaml |
+| Label | Value |
 | --- | --- |
-| `windroc.egress.contract` | `1`, this contract's version |
-| `windroc.egress.networks` | comma-separated network keys: `workers` |
-| `windroc.egress.network.<key>.name` | the Docker network a caller joins: `egress-workers` |
-| `windroc.egress.network.<key>.proxy` | the proxy URL for callers on that network: `http://egress-proxy-workers:4750` |
+| `windroc.egress.contract` | `1`, this contract's version (set in compose.yaml) |
+| `windroc.egress.networks` | comma-separated network keys, sorted, e.g. `mini-op,workers` |
+| `windroc.egress.network.<key>.name` | the Docker network a caller joins: `egress-<key>` |
+| `windroc.egress.network.<key>.proxy` | the proxy URL for callers on that network: `http://egress-proxy-<key>:4750` |
 
-Every key in `windroc.egress.networks` has both `.name` and `.proxy` labels. The proxy URL
-uses the gateway's alias on that network, so it stays the same when the gateway restarts.
+The network keys are the sections of the gateway's local config (`~/.egress/config.local.yaml`);
+`./start.sh` renders the networks and per-network labels from them, so they always match the
+networks the gateway is attached to. Every key in `windroc.egress.networks` has both `.name`
+and `.proxy` labels. The proxy URL uses the gateway's alias on that network, so it stays the
+same when the gateway restarts.
 
 ## Consumer rules
 
@@ -40,4 +43,4 @@ a caller that can edit them controls the gateway's next policy or build.
 
 A change that breaks a rule or a label's meaning bumps `windroc.egress.contract`; a
 consumer that does not know the new version refuses to start callers. Adding a network
-key is not a breaking change.
+key, or a change in the order of `windroc.egress.networks`, is not a breaking change.

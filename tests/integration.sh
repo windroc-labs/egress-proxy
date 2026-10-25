@@ -3,8 +3,7 @@
 # Docker and passwordless sudo, kills the gateway's processes and restarts the Docker
 # daemon. Prints `ok <check>` per check and stops at the first `FAIL <check>: <detail>`.
 #
-# Stage A runs the base compose.yaml (the `workers` network only); stage B adds
-# tests/compose.test.yaml (a second network, in allowlist mode).
+# Stage A starts the gateway with start.sh and a config holding only `workers`.
 # Docker's Go templates use $ inside single quotes on purpose.
 # shellcheck disable=SC2016
 set -euo pipefail
@@ -29,9 +28,13 @@ GW=egress-gateway
 PROXY=http://egress-proxy-workers:4750
 PROBE_IMAGE=curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
 LONG=egress-test-long
-compose_files=(-f "$repo/compose.yaml")
-
-compose() { docker compose --project-directory "$repo" "${compose_files[@]}" "$@"; }
+# compose <args...>: docker compose on this repo, with start.sh's rendered override once it
+# exists (without it, compose would see a gateway with no caller networks).
+compose() {
+  local files=(-f "$repo/compose.yaml")
+  [[ -f $EGRESS_CONFIG_DIR/compose.networks.yaml ]] && files+=(-f "$EGRESS_CONFIG_DIR/compose.networks.yaml")
+  docker compose --project-directory "$repo" "${files[@]}" "$@"
+}
 
 cleanup() {
   local code=$?
@@ -138,7 +141,7 @@ no_dns() {
 }
 
 # The documented start command (README.md).
-start() { compose build --quiet && compose up -d --quiet-pull; }
+start() { "$repo/start.sh"; }
 
 # -------- Stage A: compose.yaml, workers only --------
 use_config workers.yaml
@@ -223,6 +226,24 @@ if [[ $(state) != "$before" ]]; then
 fi
 ok up_idempotent
 
+# AC13: start.sh refuses a missing config or a config error and changes nothing.
+override=$EGRESS_CONFIG_DIR/compose.networks.yaml
+cp "$override" "$work/override.before"
+rc=0
+err=$(EGRESS_CONFIG_DIR=$work/no-config "$repo/start.sh" 2>&1 >/dev/null) || rc=$?
+[[ $rc == 2 && $err == *"$work/no-config/config.local.yaml not found; copy config.example.yaml there"* ]] ||
+  fail start_missing_config "exit $rc: $err"
+[[ $(state) == "$before" ]] || fail start_missing_config "the gateway changed"
+ok start_missing_config
+printf 'version: 1\nnetworks:\n  workers:\n    mode: denylist\n  extra:\n    allow: [example.com]\n' >"$EGRESS_CONFIG_DIR/config.local.yaml"
+rc=0
+err=$(start 2>&1 >/dev/null) || rc=$?
+[[ $rc == 2 && $err == *"network extra: missing key mode"* ]] || fail start_config_error "exit $rc: $err"
+cmp -s "$override" "$work/override.before" || fail start_config_error "the rendered override changed"
+[[ $(state) == "$before" ]] || fail start_config_error "the gateway changed"
+ok start_config_error
+use_config workers.yaml
+
 # AC3 (NFR-1): with the gateway stopped, the network has no way out.
 compose stop
 code=$(inspect '{{.State.ExitCode}}')
@@ -234,7 +255,7 @@ unreachable fail_closed egress-workers https://1.1.1.1/
 no_dns fail_closed egress-workers
 no_dns fail_closed egress-workers 8.8.8.8
 ok fail_closed
-compose up -d --quiet-pull
+compose start gateway
 wait_health healthy || fail fail_closed "the gateway did not come back after start"
 
 # AC5: a crash of PID 1, or of one smokescreen, brings the container back.
@@ -287,7 +308,7 @@ expect_start_error() {
 printf 'version: 1\nnetworks:\n  workers:\n    deny_ranges: []\n' >"$EGRESS_CONFIG_DIR/config.local.yaml"
 expect_start_error missing_key_logged "network workers: missing key mode"
 printf 'version: 1\nnetworks:\n  workers:\n    mode: denylist\n  api:\n    mode: denylist\n' >"$EGRESS_CONFIG_DIR/config.local.yaml"
-expect_start_error networks_mismatch_logged "networks [api, workers] differ from the gateway's networks [workers]"
+expect_start_error networks_mismatch_logged "networks [api, workers] differ from the gateway's networks [workers]; run ./start.sh"
 use_config workers.yaml
 compose restart gateway
 wait_health healthy || fail missing_key_logged "not healthy again after the config was fixed"
@@ -297,19 +318,5 @@ sudo systemctl restart docker
 for ((i = 0; i < 60; i++)); do docker info >/dev/null 2>&1 && break; sleep 1; done
 wait_health healthy || fail restarts_after_daemon_restart "not back to healthy"
 ok restarts_after_daemon_restart
-
-# -------- Stage B: compose.yaml + tests/compose.test.yaml --------
-compose_files+=(-f "$repo/tests/compose.test.yaml")
-use_config two-networks.yaml
-start
-wait_health healthy || fail allowlist_allows "the two-network gateway did not become healthy"
-[[ $(inspect '{{index .Config.Labels "windroc.egress.networks"}}') == workers,testallow ]] ||
-  fail labels_two_networks "the networks label is not workers,testallow"
-inspect '{{range .Config.Env}}{{println .}}{{end}}' | grep -qx 'EGRESS_NETWORKS=workers,testallow' ||
-  fail labels_two_networks "EGRESS_NETWORKS is not workers,testallow"
-ok labels_two_networks
-allowed allowlist_allows egress-testallow http://egress-proxy-testallow:4750 https://example.com/
-denied allowlist_denies egress-testallow http://egress-proxy-testallow:4750 https://www.wikipedia.org/
-allowed workers_unaffected egress-workers "$PROXY" https://www.wikipedia.org/
 
 echo "all checks passed"

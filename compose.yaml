@@ -1,5 +1,7 @@
-# The egress gateway: one container serving every caller network. Start or upgrade with
-# `docker compose build && docker compose up -d`; see README.md.
+# The egress gateway: one container serving every caller network. Start, upgrade, or add
+# or remove a caller network with ./start.sh, never a bare `docker compose up`: the caller
+# networks, EGRESS_NETWORKS and their labels come from the compose override start.sh
+# renders from the config's sections (~/.egress/compose.networks.yaml); see README.md.
 name: egress
 
 services:
@@ -27,27 +29,16 @@ services:
     # gateway always knows (and denies) the host's address.
     extra_hosts:
       - host.docker.internal:host-gateway
-    # The advertised caller networks. EGRESS_NETWORKS and the networks label are one value
-    # (the anchor); the per-network labels and the attachments below list the same keys
-    # (label contract v1, docs/label-contract.md). The gateway refuses a config whose
-    # network keys differ.
-    environment:
-      EGRESS_NETWORKS: &networks workers
+    # Label contract v1 (docs/label-contract.md). start.sh's override adds EGRESS_NETWORKS,
+    # the networks and per-network labels and the caller network attachments; the gateway
+    # refuses a config whose network keys differ from EGRESS_NETWORKS.
     labels:
       windroc.egress.contract: "1"
-      windroc.egress.networks: *networks
-      windroc.egress.network.workers.name: egress-workers
-      windroc.egress.network.workers.proxy: http://egress-proxy-workers:4750
     networks:
       uplink: {}
-      workers:
-        aliases: [egress-proxy-workers]
 
 networks:
   # The gateway's own way out. IPv4 only: the deny floor has no global IPv6 LAN prefix.
   uplink:
     name: egress-uplink
     enable_ipv6: false
-  workers:
-    name: egress-workers
-    internal: true

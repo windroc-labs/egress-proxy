@@ -698,15 +698,32 @@ mod tests {
     fn example_blocks_are_valid() {
         let text = std::fs::read_to_string(EXAMPLE).unwrap();
         let (text, blocks) = uncomment_examples(&text);
-        assert_eq!(blocks, 3, "example blocks in config.example.yaml");
+        assert_eq!(blocks, 4, "example blocks in config.example.yaml");
         let config = parse(Path::new(EXAMPLE), &text).unwrap_or_else(|e| panic!("{e}\n{text}"));
         let workers = &config.networks["workers"];
         assert_eq!(workers.deny_ranges.len(), 2);
+        assert_eq!(
+            workers.exceptions,
+            [HostPort::parse("host.docker.internal:11434").unwrap()]
+        );
         assert_eq!(workers.health.allow_probe.to_string(), "example.com:443");
         assert_eq!(workers.health.deny_probe.to_string(), "169.254.169.254:80");
-        let api = &config.networks["api"];
-        assert_eq!(api.mode, Mode::Allowlist);
-        assert_eq!(api.allow, ["example.com", "*.example.org"]);
+        let mini_op = &config.networks["mini-op"];
+        assert_eq!(mini_op.mode, Mode::Allowlist);
+        assert_eq!(
+            mini_op.allow,
+            [
+                "api.anthropic.com",
+                "claude.ai",
+                "claude.com",
+                "platform.claude.com"
+            ]
+        );
+        // A documentation address (TEST-NET-1), never a real LAN address.
+        assert_eq!(
+            mini_op.exceptions,
+            [HostPort::parse("192.0.2.10:22").unwrap()]
+        );
     }
 
     #[test]

@@ -105,6 +105,35 @@ networks:
         );
     }
 
+    /// Every label the override sets is in the label contract: its key with `<key>` for
+    /// the network key, and its value pattern.
+    #[test]
+    fn labels_documented() {
+        let doc = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../docs/label-contract.md"
+        ))
+        .unwrap();
+        let config = parse(Path::new("/c.yaml"), TWO).unwrap();
+        let text = compose_override(&config, 4750);
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let labels = yaml["services"]["gateway"]["labels"].as_mapping().unwrap();
+        assert_eq!(labels.len(), 5);
+        for key in labels.keys() {
+            let key = key.as_str().unwrap();
+            let generic = ["mini-op", "workers"].iter().fold(key.to_string(), |k, n| {
+                k.replace(&format!(".{n}."), ".<key>.")
+            });
+            assert!(
+                doc.contains(&format!("`{generic}`")),
+                "{generic} not documented"
+            );
+        }
+        for value in ["`egress-<key>`", "`http://egress-proxy-<key>:4750`"] {
+            assert!(doc.contains(value), "{value} not documented");
+        }
+    }
+
     #[test]
     fn one_network_and_port() {
         let config = parse(
