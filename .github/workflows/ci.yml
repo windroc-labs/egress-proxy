@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - run: shellcheck tests/*.sh
+      - run: shellcheck tests/*.sh start.sh
       - run: tests/check-repo.sh
       - run: tests/check-repo-selftest.sh
       - name: Dockerfile build checks
@@ -53,9 +53,7 @@ jobs:
       - name: compose files are valid
         env:
           EGRESS_CONFIG_DIR: ${{ runner.temp }}
-        run: |
-          docker compose -f compose.yaml config -q
-          docker compose -f compose.yaml -f tests/compose.test.yaml config -q
+        run: docker compose -f compose.yaml config -q
 
   integration:
     name: integration

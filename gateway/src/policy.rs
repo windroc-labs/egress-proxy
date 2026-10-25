@@ -4,12 +4,12 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use ipnet::IpNet;
 
-use crate::config::{Config, Mode, Network};
+use crate::config::{Config, HostPort, Mode, Network};
 use crate::facts::Facts;
 use crate::files::{make_private_dir, write_private};
 
@@ -55,16 +55,7 @@ pub fn generate(
     facts: &Facts,
     run_dir: &Path,
 ) -> Policy {
-    let mut ranges: Vec<IpNet> = DENY_FLOOR
-        .iter()
-        .map(|r| r.parse().expect("valid floor range"))
-        .chain(facts.host_docker_internal.iter().copied().map(IpNet::from))
-        .chain(facts.own_addrs.iter().copied().map(IpNet::from))
-        .chain(network.deny_ranges.iter().copied())
-        .collect();
-    ranges.sort();
-    ranges.dedup();
-
+    let ranges = deny_ranges(network, facts);
     let acl_file = network_dir(run_dir, key).join("acl.yaml");
     let mut config_yaml = String::from(HEADER);
     let _ = writeln!(config_yaml, "ip: \"{listen_ip}\"");
@@ -74,6 +65,29 @@ pub fn generate(
     for range in &ranges {
         let _ = writeln!(config_yaml, "  - \"{range}\"");
     }
+    // smokescreen checks allow_addresses before its deny ranges. The comments keep every
+    // configured exception in the bytes, so health sees an edit even when its name has
+    // no recorded address.
+    for exception in &network.exceptions {
+        let _ = writeln!(config_yaml, "# exception {exception}");
+    }
+    let mut allowed: Vec<String> = network
+        .exceptions
+        .iter()
+        .flat_map(|e| {
+            exception_addrs(e, facts)
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, e.port).to_string())
+        })
+        .collect();
+    allowed.sort();
+    allowed.dedup();
+    if !allowed.is_empty() {
+        config_yaml.push_str("allow_addresses:\n");
+        for addr in &allowed {
+            let _ = writeln!(config_yaml, "  - \"{addr}\"");
+        }
+    }
 
     let mut acl_yaml = String::from(HEADER);
     acl_yaml.push_str("version: v1\nservices: []\ndefault:\n");
@@ -82,7 +96,21 @@ pub fn generate(
         Mode::Denylist => acl_yaml.push_str("  action: open\n"),
         Mode::Allowlist => {
             acl_yaml.push_str("  action: enforce\n  allowed_domains:\n");
-            let mut domains = network.allow.clone();
+            // An exception must pass the ACL too. The ACL lists its start-time addresses,
+            // not its name: smokescreen would re-resolve a name on every CONNECT, and the
+            // ACL has no ports. The deny ranges keep each address to its listed port
+            // (check_exceptions).
+            let exception_hosts = network
+                .exceptions
+                .iter()
+                .flat_map(|e| exception_addrs(e, facts))
+                .map(|ip| ip.to_string());
+            let mut domains: Vec<String> = network
+                .allow
+                .iter()
+                .cloned()
+                .chain(exception_hosts)
+                .collect();
             domains.sort();
             domains.dedup();
             for domain in domains {
@@ -94,6 +122,56 @@ pub fn generate(
         config_yaml,
         acl_yaml,
     }
+}
+
+/// The ranges `network` denies: the floor, `host.docker.internal`, the gateway's own
+/// addresses and the section's `deny_ranges`, sorted and deduplicated.
+fn deny_ranges(network: &Network, facts: &Facts) -> Vec<IpNet> {
+    let mut ranges: Vec<IpNet> = DENY_FLOOR
+        .iter()
+        .map(|r| r.parse().expect("valid floor range"))
+        .chain(facts.host_docker_internal.iter().copied().map(IpNet::from))
+        .chain(facts.own_addrs.iter().copied().map(IpNet::from))
+        .chain(network.deny_ranges.iter().copied())
+        .collect();
+    ranges.sort();
+    ranges.dedup();
+    ranges
+}
+
+/// The canonical addresses of `exception`: its IP literal, or what its name resolved to at
+/// start (none when the name is not in the facts).
+fn exception_addrs(exception: &HostPort, facts: &Facts) -> Vec<IpAddr> {
+    match exception.ip() {
+        Some(ip) => vec![ip],
+        None => facts
+            .exceptions
+            .get(&exception.host)
+            .cloned()
+            .unwrap_or_default(),
+    }
+}
+
+/// Refuses an allowlist exception whose address no deny rule covers: its start-time
+/// addresses also enter the ACL, which has no ports, so such an address would be open on
+/// every port.
+pub fn check_exceptions(config: &Config, facts: &Facts) -> Result<(), String> {
+    for (key, network) in &config.networks {
+        if network.mode != Mode::Allowlist {
+            continue;
+        }
+        let ranges = deny_ranges(network, facts);
+        for exception in &network.exceptions {
+            for ip in exception_addrs(exception, facts) {
+                if !ranges.iter().any(|r| r.contains(&ip)) {
+                    return Err(format!(
+                        "network {key}: exceptions: {exception} resolves to {ip}, which no deny rule covers; in allowlist mode list public hosts under allow"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Generates and writes every configured network's running policy.
@@ -152,6 +230,8 @@ mod tests {
                 "172.20.0.2".parse().unwrap(),
                 "172.21.0.2".parse().unwrap(),
             ],
+            exceptions: BTreeMap::new(),
+            subnets: BTreeMap::new(),
         }
     }
 
@@ -265,6 +345,123 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), got.len(), "duplicates in {got:?}");
         assert_eq!(got.iter().filter(|r| *r == "10.0.0.0/8").count(), 1);
+    }
+
+    const EXCEPTIONS: &str = "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"host.docker.internal:11434\", \"[fd00::7]:8080\", \"[::ffff:192.168.1.9]:22\", \"nas.lan:8080\", \"gone.lan:1\"]\n  api:\n    mode: allowlist\n    allow: [example.com]\n    exceptions: [\"192.168.1.9:22\", \"nas.lan:22\", \"[fd00::7]:22\"]\n";
+
+    fn exception_facts() -> Facts {
+        let mut f = facts();
+        f.exceptions = BTreeMap::from([
+            (
+                "host.docker.internal".to_string(),
+                vec!["192.168.65.254".parse().unwrap()],
+            ),
+            (
+                "nas.lan".to_string(),
+                vec!["192.168.1.30".parse().unwrap(), "fd00::30".parse().unwrap()],
+            ),
+        ]);
+        f
+    }
+
+    fn generated(key: &str, text: &str, facts: &Facts) -> Policy {
+        let c = config(text);
+        generate(
+            key,
+            &c.networks[key],
+            facts.networks[key],
+            facts,
+            Path::new("/run/egress"),
+        )
+    }
+
+    #[test]
+    fn exceptions_allow_addresses() {
+        let p = generated("workers", EXCEPTIONS, &exception_facts());
+        assert_eq!(
+            yaml(&p.config_yaml)["allow_addresses"],
+            yaml(
+                "[\"192.168.1.30:8080\", \"192.168.1.9:22\", \"192.168.65.254:11434\", \"[fd00::30]:8080\", \"[fd00::7]:8080\"]"
+            )
+        );
+        for line in [
+            "# exception [::ffff:192.168.1.9]:22\n",
+            "# exception gone.lan:1\n",
+            "# exception host.docker.internal:11434\n",
+        ] {
+            assert!(
+                p.config_yaml.contains(line),
+                "{line} missing: {}",
+                p.config_yaml
+            );
+        }
+        assert!(
+            p.config_yaml.find("# exception").unwrap() > p.config_yaml.find("deny_ranges").unwrap()
+        );
+        assert!(
+            yaml(&workers().config_yaml)
+                .get("allow_addresses")
+                .is_none()
+        );
+        assert!(!workers().config_yaml.contains("# exception"));
+    }
+
+    #[test]
+    fn allowlist_exception_hosts_allowed() {
+        let p = generated("api", EXCEPTIONS, &exception_facts());
+        assert_eq!(
+            yaml(&p.acl_yaml)["default"]["allowed_domains"],
+            yaml("[\"192.168.1.30\", \"192.168.1.9\", \"example.com\", \"fd00::30\", \"fd00::7\"]")
+        );
+        assert_eq!(
+            yaml(&p.config_yaml)["allow_addresses"],
+            yaml("[\"192.168.1.30:22\", \"192.168.1.9:22\", \"[fd00::30]:22\", \"[fd00::7]:22\"]")
+        );
+    }
+
+    /// A name with no recorded address opens nothing, in the ACL or in allow_addresses.
+    #[test]
+    fn allowlist_unresolved_name_adds_nothing() {
+        let mut f = exception_facts();
+        f.exceptions.remove("nas.lan");
+        let text = "version: 1\nnetworks:\n  api:\n    mode: allowlist\n    allow: [example.com]\n    exceptions: [\"nas.lan:22\"]\n";
+        let p = generated("api", text, &f);
+        assert_eq!(
+            yaml(&p.acl_yaml)["default"]["allowed_domains"],
+            yaml("[example.com]")
+        );
+        assert!(yaml(&p.config_yaml).get("allow_addresses").is_none());
+        assert!(p.config_yaml.contains("# exception nas.lan:22\n"));
+    }
+
+    #[test]
+    fn exception_change_changes_policy() {
+        let base = generated("workers", EXCEPTIONS, &exception_facts());
+        let unresolved = EXCEPTIONS.replace("gone.lan:1", "gone.lan:2");
+        assert_ne!(generated("workers", &unresolved, &exception_facts()), base);
+        let mut moved = exception_facts();
+        moved
+            .exceptions
+            .insert("nas.lan".to_string(), vec!["192.168.1.31".parse().unwrap()]);
+        assert_ne!(generated("workers", EXCEPTIONS, &moved), base);
+    }
+
+    #[test]
+    fn allowlist_exceptions_must_be_denied_addresses() {
+        let text = "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"198.51.100.7:22\"]\n  api:\n    mode: allowlist\n    allow: [example.com]\n    exceptions: [\"192.168.1.9:22\", \"nas.lan:22\"]\n";
+        let mut f = exception_facts();
+        assert_eq!(check_exceptions(&config(text), &f), Ok(()));
+        f.exceptions
+            .insert("nas.lan".to_string(), vec!["198.51.100.9".parse().unwrap()]);
+        assert_eq!(
+            check_exceptions(&config(text), &f).unwrap_err(),
+            "network api: exceptions: nas.lan:22 resolves to 198.51.100.9, which no deny rule covers; in allowlist mode list public hosts under allow"
+        );
+        let ranged = text.replace(
+            "    allow: [example.com]\n",
+            "    allow: [example.com]\n    deny_ranges: [198.51.100.0/24]\n",
+        );
+        assert_eq!(check_exceptions(&config(&ranged), &f), Ok(()));
     }
 
     #[test]

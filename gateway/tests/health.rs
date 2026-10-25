@@ -84,6 +84,8 @@ fn started(config_text: &str, port: u16) -> State {
             .collect::<BTreeMap<_, _>>(),
         host_docker_internal: vec!["192.168.65.254".parse().unwrap()],
         own_addrs: vec!["127.0.0.1".parse().unwrap()],
+        exceptions: BTreeMap::new(),
+        subnets: BTreeMap::new(),
     };
     let run_dir = dir.path().join("run");
     policy::write_all(&run_dir, &cfg, &facts).unwrap();
@@ -263,4 +265,28 @@ fn network_added_without_restart_fails() {
         out.contains("FAIL networks [api, workers] differ from the running networks [workers]; restart the gateway (docker compose restart gateway)"),
         "{out}"
     );
+}
+
+#[test]
+fn exception_drift_fails() {
+    let with_exception = |entry: &str| {
+        format!(
+            "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"{entry}\"]\n"
+        )
+    };
+    let s = started(
+        &with_exception("192.168.1.20:11434"),
+        fake_proxy(Answer::Policy),
+    );
+    let (code, out) = check(&s);
+    assert_eq!(code, Some(0), "{out}");
+    for changed in ["192.168.1.20:11435", "nas.lan:11434"] {
+        fs::write(&s.config, with_exception(changed)).unwrap();
+        let (code, out) = check(&s);
+        assert_eq!(code, Some(1), "{changed}: {out}");
+        assert!(
+            out.contains("FAIL network workers: running policy differs from"),
+            "{changed}: {out}"
+        );
+    }
 }

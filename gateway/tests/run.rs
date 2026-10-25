@@ -202,3 +202,22 @@ fn unknown_option_exits_2() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("unknown option --bogus"), "{err}");
 }
+
+#[test]
+fn unresolved_exception_exits_1() {
+    let s = Setup::new(
+        "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"nas.lan:8080\"]\n",
+    );
+    let mut gw = s
+        .command(Some("workers"))
+        .args(["--resolve", "nas.lan="])
+        .spawn()
+        .unwrap();
+    assert_eq!(wait_exit(&mut gw).code(), Some(1));
+    let err = stderr_of(gw);
+    assert!(
+        err.contains("gateway: network workers: exceptions: cannot resolve nas.lan"),
+        "{err}"
+    );
+    assert!(!s.pid_file("workers").exists(), "a smokescreen was started");
+}

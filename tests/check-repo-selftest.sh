@@ -57,4 +57,16 @@ dir=$(tree no_compose)
 rm "$dir/compose.yaml"
 expect_only_failure no_compose "$dir" "FAIL labels_documented: no windroc.egress.* labels found in compose.yaml"
 
+# The sibling-repo check: a repo reference fails, the bare caller network key passes. The
+# names are assembled from pieces so this file does not match the check itself.
+c=mini d=-op
+dir=$(tree sibling_ref)
+printf 'see windroc/%s\n' "${c}${d}" >"$dir/notes.txt"
+expect_only_failure sibling_ref "$dir" "FAIL no_sibling_repo_refs: notes.txt:1:see windroc/${c}${d}"
+
+dir=$(tree network_key)
+printf 'networks:\n  %s:\n    mode: allowlist\n' "${c}${d}" >"$dir/notes.yaml"
+out=$(run_check "$dir")
+if [[ $(tail -n 1 <<<"$out") == exit=0 ]]; then ok network_key; else fail network_key "$out"; fi
+
 exit "$status"

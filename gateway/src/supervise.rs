@@ -113,6 +113,7 @@ pub fn run(opts: &Opts) -> u8 {
 
 fn prepare(opts: &Opts, config: &Config) -> Result<Facts, String> {
     let facts = facts::gather(config, opts.port, &opts.resolver)?;
+    policy::check_exceptions(config, &facts)?;
     policy::write_all(&opts.run_dir, config, &facts)?;
     let path = opts.run_dir.join("facts.json");
     facts::write(&path, &facts).map_err(|e| format!("{}: {e}", path.display()))?;

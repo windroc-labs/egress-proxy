@@ -1,6 +1,7 @@
 # Example of ~/.egress/config.local.yaml, the egress gateway's local config. Copy it there
-# and edit it; the gateway reads it at start, so restart the gateway after a change:
+# and edit it. After a change to a section's policy, restart the gateway:
 #   docker compose restart gateway
+# After adding or removing a section, run the start command instead: ./start.sh
 # A missing key, an unknown key or a bad value stops the gateway at start; `docker logs
 # egress-gateway` names the network and the key. Keep LAN and other private addresses in
 # your local copy only, never in this repo.
@@ -11,8 +12,9 @@
 # Format version; only 1 exists.
 version: 1
 
-# One section per caller network. The keys must be exactly the networks compose.yaml
-# attaches the gateway to (its EGRESS_NETWORKS); this version attaches `workers`.
+# One section per caller network: the only list of them. ./start.sh attaches the gateway to
+# Docker network egress-<key> for each section and advertises it in the gateway's labels
+# (docs/label-contract.md). Keys: lower-case letters, digits and "-"; "uplink" is reserved.
 networks:
   workers:
     # denylist: everything public is allowed; private, local and LAN ranges are denied
@@ -29,6 +31,16 @@ networks:
     #   - 2001:db8:1234::/48
     # end example
 
+    # Optional, either mode. host:port destinations allowed even though a deny rule covers
+    # their address, e.g. Ollama on the Mac or a LAN model provider. The gateway resolves
+    # each name at start; only that port of those addresses opens, for every caller on
+    # this network. Restart the gateway after the name's address changes. In allowlist
+    # mode callers connect to the address: the ACL lists it, not the name.
+    # example: exceptions
+    # exceptions:
+    #   - host.docker.internal:11434
+    # end example
+
     # Optional. The health check's probes: allow_probe must not be denied, deny_probe must
     # be denied. Defaults: example.com:443 (denylist) or the first non-glob allow entry on
     # port 443 (allowlist), and 169.254.169.254:80.
@@ -38,12 +50,18 @@ networks:
     #   deny_probe: 169.254.169.254:80
     # end example
 
-  # An allowlist network looks like this (it also needs an attachment in compose.yaml):
-  # example: allowlist network
-  # api:
+  # mini-op's network: Claude Code's API and claude.ai login, and the mini's ssh port.
+  # Replace 192.0.2.10 with the mini's LAN address in your local copy: in allowlist mode an
+  # exception must be an address a deny rule covers, so the placeholder itself is refused.
+  # example: mini-op network
+  # mini-op:
   #   mode: allowlist
-  #   # Required: domains, or *.domain globs; host:port entries are not supported yet.
+  #   # Required: domains, or *.domain globs (every port of their public addresses).
   #   allow:
-  #     - example.com
-  #     - "*.example.org"
+  #     - api.anthropic.com
+  #     - claude.ai
+  #     - claude.com
+  #     - platform.claude.com
+  #   exceptions:
+  #     - 192.0.2.10:22
   # end example
