@@ -28,7 +28,8 @@ pub struct HostFacts {
 /// How verify-egress probes a target and what it must see (README.md, Verify).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
-    /// An https URL through the proxy: CONNECT 200 and an HTTP status 200-399.
+    /// An https URL through the proxy: CONNECT 200 and any HTTP answer (an API root may
+    /// answer 403 or 404).
     ProxyAllow,
     /// A `host:port` through the proxy: CONNECT 200.
     ProxyOpen,
