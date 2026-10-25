@@ -1,0 +1,18 @@
+# Override for tests/integration.sh stage B: a second caller network, in allowlist mode,
+# advertised the same way as `workers`.
+services:
+  gateway:
+    environment:
+      EGRESS_NETWORKS: &networks workers,testallow
+    labels:
+      windroc.egress.networks: *networks
+      windroc.egress.network.testallow.name: egress-testallow
+      windroc.egress.network.testallow.proxy: http://egress-proxy-testallow:4750
+    networks:
+      testallow:
+        aliases: [egress-proxy-testallow]
+
+networks:
+  testallow:
+    name: egress-testallow
+    internal: true

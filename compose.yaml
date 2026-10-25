@@ -1,0 +1,53 @@
+# The egress gateway: one container serving every caller network. Start or upgrade with
+# `docker compose build && docker compose up -d`; see README.md.
+name: egress
+
+services:
+  gateway:
+    build: .
+    container_name: egress-gateway
+    restart: unless-stopped
+    # Longer than the entrypoint's own 10 s grace for its smokescreens, so a stop exits 0.
+    stop_grace_period: 20s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs:
+      - /run/egress:mode=0700,uid=65532,gid=65532
+    # The directory, not the file: a single-file bind mount keeps the old inode when an
+    # editor saves by replacing the file, hiding the edit from the gateway.
+    volumes:
+      - type: bind
+        source: ${EGRESS_CONFIG_DIR:-${HOME}/.egress}
+        target: /etc/egress
+        read_only: true
+        bind:
+          create_host_path: false
+    # Docker Desktop resolves host.docker.internal itself; this makes Linux match, so the
+    # gateway always knows (and denies) the host's address.
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    # The advertised caller networks. EGRESS_NETWORKS and the networks label are one value
+    # (the anchor); the per-network labels and the attachments below list the same keys
+    # (label contract v1, docs/label-contract.md). The gateway refuses a config whose
+    # network keys differ.
+    environment:
+      EGRESS_NETWORKS: &networks workers
+    labels:
+      windroc.egress.contract: "1"
+      windroc.egress.networks: *networks
+      windroc.egress.network.workers.name: egress-workers
+      windroc.egress.network.workers.proxy: http://egress-proxy-workers:4750
+    networks:
+      uplink: {}
+      workers:
+        aliases: [egress-proxy-workers]
+
+networks:
+  # The gateway's own way out. IPv4 only: the deny floor has no global IPv6 LAN prefix.
+  uplink:
+    name: egress-uplink
+    enable_ipv6: false
+  workers:
+    name: egress-workers
+    internal: true

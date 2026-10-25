@@ -1,0 +1,49 @@
+# Example of ~/.egress/config.local.yaml, the egress gateway's local config. Copy it there
+# and edit it; the gateway reads it at start, so restart the gateway after a change:
+#   docker compose restart gateway
+# A missing key, an unknown key or a bad value stops the gateway at start; `docker logs
+# egress-gateway` names the network and the key. Keep LAN and other private addresses in
+# your local copy only, never in this repo.
+#
+# The commented examples between "example:" and "end example" lines are valid as written:
+# remove one "# " from each of their lines to use them (gateway/src/config.rs tests that).
+
+# Format version; only 1 exists.
+version: 1
+
+# One section per caller network. The keys must be exactly the networks compose.yaml
+# attaches the gateway to (its EGRESS_NETWORKS); this version attaches `workers`.
+networks:
+  workers:
+    # denylist: everything public is allowed; private, local and LAN ranges are denied
+    # (the deny floor in README.md, plus host.docker.internal and the gateway's own
+    # addresses). allowlist: only the domains under `allow` are allowed.
+    mode: denylist
+
+    # Optional. Ranges denied on top of the floor, in CIDR form. The gateway cannot see the
+    # Mac's own public IPv4 address or global IPv6 prefix; add them here. Ranges inside
+    # ::ffff:0:0/96 are refused (smokescreen would apply them to every IPv4 address).
+    # example: deny_ranges
+    # deny_ranges:
+    #   - 203.0.113.7/32
+    #   - 2001:db8:1234::/48
+    # end example
+
+    # Optional. The health check's probes: allow_probe must not be denied, deny_probe must
+    # be denied. Defaults: example.com:443 (denylist) or the first non-glob allow entry on
+    # port 443 (allowlist), and 169.254.169.254:80.
+    # example: health
+    # health:
+    #   allow_probe: example.com:443
+    #   deny_probe: 169.254.169.254:80
+    # end example
+
+  # An allowlist network looks like this (it also needs an attachment in compose.yaml):
+  # example: allowlist network
+  # api:
+  #   mode: allowlist
+  #   # Required: domains, or *.domain globs; host:port entries are not supported yet.
+  #   allow:
+  #     - example.com
+  #     - "*.example.org"
+  # end example

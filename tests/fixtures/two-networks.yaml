@@ -1,0 +1,9 @@
+# tests/integration.sh stage B: compose.yaml plus tests/compose.test.yaml.
+version: 1
+networks:
+  workers:
+    mode: denylist
+  testallow:
+    mode: allowlist
+    allow:
+      - example.com

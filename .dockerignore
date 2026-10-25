@@ -1,0 +1,4 @@
+*
+!Dockerfile
+!gateway/
+gateway/target

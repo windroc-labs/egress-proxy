@@ -1,0 +1,5 @@
+# tests/integration.sh stage A: the base compose.yaml's one network.
+version: 1
+networks:
+  workers:
+    mode: denylist
