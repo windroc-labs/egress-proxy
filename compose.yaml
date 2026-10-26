@@ -2,7 +2,7 @@
 # or remove a caller network with ./start.sh, never a bare `docker compose up`: the caller
 # networks, EGRESS_NETWORKS and their labels come from the compose override start.sh
 # renders from the config's sections (~/.egress/compose.networks.yaml); see README.md.
-name: egress
+name: egress-proxy
 
 services:
   proxy:

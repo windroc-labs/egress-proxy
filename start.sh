@@ -40,9 +40,17 @@ docker run --rm --pull never --network none --read-only --cap-drop ALL \
   "$image" compose >"$tmp" || exit $?
 mv "$tmp" "$override"
 
-# --remove-orphans: an install from before the rename to proxy runs compose service
-# gateway; its container is an orphan now and would keep serving the caller networks.
-"${base[@]}" -f "$override" up -d --remove-orphans
+"${base[@]}" -f "$override" up -d
+
+# An install from before the rename to proxy runs as compose project egress, which this
+# project does not manage: remove its container once this one is up. The caller networks
+# stay: compose reuses them by name.
+old=$(docker ps -aq --filter label=com.docker.compose.project=egress --filter label=windroc.egress.contract)
+if [[ -n $old ]]; then
+  mapfile -t old_ids <<<"$old"
+  echo "start.sh: removing the proxy container of the old compose project egress" >&2
+  docker rm -f "${old_ids[@]}" >/dev/null
+fi
 
 # A policy edit within the sections changes no compose file, so compose keeps the running
 # container: restart it when its running policy differs from the config (`proxy drift`

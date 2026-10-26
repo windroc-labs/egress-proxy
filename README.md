@@ -2,8 +2,9 @@
 
 Shared egress proxy for Docker caller networks.
 
-One container, `egress-proxy`, joins each **caller network** (an internal Docker network
-whose containers have no other way out) and proxies its traffic with
+One container, `egress-proxy` (compose project `egress-proxy`), joins each **caller
+network** (an internal Docker network whose containers have no other way out) and proxies
+its traffic with
 [smokescreen](https://github.com/stripe/smokescreen) v0.1.0 under that network's policy. A
 caller is identified by the network its request arrives on; there are no tokens. The caller
 networks are the sections of the local config, e.g. `workers` (denylist) and `mini-op`
@@ -30,9 +31,10 @@ rendered file the proxy has no caller networks and exits 2 (fail closed).
 `restart: unless-stopped` brings the proxy back after a crash, a Docker Desktop restart,
 or a Mac restart (with Docker Desktop set to start at login).
 
-Upgrading an install from before the rename to proxy (container `egress-gateway`):
-`./start.sh` replaces that container with `egress-proxy` on the same caller networks, with
-the same labels and aliases. Then remove by hand the old image, `docker image rm
+Upgrading an install from before the rename to proxy (compose project `egress`, container
+`egress-gateway`): `./start.sh` starts `egress-proxy` in compose project `egress-proxy`,
+then removes the old container; the caller networks, labels and aliases stay. Then remove
+by hand the old image, `docker image rm
 egress-gateway`, and in a checkout where you built the entrypoint, `rm -rf gateway`
 (its ignored build output).
 

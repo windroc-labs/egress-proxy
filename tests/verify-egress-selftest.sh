@@ -358,7 +358,7 @@ expect unhealthy_stops "$out" 1 \
 [[ $(curl_calls) == 0 ]] || fail unhealthy_stops "probes ran"
 
 scenario two_proxies
-printf 'px1\ngw2\n' >"$FAKE/ids"
+printf 'px1\npx2\n' >"$FAKE/ids"
 out=$(run workers)
 expect two_proxies "$out" 1 "FAIL proxy_found label windroc.egress.contract: 2 containers, want exactly one"
 

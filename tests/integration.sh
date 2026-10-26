@@ -587,24 +587,31 @@ wait_health healthy || fail remove_network "not healthy without the mini-op sect
 expect_networks remove_network testnet workers
 
 # -------- Stage D: upgrade an install from before the rename to proxy --------
-# The old install: compose service gateway, container egress-gateway, on the same caller
-# networks. This compose.yaml and override with the old names stand in for the old
-# checkout; only the compose names matter to the upgrade, so the image is this one.
-old=$work/old OLD_SERVICE=gateway OLD_PX=egress-gateway
+# The old install: compose project egress, service gateway, container egress-gateway,
+# with the caller networks created by that project. This compose.yaml and override with
+# the old names stand in for the old checkout; only the compose names matter to the
+# upgrade, so the image is this one.
+old=$work/old OLD_PROJECT=egress OLD_SERVICE=gateway OLD_PX=egress-gateway
 mkdir -p "$old"
-sed -e "s/^  proxy:\$/  $OLD_SERVICE:/" -e "s/^    container_name: $PX\$/    container_name: $OLD_PX/" \
-  "$repo/compose.yaml" >"$old/compose.yaml"
+sed -e "s/^name: egress-proxy\$/name: $OLD_PROJECT/" -e "s/^  proxy:\$/  $OLD_SERVICE:/" \
+  -e "s/^    container_name: $PX\$/    container_name: $OLD_PX/" "$repo/compose.yaml" >"$old/compose.yaml"
 sed "s/^  proxy:\$/  $OLD_SERVICE:/" "$EGRESS_CONFIG_DIR/compose.networks.yaml" >"$old/compose.networks.yaml"
-if ! grep -q "container_name: $OLD_PX\$" "$old/compose.yaml" || ! grep -q "^  $OLD_SERVICE:\$" "$old/compose.networks.yaml"; then
+if ! grep -q "^name: $OLD_PROJECT\$" "$old/compose.yaml" || ! grep -q "container_name: $OLD_PX\$" "$old/compose.yaml" ||
+  ! grep -q "^  $OLD_SERVICE:\$" "$old/compose.networks.yaml"; then
   fail upgrade_replaces_old "cannot write the old compose files"
 fi
-docker rm -f "$PX" >/dev/null
+# Down removes this project's container and networks, so the old project creates them.
+compose down
 docker compose --project-directory "$repo" -f "$old/compose.yaml" -f "$old/compose.networks.yaml" up -d
 PX=$OLD_PX wait_health healthy || fail upgrade_replaces_old "the old $OLD_PX did not become healthy"
 upgrade_nets() { docker network inspect --format '{{.Id}}' egress-uplink egress-testnet egress-workers; }
 nets_before=$(upgrade_nets)
 start
 [[ -z $(docker ps -aq --filter "name=^$OLD_PX\$") ]] || fail upgrade_replaces_old "$OLD_PX still exists"
+[[ -z $(docker ps -aq --filter "label=com.docker.compose.project=$OLD_PROJECT") ]] ||
+  fail upgrade_replaces_old "a container of compose project $OLD_PROJECT is left"
+[[ $(inspect '{{index .Config.Labels "com.docker.compose.project"}}') == egress-proxy ]] ||
+  fail upgrade_replaces_old "$PX is not in compose project egress-proxy"
 wait_health healthy || fail upgrade_replaces_old "$PX not healthy after the upgrade"
 expect_networks upgrade_replaces_old testnet workers
 [[ $(upgrade_nets) == "$nets_before" ]] || fail upgrade_keeps_networks "the caller networks were recreated"
