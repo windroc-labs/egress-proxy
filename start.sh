@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# The egress gateway's start command: start, upgrade, or apply an added or removed caller
+# The egress proxy's start command: start, upgrade, or apply an added or removed caller
 # network. Idempotent: with the same checkout and config it changes nothing.
 #
 # The config's sections are the only list of caller networks. Compose cannot read them, so
-# this renders a compose override from them with the gateway image itself (`gateway
+# this renders a compose override from them with the proxy image itself (`proxy
 # compose`, which validates the config) and starts compose with it. The override lives next
 # to the config, outside the checkout, so another egress version renders the same networks.
 #
 # Exit codes: 0 started; 2 no config or a config error (the error names the network and
 # key); any other: the failing docker command's. On failure the override and the running
-# gateway are left as they were.
+# proxy are left as they were.
 set -euo pipefail
 
 repo=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)

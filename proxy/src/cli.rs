@@ -1,7 +1,7 @@
 //! Command line of the image's entrypoint. Not a management command: the image runs
-//! `gateway run`, its `HEALTHCHECK` runs `gateway health`, only start.sh runs
-//! `gateway compose`, in a throwaway container with `--network none`, and only
-//! verify-egress runs `gateway plan`, read-only, with `docker exec` in the gateway.
+//! `proxy run`, its `HEALTHCHECK` runs `proxy health`, only start.sh runs
+//! `proxy compose`, in a throwaway container with `--network none`, and only
+//! verify-egress runs `proxy plan`, read-only, with `docker exec` in the proxy.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use ipnet::IpNet;
 use crate::facts::Resolver;
 use crate::plan::HostFacts;
 
-pub const USAGE: &str = "usage: gateway [run|health|compose] [--config <path>] [--run-dir <dir>] [--smokescreen <path>] [--port <n>] [--resolve <host>=<ip>[,<ip>...]]...\n       gateway plan <key> --listener-port <n> [--host-addr <ip>/<len>]... [--default-gateway <ip>]... [--config <path>] [--run-dir <dir>]";
+pub const USAGE: &str = "usage: proxy [run|health|compose] [--config <path>] [--run-dir <dir>] [--smokescreen <path>] [--port <n>] [--resolve <host>=<ip>[,<ip>...]]...\n       proxy plan <key> --listener-port <n> [--host-addr <ip>/<len>]... [--default-gateway <ip>]... [--config <path>] [--run-dir <dir>]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {

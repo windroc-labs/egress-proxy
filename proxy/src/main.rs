@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
-use gateway::cli::{self, Mode};
-use gateway::{health, plan, render, supervise};
+use proxy::cli::{self, Mode};
+use proxy::{health, plan, render, supervise};
 
 fn main() -> ExitCode {
     let opts = match cli::parse_args(
@@ -10,7 +10,7 @@ fn main() -> ExitCode {
     ) {
         Ok(opts) => opts,
         Err(e) => {
-            eprintln!("gateway: {e}\n{}", cli::USAGE);
+            eprintln!("proxy: {e}\n{}", cli::USAGE);
             return ExitCode::from(2);
         }
     };

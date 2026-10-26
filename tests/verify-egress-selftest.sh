@@ -20,9 +20,9 @@ export DOCKER_CONFIG=$work/docker
 mkdir -p "$work/bin" "$DOCKER_CONFIG"
 
 # The fake docker. State and scenario live in $FAKE:
-#   ids        containers matching the contract label (default: gw1)
+#   ids        containers matching the contract label (default: px1)
 #   health     "<running> <health>" (default: true healthy)
-#   plan       the plan `gateway plan` prints; plan.rc and plan.err make it fail
+#   plan       the plan `proxy plan` prints; plan.rc and plan.err make it fail
 #   answers    "<url>\t<write-out>\t<exit>" lines overriding curl's answer for a URL, or
 #              "<proxy> <url>\t…" for that URL through that proxy only
 #   open       host:port targets a CONNECT tunnel reaches
@@ -30,7 +30,7 @@ mkdir -p "$work/bin" "$DOCKER_CONFIG"
 #   calls      every call, with the DOCKER_CONFIG and DOCKER_HOST it saw
 #   image_user, image_id, image_missing   what `docker image inspect` reports
 #   rows       what the tool container prints; tool_run the `docker run` of it
-#   gwlog      "<unix time>\t<line>" lines `docker logs --since --until` of the gateway serves
+#   pxlog      "<unix time>\t<line>" lines `docker logs --since --until` of the proxy serves
 cat >"$work/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -98,22 +98,22 @@ case $1 in
   wait) echo 0 ;;
   logs)
     if [[ $2 == --since ]]; then
-      awk -F '\t' -v s="$3" -v e="$5" '$1 >= s && $1 <= e { print $2 }' "$FAKE/gwlog" 2>/dev/null || true
+      awk -F '\t' -v s="$3" -v e="$5" '$1 >= s && $1 <= e { print $2 }' "$FAKE/pxlog" 2>/dev/null || true
     else
       cat "$FAKE/rows" 2>/dev/null || true
     fi
     ;;
-  ps) cat "$FAKE/ids" 2>/dev/null || echo gw1 ;;
+  ps) cat "$FAKE/ids" 2>/dev/null || echo px1 ;;
   inspect)
     fmt=$3 id=$4
     case $fmt in
-      *'{{.Name}}'*) echo /egress-gateway ;;
+      *'{{.Name}}'*) echo /egress-proxy ;;
       *'"windroc.egress.contract"'*) echo 1 ;;
       *'.State.Running'*) cat "$FAKE/health" 2>/dev/null || echo "true healthy" ;;
       *'"windroc.egress.networks"'*) echo "mini-op,workers" ;;
       *'.name"'*) echo "egress-$(network_key "$fmt")" ;;
       *'.proxy"'*) echo "http://egress-proxy-$(network_key "$fmt"):4750" ;;
-      *'.Config.Image'*) echo egress-gateway-image ;;
+      *'.Config.Image'*) echo egress-proxy-image ;;
       *IPAddress*) peer_ip "$(cat "$FAKE/c/$id")" ;;
       *) echo "fake docker: unknown inspect $fmt" >&2; exit 1 ;;
     esac
@@ -136,7 +136,7 @@ case $1 in
     container=$2
     shift 2
     case $1 in
-      /gateway)
+      /proxy)
         if [[ -f $FAKE/plan.rc ]]; then
           cat "$FAKE/plan.err" >&2
           exit "$(cat "$FAKE/plan.rc")"
@@ -201,7 +201,7 @@ PLAN=$(printf '%s\n' \
   $'direct_none\tdirect_none\thttps://1.1.1.1/' \
   $'dns_none\tdns_none\texample.com' \
   $'dns_none\tdns_none\texample.com@1.1.1.1')
-# 7 preconditions (gateway_found .. plan), the 9 plan checks, peer_control and peer_none.
+# 7 preconditions (proxy_found .. plan), the 9 plan checks, peer_control and peer_none.
 TOTAL=18
 
 # scenario <name>: a fresh $FAKE with the passing defaults.
@@ -242,7 +242,7 @@ curl_calls() { grep -c ' exec [^ ]* curl ' "$FAKE/calls" || true; }
 scenario all_pass
 out=$(run workers)
 expect all_pass "$out" 0 \
-  "ok gateway_healthy egress-gateway healthy" \
+  "ok proxy_healthy egress-proxy healthy" \
   "ok proxy_deny 10.0.0.1:443 connect=407" \
   "ok proxy_allow https://example.com/ connect=200 http=200" \
   "ok exception_open host.docker.internal:11434 connect=200" \
@@ -268,7 +268,7 @@ if grep -qF -- "--host-addr 10.1.0.4/16" "$FAKE/calls" &&
   grep -qF -- "--default-gateway 10.1.0.1" "$FAKE/calls"; then
   ok linux_host_facts
 else
-  fail linux_host_facts "$(grep ' exec gw1 ' "$FAKE/calls")"
+  fail linux_host_facts "$(grep ' exec px1 ' "$FAKE/calls")"
 fi
 
 # Every docker call saw the throwaway client config and the pinned endpoint.
@@ -294,7 +294,7 @@ if [[ $(tail -n 1 <<<"$out") == exit=0 ]] &&
   grep -qF -- "--default-gateway 192.168.1.1 --default-gateway fe80::1 --host-addr 127.0.0.1/8 --host-addr ::1/128 --host-addr fe80::1c2b:3d4e:5f60:7182/64 --host-addr 192.168.1.20/24 --host-addr 2001:db8:1:2::20/64" "$FAKE/calls"; then
   ok darwin_host_facts
 else
-  fail darwin_host_facts "$out $(grep ' exec gw1 ' "$FAKE/calls" || true)"
+  fail darwin_host_facts "$out $(grep ' exec px1 ' "$FAKE/calls" || true)"
 fi
 
 scenario mismatch_named
@@ -353,30 +353,30 @@ scenario unhealthy_stops
 echo "true unhealthy" >"$FAKE/health"
 out=$(run workers)
 expect unhealthy_stops "$out" 1 \
-  "FAIL gateway_healthy egress-gateway: running/health 'true unhealthy', want true healthy" \
-  "1 of 3 checks failed: gateway_healthy"
+  "FAIL proxy_healthy egress-proxy: running/health 'true unhealthy', want true healthy" \
+  "1 of 3 checks failed: proxy_healthy"
 [[ $(curl_calls) == 0 ]] || fail unhealthy_stops "probes ran"
 
-scenario two_gateways
-printf 'gw1\ngw2\n' >"$FAKE/ids"
+scenario two_proxies
+printf 'px1\ngw2\n' >"$FAKE/ids"
 out=$(run workers)
-expect two_gateways "$out" 1 "FAIL gateway_found label windroc.egress.contract: 2 containers, want exactly one"
+expect two_proxies "$out" 1 "FAIL proxy_found label windroc.egress.contract: 2 containers, want exactly one"
 
 scenario unknown_network
 out=$(run other)
 expect unknown_network "$out" 1 "FAIL network_advertised other: networks 'mini-op,workers', want other among them"
 
-scenario old_gateway
+scenario old_proxy
 echo 2 >"$FAKE/plan.rc"
-printf 'gateway: unknown option plan\nusage: gateway ...\n' >"$FAKE/plan.err"
+printf 'proxy: unknown option plan\nusage: proxy ...\n' >"$FAKE/plan.err"
 out=$(run workers)
-expect old_gateway "$out" 1 "FAIL plan egress-gateway: the gateway image has no plan mode; run ./start.sh, want a plan"
+expect old_proxy "$out" 1 "FAIL plan egress-proxy: the proxy image has no plan mode; run ./start.sh, want a plan"
 
 scenario drift_message
 echo 2 >"$FAKE/plan.rc"
-echo "gateway: network workers: running policy differs from /etc/egress/config.local.yaml; restart the gateway (docker compose restart gateway)" >"$FAKE/plan.err"
+echo "proxy: network workers: running policy differs from /etc/egress/config.local.yaml; restart the proxy (docker compose restart proxy)" >"$FAKE/plan.err"
 out=$(run workers)
-expect drift_message "$out" 1 "FAIL plan egress-gateway: gateway: network workers: running policy differs from /etc/egress/config.local.yaml; restart the gateway (docker compose restart gateway), want a plan"
+expect drift_message "$out" 1 "FAIL plan egress-proxy: proxy: network workers: running policy differs from /etc/egress/config.local.yaml; restart the proxy (docker compose restart proxy), want a plan"
 
 # malformed <case> <plan line> <reason>: the line fails `plan` before any probe runs.
 malformed() {
@@ -428,7 +428,7 @@ scenario tools_results
   allow_line 190 true pypi.org 172.31.1.5
   allow_line 200 true example.com 172.31.1.5
   allow_line 211 true example.com 172.31.1.5
-} >"$FAKE/gwlog"
+} >"$FAKE/pxlog"
 out=$(EGRESS_SELFTEST_TOKEN=sk-ant-SELFTEST-TOKEN run --tools worker:test)
 expect tools_results "$out" 0 \
   "ok tools_image worker:test user 1000, id sha256:feedc0de0123456789abcdef" \

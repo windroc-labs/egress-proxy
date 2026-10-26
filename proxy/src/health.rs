@@ -1,4 +1,4 @@
-//! `gateway health`, the image's `HEALTHCHECK`: the running policy still matches the
+//! `proxy health`, the image's `HEALTHCHECK`: the running policy still matches the
 //! mounted config, and each network's proxy answers its probes as its policy says.
 
 use std::io::{self, Read, Write};

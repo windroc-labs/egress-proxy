@@ -1,8 +1,8 @@
-//! `gateway plan <key>`: the checks verify-egress runs from a probe on caller network
+//! `proxy plan <key>`: the checks verify-egress runs from a probe on caller network
 //! `<key>`, one `<name>\t<method>\t<target>` line each. verify-egress runs it with
-//! `docker exec` in the running gateway, which holds the config and its start facts; the
+//! `docker exec` in the running proxy, which holds the config and its start facts; the
 //! host facts (the Mac's addresses, default gateways and the host listener's port) come
-//! from the command line. Read-only, like `gateway health`.
+//! from the command line. Read-only, like `proxy health`.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -95,7 +95,7 @@ pub fn plan(
         list: Vec::new(),
     };
 
-    // Deny rules: one address per floor range, the special addresses, the gateway, the
+    // Deny rules: one address per floor range, the special addresses, the proxy, the
     // host, the section's own ranges and the extra deny targets.
     for range in DENY_FLOOR {
         let net: IpNet = range.parse().expect("valid floor range");
@@ -272,7 +272,7 @@ fn opened_by_exception(network: &Network, facts: &Facts, target: &HostPort) -> b
 
 /// Whether `network`'s policy denies `target` apart from its exceptions: an allowlist
 /// denies everything it does not allow; a denylist only the addresses its deny ranges
-/// cover (a name by the addresses the gateway resolved for it at start).
+/// cover (a name by the addresses the proxy resolved for it at start).
 fn denies(network: &Network, facts: &Facts, target: &HostPort) -> bool {
     if network.mode == Mode::Allowlist {
         return !allowed_by(&network.allow, &target.host);
@@ -404,7 +404,7 @@ pub fn run(opts: &Opts) -> u8 {
             0
         }
         Err(e) => {
-            eprintln!("gateway: {e}");
+            eprintln!("proxy: {e}");
             2
         }
     }

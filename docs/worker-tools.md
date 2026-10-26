@@ -1,12 +1,12 @@
-# Worker tools behind the gateway
+# Worker tools behind the proxy
 
 How the tools in an ensemble worker image behave on the `workers` caller network, where
-the gateway is the only way out (WDRC-107 PRD FR-14; the tool table in the WDRC-90 PRD's
+the proxy is the only way out (WDRC-107 PRD FR-14; the tool table in the WDRC-90 PRD's
 risks). A tool that ignores the proxy variables fails closed, as intended.
 
 ## How to fill this table
 
-On the test Mac mini, through mini-op, never on a developer's Mac: with the gateway
+On the test Mac mini, through mini-op, never on a developer's Mac: with the proxy
 healthy and the worker image built by ensemble's broker (`docker image ls ensemble-worker`),
 run
 
@@ -18,12 +18,12 @@ and replace the rows below with the rows it prints. Each row is one tool or one 
 
 - **Expected**: `fails` or `works` from the PRD's table; `unknown` where it was
   unverified.
-- **Result**: `works` (the gateway allowed the tool's request and the tool succeeded, or,
-  for `gh` and Claude Code, which run with a dummy credential, the gateway allowed the
-  request), `fails: no proxy used` (the gateway saw no allowed request from the tool),
-  `fails: exit <n>` or `fails: timed out` (the gateway allowed the request but the tool
+- **Result**: `works` (the proxy allowed the tool's request and the tool succeeded, or,
+  for `gh` and Claude Code, which run with a dummy credential, the proxy allowed the
+  request), `fails: no proxy used` (the proxy saw no allowed request from the tool),
+  `fails: exit <n>` or `fails: timed out` (the proxy allowed the request but the tool
   failed), `not in image`, or `could not run: <reason>`. Results come from exit codes
-  and the gateway's log only, never from a tool's output.
+  and the proxy's log only, never from a tool's output.
 - **Image**: `--tools` prints the image's full ID, as `docker image inspect --format
   '{{.Id}}'` reports it (`sha256:…`). The 2026-10-25 rows below came from a run of
   475817aa, before that change, and carry the worker version it printed (0.2.0) and the

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Docker end-to-end checks of the gateway (CI `integration` job). Linux CI only: it needs
-# Docker and passwordless sudo, kills the gateway's processes and restarts the Docker
+# Docker end-to-end checks of the proxy (CI `integration` job). Linux CI only: it needs
+# Docker and passwordless sudo, kills the proxy's processes and restarts the Docker
 # daemon. Prints `ok <check>` per check and stops at the first `FAIL <check>: <detail>`.
 #
-# Stage A starts the gateway with start.sh and a config holding only `workers`; stage B
+# Stage A starts the proxy with start.sh and a config holding only `workers`; stage B
 # adds `mini-op` (allowlist), checks that each network gets only its own policy, and runs
 # verify-egress on both networks and with --tools; stage C adds and removes a network
 # through the config alone.
@@ -23,11 +23,11 @@ work=$(mktemp -d)
 export DOCKER_CONFIG=$work/docker
 mkdir -p "$DOCKER_CONFIG"
 echo '{}' >"$DOCKER_CONFIG/config.json"
-# The gateway's config directory; never the real ~/.egress.
+# The proxy's config directory; never the real ~/.egress.
 export EGRESS_CONFIG_DIR=$work/egress
 mkdir -p "$EGRESS_CONFIG_DIR"
 
-GW=egress-gateway
+PX=egress-proxy
 PROXY=http://egress-proxy-workers:4750
 # The probe image verify-egress pins: one source for its digest.
 PROBE_IMAGE=$(sed -n 's/^PROBE_IMAGE=//p' "$repo/verify-egress")
@@ -42,7 +42,7 @@ LEGACY_PROXY=${c}${d}-proxy
 LISTENERS=(egress-test-listen-workers egress-test-listen-mini-op)
 host_listeners=()
 # compose <args...>: docker compose on this repo, with start.sh's rendered override once it
-# exists (without it, compose would see a gateway with no caller networks).
+# exists (without it, compose would see a proxy with no caller networks).
 compose() {
   local files=(-f "$repo/compose.yaml")
   [[ -f $EGRESS_CONFIG_DIR/compose.networks.yaml ]] && files+=(-f "$EGRESS_CONFIG_DIR/compose.networks.yaml")
@@ -52,10 +52,10 @@ compose() {
 cleanup() {
   local code=$?
   if ((code != 0)); then
-    echo "--- docker inspect $GW .State"
-    docker inspect --format '{{json .State}}' "$GW" 2>&1 || true
-    echo "--- docker logs $GW (last 100 lines)"
-    docker logs --tail 100 "$GW" 2>&1 || true
+    echo "--- docker inspect $PX .State"
+    docker inspect --format '{{json .State}}' "$PX" 2>&1 || true
+    echo "--- docker logs $PX (last 100 lines)"
+    docker logs --tail 100 "$PX" 2>&1 || true
   fi
   docker rm -f "$LONG" "$LEGACY_PROXY" "${LISTENERS[@]}" >/dev/null 2>&1 || true
   ((${#host_listeners[@]} == 0)) || kill "${host_listeners[@]}" 2>/dev/null || true
@@ -73,9 +73,9 @@ fail() {
 
 use_config() { cp "$repo/tests/fixtures/$1" "$EGRESS_CONFIG_DIR/config.local.yaml"; }
 
-inspect() { docker inspect --format "$1" "$GW"; }
+inspect() { docker inspect --format "$1" "$PX"; }
 
-# wait_health <status> [seconds]: polls the gateway's health every 2 s.
+# wait_health <status> [seconds]: polls the proxy's health every 2 s.
 wait_health() {
   local want=$1 limit=${2:-90} got="" i
   for ((i = 0; i < limit; i += 2)); do
@@ -169,8 +169,8 @@ start() { "$repo/start.sh"; }
 # -------- Stage A: compose.yaml, workers only --------
 use_config workers.yaml
 start
-wait_health healthy || fail healthy "the gateway did not become healthy"
-[[ $(docker ps --filter "name=^$GW\$" --format '{{.Status}}') == *"(healthy)"* ]] ||
+wait_health healthy || fail healthy "the proxy did not become healthy"
+[[ $(docker ps --filter "name=^$PX\$" --format '{{.Status}}') == *"(healthy)"* ]] ||
   fail healthy "docker ps does not show (healthy)"
 ok healthy
 
@@ -178,8 +178,8 @@ ok healthy
 want_labels=$'windroc.egress.contract=1\nwindroc.egress.network.workers.name=egress-workers\nwindroc.egress.network.workers.proxy=http://egress-proxy-workers:4750\nwindroc.egress.networks=workers'
 got_labels=$(inspect '{{range $k, $v := .Config.Labels}}{{println $k "=" $v}}{{end}}' | sed 's/ = /=/' | grep '^windroc\.egress\.' | sort)
 [[ $got_labels == "$want_labels" ]] || fail labels_v1 "labels are: $got_labels"
-[[ $(docker ps -a --filter label=windroc.egress.contract=1 --format '{{.Names}}') == "$GW" ]] ||
-  fail labels_v1 "the contract label does not find exactly $GW"
+[[ $(docker ps -a --filter label=windroc.egress.contract=1 --format '{{.Names}}') == "$PX" ]] ||
+  fail labels_v1 "the contract label does not find exactly $PX"
 inspect '{{range .Config.Env}}{{println .}}{{end}}' | grep -qx 'EGRESS_NETWORKS=workers' ||
   fail labels_v1 "EGRESS_NETWORKS differs from the windroc.egress.networks label"
 ok labels_v1
@@ -199,8 +199,8 @@ ok hardening
   fail networks_attached "attached to: $(inspect '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}')"
 [[ $(docker network inspect --format '{{.Internal}}' egress-workers) == true ]] || fail networks_attached "egress-workers is not internal"
 ok networks_attached
-[[ -z $(docker port "$GW") && $(inspect '{{json .HostConfig.PortBindings}}') =~ ^(\{\}|null)$ ]] ||
-  fail no_published_ports "ports: $(docker port "$GW")"
+[[ -z $(docker port "$PX") && $(inspect '{{json .HostConfig.PortBindings}}') =~ ^(\{\}|null)$ ]] ||
+  fail no_published_ports "ports: $(docker port "$PX")"
 ok no_published_ports
 workers_ip=$(inspect '{{(index .NetworkSettings.Networks "egress-workers").IPAddress}}')
 uplink_ip=$(inspect '{{(index .NetworkSettings.Networks "egress-uplink").IPAddress}}')
@@ -256,18 +256,18 @@ rc=0
 err=$(EGRESS_CONFIG_DIR=$work/no-config "$repo/start.sh" 2>&1 >/dev/null) || rc=$?
 [[ $rc == 2 && $err == *"$work/no-config/config.local.yaml not found; copy config.example.yaml there"* ]] ||
   fail start_missing_config "exit $rc: $err"
-[[ $(state) == "$before" ]] || fail start_missing_config "the gateway changed"
+[[ $(state) == "$before" ]] || fail start_missing_config "the proxy changed"
 ok start_missing_config
 printf 'version: 1\nnetworks:\n  workers:\n    mode: denylist\n  extra:\n    allow: [example.com]\n' >"$EGRESS_CONFIG_DIR/config.local.yaml"
 rc=0
 err=$(start 2>&1 >/dev/null) || rc=$?
 [[ $rc == 2 && $err == *"network extra: missing key mode"* ]] || fail start_config_error "exit $rc: $err"
 cmp -s "$override" "$work/override.before" || fail start_config_error "the rendered override changed"
-[[ $(state) == "$before" ]] || fail start_config_error "the gateway changed"
+[[ $(state) == "$before" ]] || fail start_config_error "the proxy changed"
 ok start_config_error
 use_config workers.yaml
 
-# AC3 (NFR-1): with the gateway stopped, the network has no way out.
+# AC3 (NFR-1): with the proxy stopped, the network has no way out.
 compose stop
 code=$(inspect '{{.State.ExitCode}}')
 [[ $code == 0 ]] || fail stop_exits_0 "exit code $code after compose stop, want 0 (stop_grace_period: 20s)"
@@ -278,8 +278,8 @@ unreachable fail_closed egress-workers https://1.1.1.1/
 no_dns fail_closed egress-workers
 no_dns fail_closed egress-workers 8.8.8.8
 ok fail_closed
-compose start gateway
-wait_health healthy || fail fail_closed "the gateway did not come back after start"
+compose start proxy
+wait_health healthy || fail fail_closed "the proxy did not come back after start"
 
 # AC5: a crash of PID 1, or of one smokescreen, brings the container back.
 started=$(inspect '{{.State.StartedAt}}')
@@ -287,7 +287,7 @@ sudo kill -9 "$(inspect '{{.State.Pid}}')"
 wait_restart "$started" || fail restarts_after_crash "not back to healthy"
 ok restarts_after_crash
 started=$(inspect '{{.State.StartedAt}}')
-smokescreen_pid=$(docker top "$GW" -eo pid,args | awk '$2 == "/smokescreen" { print $1; exit }')
+smokescreen_pid=$(docker top "$PX" -eo pid,args | awk '$2 == "/smokescreen" { print $1; exit }')
 [[ -n $smokescreen_pid ]] || fail restarts_after_child_exit "no smokescreen process in docker top"
 sudo kill -9 "$smokescreen_pid"
 wait_restart "$started" || fail restarts_after_child_exit "not back to healthy"
@@ -306,7 +306,7 @@ wait_health unhealthy || fail unhealthy_on_config_drift "still healthy after the
 inspect '{{range .State.Health.Log}}{{.Output}}{{end}}' | grep -q 'network workers: running policy differs from' ||
   fail unhealthy_on_config_drift "the health log does not name the network"
 ok unhealthy_on_config_drift
-compose restart gateway
+compose restart proxy
 wait_health healthy || fail restart_applies_policy "not healthy after the restart"
 [[ $(long_connect) == 407 ]] || fail restart_applies_policy "1.1.1.1 is still allowed after the restart"
 [[ $(docker inspect --format '{{.State.StartedAt}}' "$LONG") == "$long_started" ]] ||
@@ -314,13 +314,13 @@ wait_health healthy || fail restart_applies_policy "not healthy after the restar
 ok restart_applies_policy
 docker rm -f "$LONG" >/dev/null
 
-# AC8 + AC15: a config error stops the gateway at start and the log names it.
+# AC8 + AC15: a config error stops the proxy at start and the log names it.
 # expect_start_error <check> <message>: after a restart, the container exits 2 with it.
 expect_start_error() {
   local i
-  compose restart gateway >/dev/null 2>&1 || true
+  compose restart proxy >/dev/null 2>&1 || true
   for ((i = 0; i < 30; i++)); do
-    if docker logs --since 1m "$GW" 2>&1 | grep -qF "$2" && [[ $(inspect '{{.State.ExitCode}}') == 2 ]]; then
+    if docker logs --since 1m "$PX" 2>&1 | grep -qF "$2" && [[ $(inspect '{{.State.ExitCode}}') == 2 ]]; then
       ok "$1"
       return
     fi
@@ -331,9 +331,9 @@ expect_start_error() {
 printf 'version: 1\nnetworks:\n  workers:\n    deny_ranges: []\n' >"$EGRESS_CONFIG_DIR/config.local.yaml"
 expect_start_error missing_key_logged "network workers: missing key mode"
 printf 'version: 1\nnetworks:\n  workers:\n    mode: denylist\n  api:\n    mode: denylist\n' >"$EGRESS_CONFIG_DIR/config.local.yaml"
-expect_start_error networks_mismatch_logged "networks [api, workers] differ from the gateway's networks [workers]; run ./start.sh"
+expect_start_error networks_mismatch_logged "networks [api, workers] differ from the proxy's networks [workers]; run ./start.sh"
 use_config workers.yaml
-compose restart gateway
+compose restart proxy
 wait_health healthy || fail missing_key_logged "not healthy again after the config was fixed"
 
 # AC5: the Docker daemon restarts.
@@ -342,15 +342,15 @@ for ((i = 0; i < 60; i++)); do docker info >/dev/null 2>&1 && break; sleep 1; do
 wait_health healthy || fail restarts_after_daemon_restart "not back to healthy"
 ok restarts_after_daemon_restart
 
-# expect_networks <check> <key...>: one gateway container, attached to egress-uplink and to
+# expect_networks <check> <key...>: one proxy container, attached to egress-uplink and to
 # exactly egress-<key> per key (sorted), each internal; the labels and EGRESS_NETWORKS name
 # exactly those keys.
 expect_networks() {
   local name=$1 list want got k
   shift
   list=$(IFS=,; echo "$*")
-  [[ $(docker ps -a --filter label=windroc.egress.contract --format '{{.Names}}') == "$GW" ]] ||
-    fail "$name" "the contract label does not find exactly $GW"
+  [[ $(docker ps -a --filter label=windroc.egress.contract --format '{{.Names}}') == "$PX" ]] ||
+    fail "$name" "the contract label does not find exactly $PX"
   want="windroc.egress.contract=1"$'\n'"windroc.egress.networks=$list"
   for k in "$@"; do
     want+=$'\n'"windroc.egress.network.$k.name=egress-$k"$'\n'"windroc.egress.network.$k.proxy=http://egress-proxy-$k:4750"
@@ -405,9 +405,9 @@ legacy_before=$(legacy)
 
 two_networks_config
 start
-wait_health healthy || fail two_networks_healthy "the two-network gateway did not become healthy"
+wait_health healthy || fail two_networks_healthy "the two-network proxy did not become healthy"
 ok two_networks_healthy
-# AC1: one gateway on both networks, advertised one to one with the config's sections.
+# AC1: one proxy on both networks, advertised one to one with the config's sections.
 expect_networks networks_match_config mini-op workers
 [[ $(legacy) == "$legacy_before" ]] || fail mini_op_names_untouched "before: $legacy_before; after: $(legacy)"
 ok mini_op_names_untouched
@@ -419,7 +419,7 @@ tunneled mini_op_exception egress-mini-op "$MPROXY" "http://$lan_ip:2222/"
 
 # AC3: neither network gets the other's allows.
 denied workers_no_mini_op_allow egress-workers "$PROXY" "https://$lan_ip:2222/"
-# The gateway resolves host.docker.internal to the default bridge's gateway (host-gateway).
+# The proxy resolves host.docker.internal to the default bridge's gateway (host-gateway).
 hdi_ip=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
 denied mini_op_no_workers_exception egress-mini-op "$MPROXY" "https://$hdi_ip:11434/"
 
@@ -439,18 +439,18 @@ denied private_resolution_denied egress-workers "$PROXY" https://localtest.me/
 denied private_resolution_denied egress-mini-op "$MPROXY" https://localtest.me/
 
 # AC4: no caller reaches the other network's proxy listener, directly or through its own.
-gw_workers_ip=$(inspect '{{(index .NetworkSettings.Networks "egress-workers").IPAddress}}')
-gw_mini_op_ip=$(inspect '{{(index .NetworkSettings.Networks "egress-mini-op").IPAddress}}')
-unreachable no_cross_proxy egress-workers -x "http://$gw_mini_op_ip:4750" https://example.com/
+px_workers_ip=$(inspect '{{(index .NetworkSettings.Networks "egress-workers").IPAddress}}')
+px_mini_op_ip=$(inspect '{{(index .NetworkSettings.Networks "egress-mini-op").IPAddress}}')
+unreachable no_cross_proxy egress-workers -x "http://$px_mini_op_ip:4750" https://example.com/
 unreachable no_cross_proxy egress-workers -x "$MPROXY" https://example.com/
-unreachable no_cross_proxy egress-mini-op -x "http://$gw_workers_ip:4750" https://example.com/
+unreachable no_cross_proxy egress-mini-op -x "http://$px_workers_ip:4750" https://example.com/
 unreachable no_cross_proxy egress-mini-op -x "$PROXY" https://example.com/
-denied no_cross_proxy egress-workers "$PROXY" "https://$gw_mini_op_ip:4750/"
+denied no_cross_proxy egress-workers "$PROXY" "https://$px_mini_op_ip:4750/"
 denied no_cross_proxy egress-workers "$PROXY" https://egress-proxy-mini-op:4750/
-denied no_cross_proxy egress-mini-op "$MPROXY" "https://$gw_workers_ip:4750/"
+denied no_cross_proxy egress-mini-op "$MPROXY" "https://$px_workers_ip:4750/"
 
 # AC5: containers on the two networks cannot reach each other. Each listener (a plain
-# smokescreen from the gateway image) answers on its own network: the positive control.
+# smokescreen from the proxy image) answers on its own network: the positive control.
 image=$(compose config --images)
 for net in workers mini-op; do
   docker run -d --name "egress-test-listen-$net" --network "egress-$net" --entrypoint /smokescreen \
@@ -497,7 +497,7 @@ networks:
     verify:
       deny_targets: ["$lan_ip:22", "$lan_ip:2223"]
 EOF
-  compose restart gateway >/dev/null
+  compose restart proxy >/dev/null
   wait_health healthy || fail verify_config "not healthy after the restart"
 }
 # verify <check> <want exit> <args...>: runs verify-egress, prints its output, and checks
@@ -537,7 +537,7 @@ for line in "| curl | works | works | $probe_id | $(date -u +%Y-%m-%d) |" \
 done
 ok verify_egress_tools
 two_networks_config
-compose restart gateway >/dev/null
+compose restart proxy >/dev/null
 wait_health healthy || fail verify_egress_tools "not healthy after restoring the fixture"
 
 # -------- Stage C: add and remove a network through the config alone --------
@@ -571,7 +571,7 @@ git -C "$repo" ls-files -z | (cd "$repo" && xargs -0 cp --parents -t "$copy")
 wait_health healthy || fail other_checkout_keeps_network "not healthy after the other checkout's start"
 expect_networks other_checkout_keeps_network mini-op testnet workers
 
-# AC10: without the mini-op section, the gateway leaves egress-mini-op and its labels.
+# AC10: without the mini-op section, the proxy leaves egress-mini-op and its labels.
 sed "s/LAN_IP/$lan_ip/" "$repo/tests/fixtures/two-networks.yaml" |
   awk '/^  mini-op:/ { skip = 1; next } /^  [a-z]/ { skip = 0 } !skip' >"$EGRESS_CONFIG_DIR/config.local.yaml"
 printf '%s' "$testnet" >>"$EGRESS_CONFIG_DIR/config.local.yaml"
