@@ -39,4 +39,6 @@ docker run --rm --pull never --network none --read-only --cap-drop ALL \
   "$image" compose >"$tmp" || exit $?
 mv "$tmp" "$override"
 
-"${base[@]}" -f "$override" up -d
+# --remove-orphans: an install from before the rename to proxy runs compose service
+# gateway; its container is an orphan now and would keep serving the caller networks.
+"${base[@]}" -f "$override" up -d --remove-orphans

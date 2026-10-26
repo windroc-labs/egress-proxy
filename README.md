@@ -30,6 +30,12 @@ rendered file the proxy has no caller networks and exits 2 (fail closed).
 `restart: unless-stopped` brings the proxy back after a crash, a Docker Desktop restart,
 or a Mac restart (with Docker Desktop set to start at login).
 
+Upgrading an install from before the rename to proxy (container `egress-gateway`):
+`./start.sh` replaces that container with `egress-proxy` on the same caller networks, with
+the same labels and aliases. Then remove by hand the old image, `docker image rm
+egress-gateway`, and in a checkout where you built the entrypoint, `rm -rf gateway`
+(its ignored build output).
+
 ## Commands
 
 | Task | Command |

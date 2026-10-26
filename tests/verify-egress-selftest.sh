@@ -372,6 +372,13 @@ printf 'proxy: unknown option plan\nusage: proxy ...\n' >"$FAKE/plan.err"
 out=$(run workers)
 expect old_proxy "$out" 1 "FAIL plan egress-proxy: the proxy image has no plan mode; run ./start.sh, want a plan"
 
+# An image from before the rename to proxy has no /proxy to exec.
+scenario pre_rename_image
+echo 126 >"$FAKE/plan.rc"
+echo 'OCI runtime exec failed: exec failed: unable to start container process: exec: "/proxy": stat /proxy: no such file or directory: unknown' >"$FAKE/plan.err"
+out=$(run workers)
+expect pre_rename_image "$out" 1 "FAIL plan egress-proxy: the proxy image has no plan mode; run ./start.sh, want a plan"
+
 scenario drift_message
 echo 2 >"$FAKE/plan.rc"
 echo "proxy: network workers: running policy differs from /etc/egress/config.local.yaml; restart the proxy (docker compose restart proxy)" >"$FAKE/plan.err"

@@ -6,7 +6,7 @@
 # Stage A starts the proxy with start.sh and a config holding only `workers`; stage B
 # adds `mini-op` (allowlist), checks that each network gets only its own policy, and runs
 # verify-egress on both networks and with --tools; stage C adds and removes a network
-# through the config alone.
+# through the config alone; stage D upgrades an install from before the rename to proxy.
 # Docker's Go templates use $ inside single quotes on purpose.
 # shellcheck disable=SC2016
 set -euo pipefail
@@ -578,5 +578,31 @@ printf '%s' "$testnet" >>"$EGRESS_CONFIG_DIR/config.local.yaml"
 start
 wait_health healthy || fail remove_network "not healthy without the mini-op section"
 expect_networks remove_network testnet workers
+
+# -------- Stage D: upgrade an install from before the rename to proxy --------
+# The old install: compose service gateway, container egress-gateway, on the same caller
+# networks. This compose.yaml and override with the old names stand in for the old
+# checkout; only the compose names matter to the upgrade, so the image is this one.
+old=$work/old OLD_SERVICE=gateway OLD_PX=egress-gateway
+mkdir -p "$old"
+sed -e "s/^  proxy:\$/  $OLD_SERVICE:/" -e "s/^    container_name: $PX\$/    container_name: $OLD_PX/" \
+  "$repo/compose.yaml" >"$old/compose.yaml"
+sed "s/^  proxy:\$/  $OLD_SERVICE:/" "$EGRESS_CONFIG_DIR/compose.networks.yaml" >"$old/compose.networks.yaml"
+if ! grep -q "container_name: $OLD_PX\$" "$old/compose.yaml" || ! grep -q "^  $OLD_SERVICE:\$" "$old/compose.networks.yaml"; then
+  fail upgrade_replaces_old "cannot write the old compose files"
+fi
+docker rm -f "$PX" >/dev/null
+docker compose --project-directory "$repo" -f "$old/compose.yaml" -f "$old/compose.networks.yaml" up -d
+PX=$OLD_PX wait_health healthy || fail upgrade_replaces_old "the old $OLD_PX did not become healthy"
+upgrade_nets() { docker network inspect --format '{{.Id}}' egress-uplink egress-testnet egress-workers; }
+nets_before=$(upgrade_nets)
+start
+[[ -z $(docker ps -aq --filter "name=^$OLD_PX\$") ]] || fail upgrade_replaces_old "$OLD_PX still exists"
+wait_health healthy || fail upgrade_replaces_old "$PX not healthy after the upgrade"
+expect_networks upgrade_replaces_old testnet workers
+[[ $(upgrade_nets) == "$nets_before" ]] || fail upgrade_keeps_networks "the caller networks were recreated"
+ok upgrade_keeps_networks
+allowed upgrade_serves egress-workers "$PROXY" https://www.wikipedia.org/
+allowed upgrade_serves egress-testnet http://egress-proxy-testnet:4750 https://example.com/
 
 echo "all checks passed"

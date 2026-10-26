@@ -430,7 +430,8 @@ pass host_listener "127.0.0.1:$listen_port" "answers on the host"
 plan_args=(plan "$key" --listener-port "$listen_port")
 if ((${#host_args[@]} > 0)); then plan_args+=("${host_args[@]}"); fi
 if ! docker exec "$px" /proxy "${plan_args[@]}" >"$tmp/plan" 2>"$tmp/plan.err"; then
-  if grep -q 'unknown option plan' "$tmp/plan.err"; then
+  # An image without plan mode, or one from before the rename with no /proxy.
+  if grep -qE 'unknown option plan|stat /proxy: no such file or directory' "$tmp/plan.err"; then
     stop plan "$px_name" "the proxy image has no plan mode; run ./start.sh" "a plan"
   fi
   stop plan "$px_name" "$(head -n 1 "$tmp/plan.err" | cut -c 1-300)" "a plan"
