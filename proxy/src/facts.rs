@@ -20,16 +20,16 @@ const ALIAS_RETRY: Duration = Duration::from_millis(500);
 pub struct Facts {
     /// The port every network's smokescreen listens on.
     pub port: u16,
-    /// Each network's listen IP: the gateway's address on that network.
+    /// Each network's listen IP: the proxy's address on that network.
     pub networks: BTreeMap<String, IpAddr>,
     /// What `host.docker.internal` resolved to (empty when it did not resolve).
     pub host_docker_internal: Vec<IpAddr>,
-    /// The gateway's own interface addresses.
+    /// The proxy's own interface addresses.
     pub own_addrs: Vec<IpAddr>,
     /// Each exception host name (not IP literals) and the canonical addresses it resolved
     /// to, sorted and deduplicated.
     pub exceptions: BTreeMap<String, Vec<IpAddr>>,
-    /// Each caller network's subnet, from the gateway's interface on it.
+    /// Each caller network's subnet, from the proxy's interface on it.
     pub subnets: BTreeMap<String, IpNet>,
 }
 
@@ -64,12 +64,12 @@ impl Resolver {
 }
 
 /// Learns each configured network's listen IP and subnet, `host.docker.internal`, the
-/// gateway's own addresses and the exceptions' addresses.
+/// proxy's own addresses and the exceptions' addresses.
 pub fn gather(config: &Config, port: u16, resolver: &Resolver) -> Result<Facts, String> {
     gather_with(config, port, resolver, &interfaces()?)
 }
 
-/// [`gather`] with the gateway's interface addresses given.
+/// [`gather`] with the proxy's interface addresses given.
 fn gather_with(
     config: &Config,
     port: u16,
@@ -108,7 +108,7 @@ fn gather_with(
 }
 
 /// Resolves every exception host name once and refuses any exception address that is the
-/// gateway's or on a caller network: either would let a caller through to another network.
+/// proxy's or on a caller network: either would let a caller through to another network.
 fn resolve_exceptions(
     config: &Config,
     resolver: &Resolver,
@@ -152,7 +152,7 @@ fn refuse_exception_addr(
 ) -> Result<(), String> {
     if ip.is_loopback() || ip.is_unspecified() || own.contains(&ip) {
         return Err(format!(
-            "{exception} resolves to {ip}, an address of the gateway itself"
+            "{exception} resolves to {ip}, an address of the proxy itself"
         ));
     }
     match subnets.iter().find(|(_, net)| net.contains(&ip)) {
@@ -171,7 +171,7 @@ fn resolve_listen_ip(alias: &str, resolver: &Resolver, own: &[IpAddr]) -> Result
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "cannot resolve {alias}; the gateway is not attached to that network (run ./start.sh)"
+                "cannot resolve {alias}; the proxy is not attached to that network (run ./start.sh)"
             ));
         }
         sleep(ALIAS_RETRY);
@@ -316,7 +316,7 @@ mod tests {
         parse(Path::new("/c.yaml"), &text).unwrap()
     }
 
-    /// The gateway's interfaces: loopback, plus one address on each caller network.
+    /// The proxy's interfaces: loopback, plus one address on each caller network.
     fn interfaces() -> Vec<IpNet> {
         ["127.0.0.1/8", "::1/128", "172.20.0.2/16", "172.21.0.2/16"]
             .iter()
@@ -432,7 +432,7 @@ mod tests {
             assert_eq!(
                 err,
                 format!(
-                    "network workers: exceptions: {entry} resolves to {ip}, an address of the gateway itself"
+                    "network workers: exceptions: {entry} resolves to {ip}, an address of the proxy itself"
                 )
             );
         }
@@ -443,7 +443,7 @@ mod tests {
         let err = gather_two(&["[::ffff:127.0.0.1]:8080"], &[]).unwrap_err();
         assert_eq!(
             err,
-            "network workers: exceptions: [::ffff:127.0.0.1]:8080 resolves to 127.0.0.1, an address of the gateway itself"
+            "network workers: exceptions: [::ffff:127.0.0.1]:8080 resolves to 127.0.0.1, an address of the proxy itself"
         );
     }
 

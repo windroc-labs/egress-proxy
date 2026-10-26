@@ -1,9 +1,9 @@
 [package]
-name = "gateway"
+name = "proxy"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Entrypoint of the egress gateway image: generates each caller network's smokescreen policy and supervises one smokescreen per network."
+description = "Entrypoint of the egress proxy image: generates each caller network's smokescreen policy and supervises one smokescreen per network."
 
 [dependencies]
 ipnet = { version = "2.12.2", features = ["serde"] }

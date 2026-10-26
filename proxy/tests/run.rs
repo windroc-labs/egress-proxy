@@ -1,4 +1,4 @@
-//! `gateway run` as a process, with a fake smokescreen.
+//! `proxy run` as a process, with a fake smokescreen.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -43,7 +43,7 @@ impl Setup {
     }
 
     fn command(&self, networks: Option<&str>) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gateway"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_proxy"));
         cmd.arg("run")
             .arg("--config")
             .arg(self.root.join("config.yaml"))
@@ -90,7 +90,7 @@ fn wait_exit(child: &mut Child) -> ExitStatus {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
         }
-        assert!(Instant::now() < deadline, "gateway did not exit");
+        assert!(Instant::now() < deadline, "proxy did not exit");
         sleep(Duration::from_millis(50));
     }
 }
@@ -111,7 +111,7 @@ fn mode(path: &Path) -> u32 {
 #[test]
 fn writes_policy_files() {
     let s = Setup::new(TWO_NETWORKS);
-    let mut gw = s.command(Some("workers,api")).spawn().unwrap();
+    let mut proxy = s.command(Some("workers,api")).spawn().unwrap();
     s.child_pid("workers");
     s.child_pid("api");
     let config = fs::read_to_string(s.run_dir().join("workers/config.yaml")).unwrap();
@@ -121,11 +121,11 @@ fn writes_policy_files() {
     assert!(acl.contains("action: enforce"), "{acl}");
     assert_eq!(mode(&s.run_dir().join("facts.json")), 0o600);
     assert_eq!(mode(&s.run_dir().join("workers/config.yaml")), 0o600);
-    kill(Pid::from_raw(gw.id() as i32), Signal::SIGTERM).unwrap();
-    assert_eq!(wait_exit(&mut gw).code(), Some(0));
-    let err = stderr_of(gw);
+    kill(Pid::from_raw(proxy.id() as i32), Signal::SIGTERM).unwrap();
+    assert_eq!(wait_exit(&mut proxy).code(), Some(0));
+    let err = stderr_of(proxy);
     assert!(
-        err.contains("gateway: network workers (denylist) listening on 127.0.0.1:4750"),
+        err.contains("proxy: network workers (denylist) listening on 127.0.0.1:4750"),
         "{err}"
     );
 }
@@ -133,29 +133,29 @@ fn writes_policy_files() {
 #[test]
 fn sigterm_stops_children_exit_0() {
     let s = Setup::new(TWO_NETWORKS);
-    let mut gw = s.command(Some("workers,api")).spawn().unwrap();
+    let mut proxy = s.command(Some("workers,api")).spawn().unwrap();
     let pids = [s.child_pid("workers"), s.child_pid("api")];
-    kill(Pid::from_raw(gw.id() as i32), Signal::SIGTERM).unwrap();
-    assert_eq!(wait_exit(&mut gw).code(), Some(0));
+    kill(Pid::from_raw(proxy.id() as i32), Signal::SIGTERM).unwrap();
+    assert_eq!(wait_exit(&mut proxy).code(), Some(0));
     for pid in pids {
-        assert!(!alive(pid), "smokescreen {pid} survived the gateway");
+        assert!(!alive(pid), "smokescreen {pid} survived the proxy");
     }
 }
 
 #[test]
 fn child_exit_stops_all_exit_1() {
     let s = Setup::new(TWO_NETWORKS);
-    let mut gw = s
+    let mut proxy = s
         .command(Some("workers,api"))
         .env("FAKE_EXIT_FOR", "/api/")
         .spawn()
         .unwrap();
     let workers = s.child_pid("workers");
-    assert_eq!(wait_exit(&mut gw).code(), Some(1));
+    assert_eq!(wait_exit(&mut proxy).code(), Some(1));
     assert!(!alive(workers), "workers smokescreen survived");
-    let err = stderr_of(gw);
+    let err = stderr_of(proxy);
     assert!(
-        err.contains("gateway: network api: smokescreen exited (exit code 3); stopping"),
+        err.contains("proxy: network api: smokescreen exited (exit code 3); stopping"),
         "{err}"
     );
 }
@@ -163,9 +163,9 @@ fn child_exit_stops_all_exit_1() {
 #[test]
 fn missing_mode_exits_2() {
     let s = Setup::new("version: 1\nnetworks:\n  workers:\n    deny_ranges: []\n");
-    let mut gw = s.command(Some("workers")).spawn().unwrap();
-    assert_eq!(wait_exit(&mut gw).code(), Some(2));
-    let err = stderr_of(gw);
+    let mut proxy = s.command(Some("workers")).spawn().unwrap();
+    assert_eq!(wait_exit(&mut proxy).code(), Some(2));
+    let err = stderr_of(proxy);
     assert!(err.contains("network workers: missing key mode"), "{err}");
     assert!(!s.run_dir().exists(), "a policy was written");
 }
@@ -173,11 +173,11 @@ fn missing_mode_exits_2() {
 #[test]
 fn networks_mismatch_exits_2() {
     let s = Setup::new("version: 1\nnetworks:\n  workers:\n    mode: denylist\n");
-    let mut gw = s.command(Some("workers,api")).spawn().unwrap();
-    assert_eq!(wait_exit(&mut gw).code(), Some(2));
-    let err = stderr_of(gw);
+    let mut proxy = s.command(Some("workers,api")).spawn().unwrap();
+    assert_eq!(wait_exit(&mut proxy).code(), Some(2));
+    let err = stderr_of(proxy);
     assert!(
-        err.contains("networks [workers] differ from the gateway's networks [api, workers]"),
+        err.contains("networks [workers] differ from the proxy's networks [api, workers]"),
         "{err}"
     );
     assert!(!s.run_dir().exists(), "a policy was written");
@@ -186,15 +186,15 @@ fn networks_mismatch_exits_2() {
 #[test]
 fn missing_env_exits_2() {
     let s = Setup::new("version: 1\nnetworks:\n  workers:\n    mode: denylist\n");
-    let mut gw = s.command(None).spawn().unwrap();
-    assert_eq!(wait_exit(&mut gw).code(), Some(2));
-    let err = stderr_of(gw);
+    let mut proxy = s.command(None).spawn().unwrap();
+    assert_eq!(wait_exit(&mut proxy).code(), Some(2));
+    let err = stderr_of(proxy);
     assert!(err.contains("EGRESS_NETWORKS is not set"), "{err}");
 }
 
 #[test]
 fn unknown_option_exits_2() {
-    let out = Command::new(env!("CARGO_BIN_EXE_gateway"))
+    let out = Command::new(env!("CARGO_BIN_EXE_proxy"))
         .args(["run", "--bogus"])
         .output()
         .unwrap();
@@ -208,15 +208,15 @@ fn unresolved_exception_exits_1() {
     let s = Setup::new(
         "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    exceptions: [\"nas.lan:8080\"]\n",
     );
-    let mut gw = s
+    let mut proxy = s
         .command(Some("workers"))
         .args(["--resolve", "nas.lan="])
         .spawn()
         .unwrap();
-    assert_eq!(wait_exit(&mut gw).code(), Some(1));
-    let err = stderr_of(gw);
+    assert_eq!(wait_exit(&mut proxy).code(), Some(1));
+    let err = stderr_of(proxy);
     assert!(
-        err.contains("gateway: network workers: exceptions: cannot resolve nas.lan"),
+        err.contains("proxy: network workers: exceptions: cannot resolve nas.lan"),
         "{err}"
     );
     assert!(!s.pid_file("workers").exists(), "a smokescreen was started");

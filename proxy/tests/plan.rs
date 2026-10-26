@@ -1,13 +1,13 @@
-//! `gateway plan` as a process, against running state written by the library.
+//! `proxy plan` as a process, against running state written by the library.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use gateway::config;
-use gateway::facts::{self, Facts};
-use gateway::policy;
+use proxy::config;
+use proxy::facts::{self, Facts};
+use proxy::policy;
 
 const TWO: &str = "version: 1\nnetworks:\n  workers:\n    mode: denylist\n  mini-op:\n    mode: allowlist\n    allow: [example.com]\n";
 
@@ -17,7 +17,7 @@ struct State {
     run_dir: PathBuf,
 }
 
-/// Writes `config_text` and the running state `gateway run` would have written for it.
+/// Writes `config_text` and the running state `proxy run` would have written for it.
 fn started(config_text: &str) -> State {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.local.yaml");
@@ -45,7 +45,7 @@ fn started(config_text: &str) -> State {
 }
 
 fn plan(state: &State, key: &str, advertised: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_gateway"))
+    Command::new(env!("CARGO_BIN_EXE_proxy"))
         .args(["plan", key, "--listener-port", "50123"])
         .args([
             "--host-addr",
@@ -102,7 +102,7 @@ fn drift_refused() {
     assert_eq!(
         text(&out.stderr),
         format!(
-            "gateway: network mini-op: running policy differs from {}; restart the gateway (docker compose restart gateway)\n",
+            "proxy: network mini-op: running policy differs from {}; run ./start.sh\n",
             state.config.display()
         )
     );
@@ -115,13 +115,13 @@ fn unknown_network_and_missing_state() {
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(
         text(&out.stderr),
-        "gateway: network other is not in the config\n"
+        "proxy: network other is not in the config\n"
     );
     fs::remove_file(state.run_dir.join("facts.json")).unwrap();
     let out = plan(&state, "workers", "mini-op,workers");
     assert_eq!(out.status.code(), Some(2));
     assert!(
-        text(&out.stderr).starts_with("gateway: not started: "),
+        text(&out.stderr).starts_with("proxy: not started: "),
         "{}",
         text(&out.stderr)
     );
@@ -130,10 +130,10 @@ fn unknown_network_and_missing_state() {
 
 #[test]
 fn usage_errors_exit_2() {
-    let out = Command::new(env!("CARGO_BIN_EXE_gateway"))
+    let out = Command::new(env!("CARGO_BIN_EXE_proxy"))
         .args(["plan", "workers"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
-    assert!(text(&out.stderr).starts_with("gateway: plan needs --listener-port\n"));
+    assert!(text(&out.stderr).starts_with("proxy: plan needs --listener-port\n"));
 }

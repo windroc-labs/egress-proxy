@@ -1,4 +1,4 @@
-//! `gateway health` as a process, against running state written by the library and an
+//! `proxy health` as a process, against running state written by the library and an
 //! in-process fake proxy.
 
 use std::collections::BTreeMap;
@@ -10,9 +10,9 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gateway::config;
-use gateway::facts::{self, Facts};
-use gateway::policy;
+use proxy::config;
+use proxy::facts::{self, Facts};
+use proxy::policy;
 
 const WORKERS: &str = "version: 1\nnetworks:\n  workers:\n    mode: denylist\n";
 
@@ -68,7 +68,7 @@ struct State {
     run_dir: PathBuf,
 }
 
-/// Writes `config_text` and the running state `gateway run` would have written, with
+/// Writes `config_text` and the running state `proxy run` would have written, with
 /// every network listening on 127.0.0.1:`port`.
 fn started(config_text: &str, port: u16) -> State {
     let dir = tempfile::tempdir().unwrap();
@@ -98,7 +98,7 @@ fn started(config_text: &str, port: u16) -> State {
 }
 
 fn health(config: &Path, run_dir: &Path, networks: &str) -> (Option<i32>, String) {
-    let Output { status, stdout, .. } = Command::new(env!("CARGO_BIN_EXE_gateway"))
+    let Output { status, stdout, .. } = Command::new(env!("CARGO_BIN_EXE_proxy"))
         .arg("health")
         .arg("--config")
         .arg(config)
@@ -145,7 +145,7 @@ fn drift_names_network() {
     let (code, out) = check(&s);
     assert_eq!(code, Some(1), "{out}");
     let want = format!(
-        "FAIL network workers: running policy differs from {}; restart the gateway (docker compose restart gateway)",
+        "FAIL network workers: running policy differs from {}; run ./start.sh",
         s.config.display()
     );
     assert!(out.contains(&want), "{out}");
@@ -249,7 +249,7 @@ fn networks_mismatch_fails() {
     let (code, out) = health(&s.config, &s.run_dir, "workers,api");
     assert_eq!(code, Some(1), "{out}");
     assert!(
-        out.contains("differ from the gateway's networks [api, workers]"),
+        out.contains("differ from the proxy's networks [api, workers]"),
         "{out}"
     );
 }
@@ -262,7 +262,7 @@ fn network_added_without_restart_fails() {
     let (code, out) = health(&s.config, &s.run_dir, "workers,api");
     assert_eq!(code, Some(1), "{out}");
     assert!(
-        out.contains("FAIL networks [api, workers] differ from the running networks [workers]; restart the gateway (docker compose restart gateway)"),
+        out.contains("FAIL networks [api, workers] differ from the running networks [workers]; run ./start.sh"),
         "{out}"
     );
 }

@@ -1,4 +1,4 @@
-//! `gateway run`: generate every network's policy, start one smokescreen per network,
+//! `proxy run`: generate every network's policy, start one smokescreen per network,
 //! and supervise them as PID 1.
 
 use std::io;
@@ -25,7 +25,7 @@ struct Child {
     alive: bool,
 }
 
-/// Runs the gateway; returns the process exit code: 0 after SIGTERM or SIGINT, 1 when
+/// Runs the proxy; returns the process exit code: 0 after SIGTERM or SIGINT, 1 when
 /// a smokescreen exits or cannot start, 2 on a config or environment error.
 pub fn run(opts: &Opts) -> u8 {
     // Block first, so a SIGTERM during start (alias lookups can take 10 s) waits for
@@ -36,21 +36,21 @@ pub fn run(opts: &Opts) -> u8 {
         mask.add(sig);
     }
     if let Err(e) = mask.thread_block() {
-        eprintln!("gateway: cannot block signals: {e}");
+        eprintln!("proxy: cannot block signals: {e}");
         return 1;
     }
 
     let config = match config::load_served(&opts.config, opts.advertised.as_deref()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("gateway: {e}");
+            eprintln!("proxy: {e}");
             return 2;
         }
     };
     let facts = match prepare(opts, &config) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("gateway: {e}");
+            eprintln!("proxy: {e}");
             return 1;
         }
     };
@@ -72,7 +72,7 @@ pub fn run(opts: &Opts) -> u8 {
         match cmd.spawn() {
             Ok(child) => {
                 eprintln!(
-                    "gateway: network {key} ({}) listening on {}:{}",
+                    "proxy: network {key} ({}) listening on {}:{}",
                     network.mode, facts.networks[key], facts.port
                 );
                 children.push(Child {
@@ -83,7 +83,7 @@ pub fn run(opts: &Opts) -> u8 {
             }
             Err(e) => {
                 eprintln!(
-                    "gateway: network {key}: cannot start {}: {e}",
+                    "proxy: network {key}: cannot start {}: {e}",
                     opts.smokescreen.display()
                 );
                 return stop(&mut children, 1);
@@ -95,16 +95,16 @@ pub fn run(opts: &Opts) -> u8 {
         match mask.wait() {
             Ok(Signal::SIGCHLD) => {
                 if let Some((network, how)) = reap(&mut children).into_iter().next() {
-                    eprintln!("gateway: network {network}: smokescreen exited ({how}); stopping");
+                    eprintln!("proxy: network {network}: smokescreen exited ({how}); stopping");
                     return stop(&mut children, 1);
                 }
             }
             Ok(sig) => {
-                eprintln!("gateway: {sig}; stopping");
+                eprintln!("proxy: {sig}; stopping");
                 return stop(&mut children, 0);
             }
             Err(e) => {
-                eprintln!("gateway: sigwait: {e}; stopping");
+                eprintln!("proxy: sigwait: {e}; stopping");
                 return stop(&mut children, 1);
             }
         }

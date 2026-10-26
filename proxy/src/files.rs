@@ -1,4 +1,4 @@
-//! Files only the gateway's user may read: the running policies and the start facts.
+//! Files only the proxy's user may read: the running policies and the start facts.
 
 use std::fs::{DirBuilder, OpenOptions};
 use std::io::{self, Write};

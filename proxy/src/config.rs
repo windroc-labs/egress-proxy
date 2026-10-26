@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use ipnet::{IpNet, Ipv6Net};
 use serde_yaml::{Mapping, Value};
 
-/// The only config format version this gateway knows.
+/// The only config format version this proxy knows.
 pub const FORMAT_VERSION: u64 = 1;
 
 const TOP_KEYS: &[&str] = &["version", "networks"];
@@ -23,7 +23,7 @@ const NETWORK_KEYS: &[&str] = &[
     "health",
     "verify",
 ];
-/// The compose key of the gateway's own way out; its Docker name would collide.
+/// The compose key of the proxy's own way out; its Docker name would collide.
 const RESERVED_KEY: &str = "uplink";
 const HEALTH_KEYS: &[&str] = &["allow_probe", "deny_probe"];
 const VERIFY_KEYS: &[&str] = &["deny_targets"];
@@ -118,7 +118,7 @@ pub fn network_name(key: &str) -> String {
     format!("egress-{key}")
 }
 
-/// The listen alias of caller network `key`: the gateway's DNS name on it.
+/// The listen alias of caller network `key`: the proxy's DNS name on it.
 pub fn listen_alias(key: &str) -> String {
     format!("egress-proxy-{key}")
 }
@@ -224,7 +224,7 @@ pub fn parse(path: &Path, text: &str) -> Result<Config, ConfigError> {
             return Err(fail(
                 None,
                 format!(
-                    "network key {key} is reserved (the gateway's own network {})",
+                    "network key {key} is reserved (the proxy's own network {})",
                     network_name(key)
                 ),
             ));
@@ -235,7 +235,7 @@ pub fn parse(path: &Path, text: &str) -> Result<Config, ConfigError> {
     Ok(Config { networks: out })
 }
 
-/// Checks that the config serves exactly the networks the gateway advertises.
+/// Checks that the config serves exactly the networks the proxy advertises.
 pub fn check_advertised(
     path: &Path,
     config: &Config,
@@ -252,7 +252,7 @@ pub fn check_advertised(
         path: path.to_path_buf(),
         network: None,
         problem: format!(
-            "networks [{}] differ from the gateway's networks [{}]; run ./start.sh",
+            "networks [{}] differ from the proxy's networks [{}]; run ./start.sh",
             have.join(", "),
             want.join(", ")
         ),
@@ -599,7 +599,7 @@ mod tests {
             ),
             (
                 "version: 1\nnetworks:\n  uplink: {mode: denylist}\n",
-                "config /c.yaml: network key uplink is reserved (the gateway's own network egress-uplink)",
+                "config /c.yaml: network key uplink is reserved (the proxy's own network egress-uplink)",
             ),
             (
                 "version: 1\nnetworks:\n  workers: {}\n",
@@ -800,7 +800,7 @@ mod tests {
         let err = check_advertised(path, &config, &["workers".into(), "api".into()]).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "config /c.yaml: networks [workers] differ from the gateway's networks [api, workers]; run ./start.sh"
+            "config /c.yaml: networks [workers] differ from the proxy's networks [api, workers]; run ./start.sh"
         );
     }
 

@@ -1,4 +1,4 @@
-//! `gateway compose` as a process.
+//! `proxy compose` as a process.
 
 use std::fs;
 use std::process::{Command, Output};
@@ -7,7 +7,7 @@ fn compose(config: &str) -> Output {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.local.yaml");
     fs::write(&path, config).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_gateway"))
+    Command::new(env!("CARGO_BIN_EXE_proxy"))
         .arg("compose")
         .arg("--config")
         .arg(&path)

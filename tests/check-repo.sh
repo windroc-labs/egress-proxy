@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Repo lint (CI `lint` job): no reference to the sibling repos outside the docs (NFR-3),
-# every base image and action pinned, no keychain or platform-TLS crates in the gateway,
+# every base image and action pinned, no keychain or platform-TLS crates in the proxy,
 # and the docs and the Dockerfile agreeing with the files they describe (labels, worker
 # tool rows).
 # Prints `ok <check>` or `FAIL <check>: <detail>`; exits 1 if any check fails.
@@ -67,7 +67,7 @@ else
 fi
 
 # Tests must never reach the macOS keychain or Security API: no crate that links them.
-none_found no_keychain_crates grep -nE '^name = "(security-framework|security-framework-sys|native-tls|keyring|rustls-platform-verifier)"$' gateway/Cargo.lock
+none_found no_keychain_crates grep -nE '^name = "(security-framework|security-framework-sys|native-tls|keyring|rustls-platform-verifier)"$' proxy/Cargo.lock
 
 # The image builds the entrypoint with the toolchain CI tests it with.
 channel=$(sed -nE 's/^channel = "([^"]+)"$/\1/p' rust-toolchain.toml)

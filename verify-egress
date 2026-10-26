@@ -6,8 +6,8 @@
 # probe container on it, with targets discovered at run time: the host's interface
 # addresses and default gateways, host.docker.internal, a listener this script opens on
 # the host's 127.0.0.1, one address per deny-floor range, each exception, the other caller
-# networks, and the config's verify.deny_targets. The running gateway computes the checks
-# (`gateway plan`, read-only, through docker exec); see README.md, Verify.
+# networks, and the config's verify.deny_targets. The running proxy computes the checks
+# (`proxy plan`, read-only, through docker exec); see README.md, Verify.
 #
 # Prints `ok <check> <target> <observed>` or `FAIL <check> <target>: <observed>, want
 # <expected>` per check, then a summary. Never prints a response body, a token or a
@@ -16,7 +16,7 @@
 # verify-egress --tools <image>: runs each tool of the worker tool table
 # (docs/worker-tools.md) in a container of <image> on the workers network, with the proxy
 # variables a worker gets, and prints one Markdown row per tool for that table. A result
-# comes only from exit codes and the gateway's log (did the gateway allow a request from
+# comes only from exit codes and the proxy's log (did the proxy allow a request from
 # that container to the row's destination), never from a tool's own output.
 #
 # Exit codes: 0 every check passed (--tools: it ran); 1 a check or precondition failed;
@@ -112,26 +112,26 @@ stop() {
   exit 1
 }
 
-# -------- The gateway, found by the label contract (docs/label-contract.md) --------
+# -------- The proxy, found by the label contract (docs/label-contract.md) --------
 ids=$(docker ps -a --filter label=windroc.egress.contract --format '{{.ID}}' 2>/dev/null) ||
-  stop gateway_found "label windroc.egress.contract" "docker ps failed" "exactly one container"
+  stop proxy_found "label windroc.egress.contract" "docker ps failed" "exactly one container"
 count=0
 for _ in $ids; do count=$((count + 1)); done
-((count == 1)) || stop gateway_found "label windroc.egress.contract" "$count containers" "exactly one"
-gw=$ids
-gw_name=$(docker inspect --format '{{.Name}}' "$gw")
-gw_name=${gw_name#/}
-pass gateway_found "label windroc.egress.contract" "$gw_name"
+((count == 1)) || stop proxy_found "label windroc.egress.contract" "$count containers" "exactly one"
+px=$ids
+px_name=$(docker inspect --format '{{.Name}}' "$px")
+px_name=${px_name#/}
+pass proxy_found "label windroc.egress.contract" "$px_name"
 
-label() { docker inspect --format "{{index .Config.Labels \"$1\"}}" "$gw"; }
+label() { docker inspect --format "{{index .Config.Labels \"$1\"}}" "$px"; }
 
 contract=$(label windroc.egress.contract)
-[[ $contract == 1 ]] || stop gateway_contract "$gw_name" "contract '$contract'" "contract 1"
-pass gateway_contract "$gw_name" "contract 1"
+[[ $contract == 1 ]] || stop proxy_contract "$px_name" "contract '$contract'" "contract 1"
+pass proxy_contract "$px_name" "contract 1"
 
-health=$(docker inspect --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$gw")
-[[ $health == "true healthy" ]] || stop gateway_healthy "$gw_name" "running/health '$health'" "true healthy"
-pass gateway_healthy "$gw_name" healthy
+health=$(docker inspect --format '{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$px")
+[[ $health == "true healthy" ]] || stop proxy_healthy "$px_name" "running/health '$health'" "true healthy"
+pass proxy_healthy "$px_name" healthy
 
 advertised=$(label windroc.egress.networks)
 case ",$advertised," in
@@ -148,7 +148,7 @@ pass network_internal "$net_name" "Internal true"
 
 # -------- --tools: the worker tool table --------
 # One line per row of docs/worker-tools.md, in its order: tool, expected result, and
-# `reach` when a dummy credential makes the tool exit non-zero even though the gateway
+# `reach` when a dummy credential makes the tool exit non-zero even though the proxy
 # let it through. tests/check-repo.sh compares these lines with the doc.
 tools=()
 expects=()
@@ -339,8 +339,8 @@ run_tools() {
         nohttp3) result="could not run: no HTTP/3 in curl" ;;
         noruntime) result="could not run: no runtime" ;;
         *)
-          docker logs --since "$start" --until "$((end + 1))" "$gw" >"$tmp/gwlog" 2>&1 || true
-          if ! allowed_from "$tmp/gwlog" "$(destination "$tool")" "$tool_ip"; then
+          docker logs --since "$start" --until "$((end + 1))" "$px" >"$tmp/pxlog" 2>&1 || true
+          if ! allowed_from "$tmp/pxlog" "$(destination "$tool")" "$tool_ip"; then
             result="fails: no proxy used"
           elif [[ $status == 0 || -n ${reaches[$i]} ]]; then
             result=works
@@ -429,11 +429,12 @@ pass host_listener "127.0.0.1:$listen_port" "answers on the host"
 # -------- The plan --------
 plan_args=(plan "$key" --listener-port "$listen_port")
 if ((${#host_args[@]} > 0)); then plan_args+=("${host_args[@]}"); fi
-if ! docker exec "$gw" /gateway "${plan_args[@]}" >"$tmp/plan" 2>"$tmp/plan.err"; then
-  if grep -q 'unknown option plan' "$tmp/plan.err"; then
-    stop plan "$gw_name" "the gateway image has no plan mode; run ./start.sh" "a plan"
+if ! docker exec "$px" /proxy "${plan_args[@]}" >"$tmp/plan" 2>"$tmp/plan.err"; then
+  # An image without plan mode, or one from before the rename with no /proxy.
+  if grep -qE 'unknown option plan|stat /proxy: no such file or directory' "$tmp/plan.err"; then
+    stop plan "$px_name" "the proxy image has no plan mode; run ./start.sh" "a plan"
   fi
-  stop plan "$gw_name" "$(head -n 1 "$tmp/plan.err" | cut -c 1-300)" "a plan"
+  stop plan "$px_name" "$(head -n 1 "$tmp/plan.err" | cut -c 1-300)" "a plan"
 fi
 
 names=()
@@ -466,8 +467,8 @@ while IFS= read -r line || [[ -n $line ]]; do
   methods+=("$method")
   targets+=("$target")
 done <"$tmp/plan"
-((${#names[@]} > 0)) || stop plan "$gw_name" "an empty plan" "a plan"
-pass plan "$gw_name" "${#names[@]} checks"
+((${#names[@]} > 0)) || stop plan "$px_name" "an empty plan" "a plan"
+pass plan "$px_name" "${#names[@]} checks"
 
 # -------- Probes --------
 # start <network> <args...>: a detached container on <network>; prints its ID. The
@@ -577,12 +578,12 @@ while ((i < ${#names[@]})); do
 done
 
 # -------- Containers on the other caller networks are out of reach --------
-gw_image=$(docker inspect --format '{{.Config.Image}}' "$gw")
+px_image=$(docker inspect --format '{{.Config.Image}}' "$px")
 IFS=, read -r -a others <<<"$advertised"
 for other in "${others[@]}"; do
   [[ -n $other && $other != "$key" ]] || continue
   other_net=$(label "windroc.egress.network.$other.name")
-  peer=$(start "$other_net" --pull never --entrypoint /smokescreen "$gw_image" --listen-ip 0.0.0.0 --listen-port 8080) || {
+  peer=$(start "$other_net" --pull never --entrypoint /smokescreen "$px_image" --listen-ip 0.0.0.0 --listen-port 8080) || {
     mismatch peer_control "$other_net" "the peer listener did not start" "an answer on its own network"
     continue
   }
