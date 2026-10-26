@@ -45,6 +45,9 @@ or a Mac restart (with Docker Desktop set to start at login).
 A config change takes effect only on restart (or `./start.sh` for an added or removed
 section); until then the gateway reports `unhealthy`, and a restart with sections that
 differ from the attached networks exits 2 with `run ./start.sh`.
+After editing the config within existing sections, run `docker compose restart gateway`, not
+`./start.sh`: `start.sh` leaves the running gateway as is, so it stays `unhealthy` and
+`verify-egress` fails `plan` with the drift message.
 A restart drops every in-flight connection on every caller network; callers keep their
 proxy settings and need no restart. After the Mac joins another network (e.g. a new
 Wi-Fi), restart the gateway.
@@ -119,6 +122,8 @@ learns on the host (its interface addresses with their prefixes, its default gat
 a listener it opens on the host's `127.0.0.1` for the run. It needs a healthy gateway and
 `python3` on the host (for the listener), and uses a throwaway Docker client config, so no
 registry credential or keychain is read.
+On macOS the first run raises "Allow Python to find devices on local networks?", and
+`host_listener` fails until it is allowed.
 
 | Check | Probe | Passes when |
 | --- | --- | --- |
