@@ -23,8 +23,10 @@ its config at start, `start.sh` is the start command, and `verify-egress` only c
 2. From this checkout: `./start.sh`
 
 `start.sh` builds the image, renders `~/.egress/compose.networks.yaml` (one caller network
-per config section: the attachments, `EGRESS_NETWORKS` and the labels) with the image, and
-runs `docker compose up -d` with it. It is idempotent: running it again changes nothing.
+per config section: the attachments, `EGRESS_NETWORKS` and the labels) with the image,
+creates the networks that do not exist yet (each `egress-<key>` internal, and
+`egress-uplink`; compose uses them as external), and runs `docker compose up -d` with it.
+It is idempotent: running it again changes nothing.
 Run it after pulling a new version of this repo, or from another checkout: the networks
 come from the config, so they stay. Never run a bare `docker compose up`: without the
 rendered file the proxy has no caller networks and exits 2 (fail closed).
@@ -32,11 +34,11 @@ rendered file the proxy has no caller networks and exits 2 (fail closed).
 or a Mac restart (with Docker Desktop set to start at login).
 
 Upgrading an install from before the rename to proxy (compose project `egress`, container
-`egress-gateway`): `./start.sh` starts `egress-proxy` in compose project `egress-proxy`,
-then removes the old container; the caller networks, labels and aliases stay. Then remove
-by hand the old image, `docker image rm
-egress-gateway`, and in a checkout where you built the entrypoint, `rm -rf gateway`
-(its ignored build output).
+`egress-gateway`): `./start.sh` removes the old container, then starts `egress-proxy` in
+compose project `egress-proxy` on the same networks, with the same labels and aliases;
+callers attached to the networks stay attached. Then remove by hand the old image,
+`docker image rm egress-gateway`, and in a checkout where you built the entrypoint,
+`rm -rf gateway` (its ignored build output).
 
 ## Commands
 
@@ -64,8 +66,8 @@ network; see `config.example.yaml`. Section `<key>` is Docker network `egress-<k
 where the proxy's alias is `egress-proxy-<key>` and its proxy URL
 `http://egress-proxy-<key>:4750`. Key `uplink` is reserved (the proxy's own network
 `egress-uplink`). These names and the container's, `egress-proxy`, do not collide with
-mini-op's `mini-op`, `mini-op-net` and `mini-op-proxy`. Removing a section detaches the proxy; its Docker network stays until
-`docker network rm egress-<key>`.
+mini-op's `mini-op`, `mini-op-net` and `mini-op-proxy`. Removing a section detaches the
+proxy; its Docker network stays until `docker network rm egress-<key>`.
 
 - **denylist**: public destinations are allowed; denied are the floor
   `0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12,
