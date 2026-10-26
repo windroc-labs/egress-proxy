@@ -8,15 +8,14 @@ use std::time::Duration;
 
 use crate::cli::Opts;
 use crate::config::{self, HostPort, Network};
-use crate::facts::{self, Facts};
-use crate::policy;
+use crate::facts;
+use crate::policy::{self, Drift};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// smokescreen denies before it dials, so a deny arrives at once; an allowed target
 /// may still be connecting when this runs out.
 const PROBE_WAIT: Duration = Duration::from_secs(3);
 const DENIED: u16 = 407;
-const RESTART: &str = "restart the gateway (docker compose restart gateway)";
 
 struct Line {
     ok: bool,
@@ -49,20 +48,14 @@ fn check(opts: &Opts) -> Vec<Line> {
         Ok(c) => c,
         Err(e) => return vec![fail(e)],
     };
-    let configured: Vec<&str> = config.networks.keys().map(String::as_str).collect();
-    let running: Vec<&str> = facts.networks.keys().map(String::as_str).collect();
-    if configured != running {
-        return vec![fail(format!(
-            "networks [{}] differ from the running networks [{}]; {RESTART}",
-            configured.join(", "),
-            running.join(", ")
-        ))];
-    }
-
-    let mut lines = Vec::new();
-    for (key, network) in &config.networks {
-        lines.push(policy_line(opts, key, network, &facts));
-    }
+    let outcomes = match policy::drift(&config, &facts, &opts.run_dir) {
+        Ok(o) => o,
+        Err(e) => return vec![fail(e)],
+    };
+    let mut lines: Vec<Line> = outcomes
+        .into_iter()
+        .map(|(key, outcome)| policy_line(opts, &key, outcome))
+        .collect();
     let probed: Vec<Vec<Line>> = thread::scope(|scope| {
         let handles: Vec<_> = config
             .networks
@@ -81,20 +74,12 @@ fn check(opts: &Opts) -> Vec<Line> {
     lines
 }
 
-fn policy_line(opts: &Opts, key: &str, network: &Network, facts: &Facts) -> Line {
-    let want = policy::generate(key, network, facts.networks[key], facts, &opts.run_dir);
-    match policy::read_running(&opts.run_dir, key) {
-        Ok(running) if running == want => ok(format!(
-            "network {key}: running policy matches {}",
-            opts.config.display()
-        )),
-        Ok(_) => fail(format!(
-            "network {key}: running policy differs from {}; {RESTART}",
-            opts.config.display()
-        )),
-        Err(e) => fail(format!(
-            "network {key}: cannot read the running policy: {e}"
-        )),
+fn policy_line(opts: &Opts, key: &str, outcome: Drift) -> Line {
+    let text = outcome.message(key, &opts.config);
+    if matches!(outcome, Drift::Matches) {
+        ok(text)
+    } else {
+        fail(text)
     }
 }
 

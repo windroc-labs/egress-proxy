@@ -4,8 +4,9 @@
 # daemon. Prints `ok <check>` per check and stops at the first `FAIL <check>: <detail>`.
 #
 # Stage A starts the gateway with start.sh and a config holding only `workers`; stage B
-# adds `mini-op` (allowlist) and checks that each network gets only its own policy; stage C
-# adds and removes a network through the config alone.
+# adds `mini-op` (allowlist), checks that each network gets only its own policy, and runs
+# verify-egress on both networks and with --tools; stage C adds and removes a network
+# through the config alone.
 # Docker's Go templates use $ inside single quotes on purpose.
 # shellcheck disable=SC2016
 set -euo pipefail
@@ -28,7 +29,9 @@ mkdir -p "$EGRESS_CONFIG_DIR"
 
 GW=egress-gateway
 PROXY=http://egress-proxy-workers:4750
-PROBE_IMAGE=curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6
+# The probe image verify-egress pins: one source for its digest.
+PROBE_IMAGE=$(sed -n 's/^PROBE_IMAGE=//p' "$repo/verify-egress")
+[[ -n $PROBE_IMAGE ]] || { echo "integration.sh: no PROBE_IMAGE line in verify-egress" >&2; exit 2; }
 LONG=egress-test-long
 MPROXY=http://egress-proxy-mini-op:4750
 # mini-op's own network and proxy container, assembled from pieces so tests/check-repo.sh
@@ -468,6 +471,74 @@ for pair in "workers mini-op" "mini-op workers"; do
 done
 ok no_cross_containers
 docker rm -f "${LISTENERS[@]}" >/dev/null
+
+# AC1, AC10, AC11, AC19 (FR-12, FR-13, FR-14): verify-egress on both networks. The fixture's
+# mini-op allows localtest.me for the FR-8 checks above, and verify-egress expects every
+# allow entry to work, so this config leaves it out. Port 22 of the runner's LAN address
+# (its ssh server) and port 2223 stand in for mini-op's old hard-coded LAN targets.
+# verify_config <workers deny targets>
+verify_config() {
+  cat >"$EGRESS_CONFIG_DIR/config.local.yaml" <<EOF
+version: 1
+networks:
+  workers:
+    mode: denylist
+    exceptions:
+      - host.docker.internal:11434
+    verify:
+      deny_targets: [$1]
+  mini-op:
+    mode: allowlist
+    allow:
+      - example.com
+    exceptions:
+      - $lan_ip:2222
+      - host.docker.internal:2222
+    verify:
+      deny_targets: ["$lan_ip:22", "$lan_ip:2223"]
+EOF
+  compose restart gateway >/dev/null
+  wait_health healthy || fail verify_config "not healthy after the restart"
+}
+# verify <check> <want exit> <args...>: runs verify-egress, prints its output, and checks
+# its exit code; leaves the output in $verify_out.
+verify() {
+  local name=$1 want=$2 rc=0
+  shift 2
+  verify_out=$("$repo/verify-egress" "$@" 2>&1) || rc=$?
+  local line
+  while IFS= read -r line; do printf '  verify-egress %s: %s\n' "$*" "$line"; done <<<"$verify_out"
+  [[ $rc == "$want" ]] || fail "$name" "verify-egress $* exited $rc, want $want"
+}
+verify_config ""
+verify verify_egress_workers 0 workers
+ok verify_egress_workers
+verify verify_egress_mini_op 0 mini-op
+for target in "$lan_ip:22" "$lan_ip:2223"; do
+  grep -qxF "ok proxy_deny $target connect=407" <<<"$verify_out" ||
+    fail verify_deny_targets "no 'ok proxy_deny $target connect=407'"
+done
+ok verify_egress_mini_op
+ok verify_deny_targets
+# A deny target the policy allows is a mismatch, named.
+verify_config '"example.com:443"'
+verify verify_egress_mismatch 1 workers
+grep -qxF "FAIL proxy_deny example.com:443: connect=200, want connect=407" <<<"$verify_out" ||
+  fail verify_egress_mismatch "the mismatch is not named"
+grep -qx "1 of [0-9]* checks failed: proxy_deny" <<<"$verify_out" ||
+  fail verify_egress_mismatch "the summary does not name proxy_deny"
+ok verify_egress_mismatch
+# The tool check with the probe image as the worker image (non-root): rows carry its ID.
+verify verify_egress_tools 0 --tools "$PROBE_IMAGE"
+probe_id=$(docker image inspect --format '{{.Id}}' "$PROBE_IMAGE")
+for line in "| curl | works | works | $probe_id | $(date -u +%Y-%m-%d) |" \
+  "| ssh | fails | not in image | $probe_id | $(date -u +%Y-%m-%d) |"; do
+  grep -qxF "$line" <<<"$verify_out" || fail verify_egress_tools "no '$line'"
+done
+ok verify_egress_tools
+two_networks_config
+compose restart gateway >/dev/null
+wait_health healthy || fail verify_egress_tools "not healthy after restoring the fixture"
 
 # -------- Stage C: add and remove a network through the config alone --------
 # AC10: a third section; the documented command attaches and advertises it.

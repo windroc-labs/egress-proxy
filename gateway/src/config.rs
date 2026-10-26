@@ -15,10 +15,18 @@ use serde_yaml::{Mapping, Value};
 pub const FORMAT_VERSION: u64 = 1;
 
 const TOP_KEYS: &[&str] = &["version", "networks"];
-const NETWORK_KEYS: &[&str] = &["mode", "deny_ranges", "allow", "exceptions", "health"];
+const NETWORK_KEYS: &[&str] = &[
+    "mode",
+    "deny_ranges",
+    "allow",
+    "exceptions",
+    "health",
+    "verify",
+];
 /// The compose key of the gateway's own way out; its Docker name would collide.
 const RESERVED_KEY: &str = "uplink";
 const HEALTH_KEYS: &[&str] = &["allow_probe", "deny_probe"];
+const VERIFY_KEYS: &[&str] = &["deny_targets"];
 const DEFAULT_DENY_PROBE: &str = "169.254.169.254:80";
 const DEFAULT_DENYLIST_ALLOW_PROBE: &str = "example.com:443";
 
@@ -37,6 +45,9 @@ pub struct Network {
     /// Destinations opened through the deny rules, sorted and deduplicated.
     pub exceptions: Vec<HostPort>,
     pub health: Health,
+    /// Extra targets verify-egress expects denied, sorted and deduplicated. Policy and
+    /// health never read them.
+    pub verify_deny_targets: Vec<HostPort>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,7 +291,7 @@ pub fn parse_advertised(value: Option<&str>) -> Result<Vec<String>, String> {
 fn parse_network(section: &Value) -> Result<Network, String> {
     let section = section
         .as_mapping()
-        .ok_or("want a mapping with keys mode, deny_ranges, allow, exceptions, health")?;
+        .ok_or("want a mapping with keys mode, deny_ranges, allow, exceptions, health, verify")?;
     check_keys(section, NETWORK_KEYS, "")?;
 
     let mode = match section.get("mode") {
@@ -323,13 +334,36 @@ fn parse_network(section: &Value) -> Result<Network, String> {
     exceptions.dedup();
 
     let health = parse_health(section.get("health"), mode, &allow)?;
+    let verify_deny_targets = parse_verify(section.get("verify"))?;
     Ok(Network {
         mode,
         deny_ranges,
         allow,
         exceptions,
         health,
+        verify_deny_targets,
     })
+}
+
+/// The `verify` mapping: verify-egress's extra deny targets.
+fn parse_verify(value: Option<&Value>) -> Result<Vec<HostPort>, String> {
+    let verify = match value {
+        None => return Ok(Vec::new()),
+        Some(Value::Mapping(m)) => m,
+        Some(_) => return Err("verify: want a mapping with key deny_targets".into()),
+    };
+    check_keys(verify, VERIFY_KEYS, "verify.")?;
+    let mut targets = string_list(verify, "deny_targets")
+        .map_err(|e| format!("verify.{e}"))?
+        .unwrap_or_default()
+        .iter()
+        .map(|t| {
+            host_port_entry(t).ok_or_else(|| format!("verify.deny_targets: {t} is not host:port"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    targets.sort();
+    targets.dedup();
+    Ok(targets)
 }
 
 fn parse_health(value: Option<&Value>, mode: Mode, allow: &[String]) -> Result<Health, String> {
@@ -393,13 +427,17 @@ fn parse_deny_range(text: &str) -> Result<IpNet, String> {
 /// An exception: `host:port` or `[v6]:port`, the host an IP address or a domain, which is
 /// lower-cased (smokescreen's ACL refuses a domain not in its normalized form).
 fn parse_exception(entry: &str) -> Result<HostPort, String> {
+    host_port_entry(entry).ok_or_else(|| format!("exceptions: {entry} is not host:port"))
+}
+
+/// A `host:port` entry whose host is an IP address or a domain, lower-cased.
+fn host_port_entry(entry: &str) -> Option<HostPort> {
     HostPort::parse(entry)
         .filter(|hp| hp.host.parse::<IpAddr>().is_ok() || valid_domain(&hp.host))
         .map(|hp| HostPort {
             host: hp.host.to_ascii_lowercase(),
             ..hp
         })
-        .ok_or_else(|| format!("exceptions: {entry} is not host:port"))
 }
 
 fn check_allow_entry(entry: &str) -> Result<(), String> {
@@ -569,7 +607,7 @@ mod tests {
             ),
             (
                 "version: 1\nnetworks:\n  workers: 3\n",
-                "config /c.yaml: network workers: want a mapping with keys mode, deny_ranges, allow, exceptions, health",
+                "config /c.yaml: network workers: want a mapping with keys mode, deny_ranges, allow, exceptions, health, verify",
             ),
             (
                 "version: 1\nnetworks:\n  workers: {mode: denylist, exceptions: \"a.b:1\"}\n",
@@ -708,7 +746,7 @@ mod tests {
     fn example_blocks_are_valid() {
         let text = std::fs::read_to_string(EXAMPLE).unwrap();
         let (text, blocks) = uncomment_examples(&text);
-        assert_eq!(blocks, 4, "example blocks in config.example.yaml");
+        assert_eq!(blocks, 5, "example blocks in config.example.yaml");
         let config = parse(Path::new(EXAMPLE), &text).unwrap_or_else(|e| panic!("{e}\n{text}"));
         let workers = &config.networks["workers"];
         assert_eq!(workers.deny_ranges.len(), 2);
@@ -718,6 +756,14 @@ mod tests {
         );
         assert_eq!(workers.health.allow_probe.to_string(), "example.com:443");
         assert_eq!(workers.health.deny_probe.to_string(), "169.254.169.254:80");
+        // Documentation addresses only (TEST-NET-2, 2001:db8::/32).
+        assert_eq!(
+            workers.verify_deny_targets,
+            [
+                HostPort::parse("198.51.100.20:22").unwrap(),
+                HostPort::parse("[2001:db8::20]:443").unwrap()
+            ]
+        );
         let mini_op = &config.networks["mini-op"];
         assert_eq!(mini_op.mode, Mode::Allowlist);
         assert_eq!(
@@ -806,6 +852,60 @@ mod tests {
             api.networks["api"].exceptions[0].to_string(),
             "192.0.2.10:22"
         );
+    }
+
+    #[test]
+    fn verify_deny_targets_parsed() {
+        let config = parse_ok(
+            "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    verify:\n      deny_targets: [\"198.51.100.7:22\", \"[2001:db8::7]:443\", \"NAS.Lan:5000\", \"198.51.100.7:22\"]\n  api:\n    mode: allowlist\n    allow: [example.com]\n    verify: {deny_targets: [\"192.0.2.20:80\"]}\n",
+        );
+        let got: Vec<String> = config.networks["workers"]
+            .verify_deny_targets
+            .iter()
+            .map(HostPort::to_string)
+            .collect();
+        assert_eq!(
+            got,
+            ["198.51.100.7:22", "[2001:db8::7]:443", "nas.lan:5000"]
+        );
+        assert_eq!(
+            config.networks["api"].verify_deny_targets,
+            [HostPort::parse("192.0.2.20:80").unwrap()]
+        );
+        assert!(
+            parse_ok(WORKERS).networks["workers"]
+                .verify_deny_targets
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn verify_errors() {
+        let cases = [
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, verify: {other: []}}\n",
+                "config /c.yaml: network workers: unknown key verify.other",
+            ),
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, verify: {deny_targets: [nope]}}\n",
+                "config /c.yaml: network workers: verify.deny_targets: nope is not host:port",
+            ),
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, verify: [\"a.b:1\"]}\n",
+                "config /c.yaml: network workers: verify: want a mapping with key deny_targets",
+            ),
+            (
+                "version: 1\nnetworks:\n  workers: {mode: denylist, verify: {deny_targets: \"a.b:1\"}}\n",
+                "config /c.yaml: network workers: verify.deny_targets: want a list",
+            ),
+        ];
+        for (text, want) in cases {
+            let got = parse_err(text);
+            assert!(
+                got.starts_with(want),
+                "config {text:?}: got {got:?}, want {want:?}"
+            );
+        }
     }
 
     #[test]

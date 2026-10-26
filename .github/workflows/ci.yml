@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - run: shellcheck tests/*.sh start.sh
+      - run: shellcheck tests/*.sh start.sh verify-egress
       - name: Check aggregate job dependencies
         run: |
           python3 -m pip install PyYAML==6.0.2
@@ -48,6 +48,7 @@ jobs:
           python3 -B .github/check_ci_needs.py
       - run: tests/check-repo.sh
       - run: tests/check-repo-selftest.sh
+      - run: tests/verify-egress-selftest.sh
       - name: Dockerfile build checks
         run: docker build --check .
       - name: actionlint

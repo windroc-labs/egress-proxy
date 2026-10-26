@@ -126,7 +126,7 @@ pub fn generate(
 
 /// The ranges `network` denies: the floor, `host.docker.internal`, the gateway's own
 /// addresses and the section's `deny_ranges`, sorted and deduplicated.
-fn deny_ranges(network: &Network, facts: &Facts) -> Vec<IpNet> {
+pub(crate) fn deny_ranges(network: &Network, facts: &Facts) -> Vec<IpNet> {
     let mut ranges: Vec<IpNet> = DENY_FLOOR
         .iter()
         .map(|r| r.parse().expect("valid floor range"))
@@ -141,7 +141,7 @@ fn deny_ranges(network: &Network, facts: &Facts) -> Vec<IpNet> {
 
 /// The canonical addresses of `exception`: its IP literal, or what its name resolved to at
 /// start (none when the name is not in the facts).
-fn exception_addrs(exception: &HostPort, facts: &Facts) -> Vec<IpAddr> {
+pub(crate) fn exception_addrs(exception: &HostPort, facts: &Facts) -> Vec<IpAddr> {
     match exception.ip() {
         Some(ip) => vec![ip],
         None => facts
@@ -192,6 +192,63 @@ pub fn write_all(run_dir: &Path, config: &Config, facts: &Facts) -> Result<(), S
         write().map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     Ok(())
+}
+
+/// What to do when the running policy is stale. Only the drift messages use it.
+const RESTART: &str = "restart the gateway (docker compose restart gateway)";
+
+/// How a network's running policy compares with the one the config now gives.
+#[derive(Debug)]
+pub enum Drift {
+    Matches,
+    Differs,
+    Unreadable(io::Error),
+}
+
+impl Drift {
+    /// The one wording of this outcome for network `key`, whose config is at `config`.
+    pub fn message(&self, key: &str, config: &Path) -> String {
+        let config = config.display();
+        match self {
+            Drift::Matches => format!("network {key}: running policy matches {config}"),
+            Drift::Differs => {
+                format!("network {key}: running policy differs from {config}; {RESTART}")
+            }
+            Drift::Unreadable(e) => format!("network {key}: cannot read the running policy: {e}"),
+        }
+    }
+}
+
+/// Compares each configured network's running policy with the one `config` now gives,
+/// in network-key order. `Err` when the configured networks differ from the running ones.
+/// Shared by `gateway health` and `gateway plan`.
+pub fn drift(
+    config: &Config,
+    facts: &Facts,
+    run_dir: &Path,
+) -> Result<Vec<(String, Drift)>, String> {
+    let configured: Vec<&str> = config.networks.keys().map(String::as_str).collect();
+    let running: Vec<&str> = facts.networks.keys().map(String::as_str).collect();
+    if configured != running {
+        return Err(format!(
+            "networks [{}] differ from the running networks [{}]; {RESTART}",
+            configured.join(", "),
+            running.join(", ")
+        ));
+    }
+    Ok(config
+        .networks
+        .iter()
+        .map(|(key, network)| {
+            let want = generate(key, network, facts.networks[key], facts, run_dir);
+            let outcome = match read_running(run_dir, key) {
+                Ok(running) if running == want => Drift::Matches,
+                Ok(_) => Drift::Differs,
+                Err(e) => Drift::Unreadable(e),
+            };
+            (key.clone(), outcome)
+        })
+        .collect())
 }
 
 /// Reads the running policy of network `key`.
@@ -504,5 +561,74 @@ mod tests {
         f.networks.remove("api");
         let err = write_all(dir.path(), &config(TWO), &f).unwrap_err();
         assert_eq!(err, "network api: no listen address");
+    }
+
+    #[test]
+    fn verify_targets_do_not_change_policy() {
+        let with = config(
+            "version: 1\nnetworks:\n  workers:\n    mode: denylist\n    deny_ranges: [203.0.113.7/32, 10.0.0.0/8]\n    verify: {deny_targets: [\"198.51.100.20:22\"]}\n  api:\n    mode: allowlist\n    allow: [example.com, \"*.example.org\", example.com]\n",
+        );
+        let without = config(TWO);
+        for key in ["workers", "api"] {
+            let ip = facts().networks[key];
+            let run = Path::new("/run/egress");
+            assert_eq!(
+                generate(key, &with.networks[key], ip, &facts(), run),
+                generate(key, &without.networks[key], ip, &facts(), run)
+            );
+        }
+    }
+
+    #[test]
+    fn drift_per_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        write_all(&run, &config(TWO), &facts()).unwrap();
+        let outcomes = drift(&config(TWO), &facts(), &run).unwrap();
+        assert!(
+            outcomes.iter().all(|(_, d)| matches!(d, Drift::Matches)),
+            "{outcomes:?}"
+        );
+        let edited = config(
+            "version: 1\nnetworks:\n  workers:\n    mode: denylist\n  api:\n    mode: allowlist\n    allow: [example.com, \"*.example.org\", example.com]\n",
+        );
+        let outcomes = drift(&edited, &facts(), &run).unwrap();
+        let keys: Vec<&str> = outcomes.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["api", "workers"]);
+        assert!(matches!(outcomes[0].1, Drift::Matches));
+        assert!(matches!(outcomes[1].1, Drift::Differs));
+        fs::remove_file(network_dir(&run, "api").join("acl.yaml")).unwrap();
+        let outcomes = drift(&edited, &facts(), &run).unwrap();
+        assert!(matches!(outcomes[0].1, Drift::Unreadable(_)));
+    }
+
+    #[test]
+    fn drift_needs_the_same_networks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = facts();
+        f.networks.remove("api");
+        let err = drift(&config(TWO), &f, dir.path()).unwrap_err();
+        assert_eq!(
+            err,
+            "networks [api, workers] differ from the running networks [workers]; restart the gateway (docker compose restart gateway)"
+        );
+    }
+
+    #[test]
+    fn drift_messages() {
+        let config = Path::new("/etc/egress/config.local.yaml");
+        assert_eq!(
+            Drift::Matches.message("workers", config),
+            "network workers: running policy matches /etc/egress/config.local.yaml"
+        );
+        assert_eq!(
+            Drift::Differs.message("workers", config),
+            "network workers: running policy differs from /etc/egress/config.local.yaml; restart the gateway (docker compose restart gateway)"
+        );
+        let missing = io::Error::new(io::ErrorKind::NotFound, "gone");
+        assert_eq!(
+            Drift::Unreadable(missing).message("mini-op", config),
+            "network mini-op: cannot read the running policy: gone"
+        );
     }
 }

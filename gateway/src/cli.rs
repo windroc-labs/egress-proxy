@@ -1,13 +1,17 @@
 //! Command line of the image's entrypoint. Not a management command: the image runs
-//! `gateway run`, its `HEALTHCHECK` runs `gateway health`, and only start.sh runs
-//! `gateway compose`, in a throwaway container with `--network none`.
+//! `gateway run`, its `HEALTHCHECK` runs `gateway health`, only start.sh runs
+//! `gateway compose`, in a throwaway container with `--network none`, and only
+//! verify-egress runs `gateway plan`, read-only, with `docker exec` in the gateway.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use crate::facts::Resolver;
+use ipnet::IpNet;
 
-pub const USAGE: &str = "usage: gateway [run|health|compose] [--config <path>] [--run-dir <dir>] [--smokescreen <path>] [--port <n>] [--resolve <host>=<ip>[,<ip>...]]...";
+use crate::facts::Resolver;
+use crate::plan::HostFacts;
+
+pub const USAGE: &str = "usage: gateway [run|health|compose] [--config <path>] [--run-dir <dir>] [--smokescreen <path>] [--port <n>] [--resolve <host>=<ip>[,<ip>...]]...\n       gateway plan <key> --listener-port <n> [--host-addr <ip>/<len>]... [--default-gateway <ip>]... [--config <path>] [--run-dir <dir>]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -15,6 +19,8 @@ pub enum Mode {
     Health,
     /// Print the compose override for the config's caller networks.
     Compose,
+    /// Print verify-egress's checks for one caller network.
+    Plan,
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +35,9 @@ pub struct Opts {
     /// The advertised caller networks, unparsed: the `EGRESS_NETWORKS` environment
     /// variable, which compose.yaml sets next to the labels.
     pub advertised: Option<String>,
+    /// `plan` only: the caller network to plan for, and the host's facts.
+    pub plan_key: Option<String>,
+    pub host: HostFacts,
 }
 
 impl Default for Opts {
@@ -41,6 +50,8 @@ impl Default for Opts {
             port: 4750,
             resolver: Resolver::default(),
             advertised: None,
+            plan_key: None,
+            host: HostFacts::default(),
         }
     }
 }
@@ -67,8 +78,18 @@ pub fn parse_args<I: IntoIterator<Item = String>>(
             opts.mode = Mode::Compose;
             args.next();
         }
+        Some("plan") => {
+            opts.mode = Mode::Plan;
+            args.next();
+            match args.next_if(|a| !a.starts_with('-')) {
+                Some(key) => opts.plan_key = Some(key),
+                None => return Err("plan needs a network key".into()),
+            }
+        }
         _ => {}
     }
+    let plan = opts.mode == Mode::Plan;
+    let mut listener_port = None;
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
@@ -96,8 +117,34 @@ pub fn parse_args<I: IntoIterator<Item = String>>(
                     .map_err(|_| format!("--resolve: bad address in {v}"))?;
                 opts.resolver.overrides.insert(host.to_string(), ips);
             }
+            "--host-addr" if plan => {
+                let v = value()?;
+                let net = v
+                    .parse::<IpNet>()
+                    .map_err(|_| format!("--host-addr: want ip/len, got {v}"))?;
+                opts.host.addrs.push(net);
+            }
+            "--default-gateway" if plan => {
+                let v = value()?;
+                let ip = v
+                    .parse::<IpAddr>()
+                    .map_err(|_| format!("--default-gateway: {v} is not an address"))?;
+                opts.host.gateways.push(ip);
+            }
+            "--listener-port" if plan => {
+                let v = value()?;
+                listener_port = Some(
+                    v.parse::<u16>()
+                        .ok()
+                        .filter(|p| *p != 0)
+                        .ok_or_else(|| format!("--listener-port: {v} is not a port"))?,
+                );
+            }
             other => return Err(format!("unknown option {other}")),
         }
+    }
+    if plan {
+        opts.host.listener_port = listener_port.ok_or("plan needs --listener-port")?;
     }
     Ok(opts)
 }
@@ -165,6 +212,77 @@ mod tests {
                 .starts_with("--resolve: bad")
         );
         assert_eq!(parse(&["status"]).unwrap_err(), "unknown option status");
+    }
+
+    #[test]
+    fn plan_mode() {
+        let opts = parse(&[
+            "plan",
+            "mini-op",
+            "--host-addr",
+            "192.168.1.20/24",
+            "--host-addr",
+            "2001:db8::20/64",
+            "--default-gateway",
+            "192.168.1.1",
+            "--listener-port",
+            "50123",
+        ])
+        .unwrap();
+        assert_eq!(opts.mode, Mode::Plan);
+        assert_eq!(opts.plan_key.as_deref(), Some("mini-op"));
+        assert_eq!(opts.host.addrs.len(), 2);
+        assert_eq!(
+            opts.host.gateways,
+            ["192.168.1.1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(opts.host.listener_port, 50123);
+    }
+
+    #[test]
+    fn plan_errors() {
+        assert_eq!(parse(&["plan"]).unwrap_err(), "plan needs a network key");
+        assert_eq!(
+            parse(&["plan", "--listener-port", "1"]).unwrap_err(),
+            "plan needs a network key"
+        );
+        assert_eq!(
+            parse(&["plan", "workers"]).unwrap_err(),
+            "plan needs --listener-port"
+        );
+        assert_eq!(
+            parse(&[
+                "plan",
+                "workers",
+                "--listener-port",
+                "1",
+                "--host-addr",
+                "x"
+            ])
+            .unwrap_err(),
+            "--host-addr: want ip/len, got x"
+        );
+        assert_eq!(
+            parse(&[
+                "plan",
+                "workers",
+                "--listener-port",
+                "1",
+                "--default-gateway",
+                "x"
+            ])
+            .unwrap_err(),
+            "--default-gateway: x is not an address"
+        );
+        for mode in ["run", "health", "compose"] {
+            for opt in ["--host-addr", "--default-gateway", "--listener-port"] {
+                assert_eq!(
+                    parse(&[mode, opt, "1"]).unwrap_err(),
+                    format!("unknown option {opt}"),
+                    "{mode}"
+                );
+            }
+        }
     }
 
     #[test]

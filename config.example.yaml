@@ -50,6 +50,16 @@ networks:
     #   deny_probe: 169.254.169.254:80
     # end example
 
+    # Optional. Extra targets `verify-egress workers` expects the proxy to deny, e.g. LAN
+    # hosts that matter to you or the Mac's public IPv4 address, which verify-egress cannot
+    # discover (README.md, Verify). Only verify-egress reads them; they change no policy.
+    # example: verify
+    # verify:
+    #   deny_targets:
+    #     - 198.51.100.20:22
+    #     - "[2001:db8::20]:443"
+    # end example
+
   # mini-op's network: Claude Code's API and claude.ai login, and the mini's ssh port.
   # Replace 192.0.2.10 with the mini's LAN address in your local copy: in allowlist mode an
   # exception must be an address a deny rule covers, so the placeholder itself is refused.
