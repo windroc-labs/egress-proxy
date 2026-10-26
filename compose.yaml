@@ -39,6 +39,8 @@ services:
 
 networks:
   # The proxy's own way out. IPv4 only: the deny floor has no global IPv6 LAN prefix.
+  # start.sh creates it, like the caller networks; external, so compose never checks
+  # which project created it.
   uplink:
     name: egress-uplink
-    enable_ipv6: false
+    external: true

@@ -9,9 +9,10 @@
 # to the config, outside the checkout, so another egress version renders the same networks.
 #
 # Exit codes: 0 started; 2 no config or a config error (the error names the network and
-# key); any other: the failing docker command's. On a config error the override and the
-# running proxy are left as they were; an upgrade removes the old project's container
-# before `up`, so a failing `up` leaves no proxy running.
+# key); 1 an existing network with the wrong internal setting; any other: the failing
+# docker command's. On a config or network error the override and the running proxy are
+# left as they were; an upgrade removes the old project's container before `up`, so a
+# failing `up` leaves no proxy running.
 set -euo pipefail
 
 repo=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
@@ -39,6 +40,30 @@ trap 'rm -f "$tmp"' EXIT
 docker run --rm --pull never --network none --read-only --cap-drop ALL \
   --security-opt no-new-privileges:true -v "$config_dir:/etc/egress:ro" \
   "$image" compose >"$tmp" || exit $?
+
+# The networks are external to compose (compose.yaml, the override), so compose never
+# checks which project created them: an install from before the rename keeps its
+# networks and the callers on them, with no warning. Create the missing ones.
+# ensure_network <name> <internal: true|false>: an existing one must match.
+ensure_network() {
+  local name=$1 internal=$2 got
+  if got=$(docker network inspect --format '{{.Internal}}' "$name" 2>/dev/null); then
+    if [[ $got != "$internal" ]]; then
+      echo "start.sh: network $name exists with internal $got, want $internal; remove it (docker network rm $name)" >&2
+      exit 1
+    fi
+  elif [[ $internal == true ]]; then
+    docker network create --internal "$name" >/dev/null
+  else
+    docker network create --ipv6=false "$name" >/dev/null
+  fi
+}
+networks=$(sed -n 's/^    name: "\(egress-[^"]*\)"$/\1/p' "$tmp")
+for net in $networks; do
+  ensure_network "$net" true
+done
+ensure_network egress-uplink false
+
 mv "$tmp" "$override"
 
 # An install from before the rename to proxy runs as compose project egress, which this

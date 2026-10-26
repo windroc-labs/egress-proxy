@@ -60,7 +60,8 @@ cleanup() {
   docker rm -f "$LONG" "$LEGACY_PROXY" "${LISTENERS[@]}" >/dev/null 2>&1 || true
   ((${#host_listeners[@]} == 0)) || kill "${host_listeners[@]}" 2>/dev/null || true
   compose down --remove-orphans >/dev/null 2>&1 || true
-  docker network rm egress-mini-op egress-testnet "$LEGACY_NET" >/dev/null 2>&1 || true
+  # The networks are external to compose, so down leaves them.
+  docker network rm egress-workers egress-mini-op egress-testnet egress-badnet egress-uplink "$LEGACY_NET" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -165,6 +166,19 @@ no_dns() {
 
 # The documented start command (README.md).
 start() { "$repo/start.sh"; }
+
+# start_no_project_warning <check>: start.sh succeeds, and compose does not warn that a
+# network was created by another project.
+start_no_project_warning() {
+  local out rc=0
+  out=$(start 2>&1) || rc=$?
+  printf '%s\n' "$out"
+  ((rc == 0)) || fail "$1" "start.sh exited $rc"
+  if grep -q 'was not created for project' <<<"$out"; then
+    fail "$1" "compose warned: $(grep 'was not created for project' <<<"$out")"
+  fi
+  ok "$1"
+}
 
 # -------- Stage A: compose.yaml, workers only --------
 use_config workers.yaml
@@ -588,25 +602,30 @@ expect_networks remove_network testnet workers
 
 # -------- Stage D: upgrade an install from before the rename to proxy --------
 # The old install: compose project egress, service gateway, container egress-gateway,
-# with the caller networks created by that project. This compose.yaml and override with
-# the old names stand in for the old checkout; only the compose names matter to the
-# upgrade, so the image is this one.
+# with the caller networks and egress-uplink created by that project (not external).
+# This compose.yaml and override with the old names stand in for the old checkout; only
+# the compose names matter to the upgrade, so the image is this one.
 old=$work/old OLD_PROJECT=egress OLD_SERVICE=gateway OLD_PX=egress-gateway
 mkdir -p "$old"
 sed -e "s/^name: egress-proxy\$/name: $OLD_PROJECT/" -e "s/^  proxy:\$/  $OLD_SERVICE:/" \
-  -e "s/^    container_name: $PX\$/    container_name: $OLD_PX/" "$repo/compose.yaml" >"$old/compose.yaml"
-sed "s/^  proxy:\$/  $OLD_SERVICE:/" "$EGRESS_CONFIG_DIR/compose.networks.yaml" >"$old/compose.networks.yaml"
+  -e "s/^    container_name: $PX\$/    container_name: $OLD_PX/" -e "s/^    external: true\$/    enable_ipv6: false/" \
+  "$repo/compose.yaml" >"$old/compose.yaml"
+sed -e "s/^  proxy:\$/  $OLD_SERVICE:/" -e "s/^    external: true\$/    internal: true/" \
+  "$EGRESS_CONFIG_DIR/compose.networks.yaml" >"$old/compose.networks.yaml"
 if ! grep -q "^name: $OLD_PROJECT\$" "$old/compose.yaml" || ! grep -q "container_name: $OLD_PX\$" "$old/compose.yaml" ||
-  ! grep -q "^  $OLD_SERVICE:\$" "$old/compose.networks.yaml"; then
+  ! grep -q "^  $OLD_SERVICE:\$" "$old/compose.networks.yaml" || grep -q external "$old/compose.yaml" "$old/compose.networks.yaml"; then
   fail upgrade_replaces_old "cannot write the old compose files"
 fi
-# Down removes this project's container and networks, so the old project creates them.
+# Down leaves the external networks: remove them, so the old project creates them.
 compose down
+docker network rm egress-uplink egress-testnet egress-workers >/dev/null
 docker compose --project-directory "$repo" -f "$old/compose.yaml" -f "$old/compose.networks.yaml" up -d
 PX=$OLD_PX wait_health healthy || fail upgrade_replaces_old "the old $OLD_PX did not become healthy"
 upgrade_nets() { docker network inspect --format '{{.Id}}' egress-uplink egress-testnet egress-workers; }
 nets_before=$(upgrade_nets)
-start
+[[ $(docker network inspect --format '{{index .Labels "com.docker.compose.project"}}' egress-workers) == "$OLD_PROJECT" ]] ||
+  fail upgrade_replaces_old "egress-workers was not created by compose project $OLD_PROJECT"
+start_no_project_warning upgrade_no_project_warning
 [[ -z $(docker ps -aq --filter "name=^$OLD_PX\$") ]] || fail upgrade_replaces_old "$OLD_PX still exists"
 [[ -z $(docker ps -aq --filter "label=com.docker.compose.project=$OLD_PROJECT") ]] ||
   fail upgrade_replaces_old "a container of compose project $OLD_PROJECT is left"
@@ -621,5 +640,20 @@ expect_networks upgrade_replaces_old testnet workers
 ok upgrade_keeps_networks
 allowed upgrade_serves egress-workers "$PROXY" https://www.wikipedia.org/
 allowed upgrade_serves egress-testnet http://egress-proxy-testnet:4750 https://example.com/
+start_no_project_warning rerun_no_project_warning
+
+# An existing egress-<key> that is not internal stops start.sh before anything changes.
+cp "$EGRESS_CONFIG_DIR/config.local.yaml" "$work/config.saved"
+printf '  badnet:\n    mode: denylist\n' >>"$EGRESS_CONFIG_DIR/config.local.yaml"
+docker network create egress-badnet >/dev/null
+before=$(inspect '{{.Id}} {{.State.StartedAt}}')
+rc=0
+out=$(start 2>&1) || rc=$?
+[[ $rc == 1 && $out == *"network egress-badnet exists with internal false, want true"* ]] ||
+  fail network_not_internal "start.sh exited $rc: $out"
+[[ $(inspect '{{.Id}} {{.State.StartedAt}}') == "$before" ]] || fail network_not_internal "the proxy changed"
+ok network_not_internal
+docker network rm egress-badnet >/dev/null
+cp "$work/config.saved" "$EGRESS_CONFIG_DIR/config.local.yaml"
 
 echo "all checks passed"
