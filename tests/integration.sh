@@ -613,7 +613,7 @@ sed -e "s/^name: egress-proxy\$/name: $OLD_PROJECT/" -e "s/^  proxy:\$/  $OLD_SE
 sed -e "s/^  proxy:\$/  $OLD_SERVICE:/" -e "s/^    external: true\$/    internal: true/" \
   "$EGRESS_CONFIG_DIR/compose.networks.yaml" >"$old/compose.networks.yaml"
 if ! grep -q "^name: $OLD_PROJECT\$" "$old/compose.yaml" || ! grep -q "container_name: $OLD_PX\$" "$old/compose.yaml" ||
-  ! grep -q "^  $OLD_SERVICE:\$" "$old/compose.networks.yaml" || grep -q external "$old/compose.yaml" "$old/compose.networks.yaml"; then
+  ! grep -q "^  $OLD_SERVICE:\$" "$old/compose.networks.yaml" || grep -qx '    external: true' "$old/compose.yaml" "$old/compose.networks.yaml"; then
   fail upgrade_replaces_old "cannot write the old compose files"
 fi
 # Down leaves the external networks: remove them, so the old project creates them.
