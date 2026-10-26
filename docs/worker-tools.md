@@ -24,43 +24,50 @@ and replace the rows below with the rows it prints. Each row is one tool or one 
   `fails: exit <n>` or `fails: timed out` (the gateway allowed the request but the tool
   failed), `not in image`, or `could not run: <reason>`. Results come from exit codes
   and the gateway's log only, never from a tool's output.
-- **Image ID**: the image's ID as `docker image inspect --format '{{.Id}}'` reports it
-  (`sha256:…`), so a row names exactly the image it was tested in.
+- **Image**: `--tools` prints the image's full ID, as `docker image inspect --format
+  '{{.Id}}'` reports it (`sha256:…`). The 2026-10-25 rows below came from a run of
+  475817aa, before that change, and carry the worker version it printed (0.2.0) and the
+  short ID from `docker image ls`; the next fill replaces them, and this note, with what
+  `--tools` prints.
 - The command's last lines name the rows that differ from the expected result and the
   rows that could not run.
 
 ## Results
 
-| Tool | Expected | Result | Image ID | Date |
+Tested on the test Mac mini through mini-op on 2026-10-25: no row differed from the
+expected result, and one row could not run (QUIC / HTTP/3: the image's curl has no
+HTTP/3).
+
+| Tool | Expected | Result | Image | Date |
 | --- | --- | --- | --- | --- |
-| ssh | fails | not yet tested | not yet tested | not yet tested |
-| git over ssh | fails | not yet tested | not yet tested | not yet tested |
-| scp | fails | not yet tested | not yet tested | not yet tested |
-| rsync over ssh | fails | not yet tested | not yet tested | not yet tested |
-| git:// | fails | not yet tested | not yet tested | not yet tested |
-| ping | fails | not yet tested | not yet tested | not yet tested |
-| traceroute | fails | not yet tested | not yet tested | not yet tested |
-| dig | fails | not yet tested | not yet tested | not yet tested |
-| nslookup | fails | not yet tested | not yet tested | not yet tested |
-| host | fails | not yet tested | not yet tested | not yet tested |
-| self-resolving program | fails | not yet tested | not yet tested | not yet tested |
-| nc | fails | not yet tested | not yet tested | not yet tested |
-| telnet | fails | not yet tested | not yet tested | not yet tested |
-| psql | fails | not yet tested | not yet tested | not yet tested |
-| redis-cli | fails | not yet tested | not yet tested | not yet tested |
-| raw TCP (python3) | fails | not yet tested | not yet tested | not yet tested |
-| raw UDP (python3) | fails | not yet tested | not yet tested | not yet tested |
-| QUIC / HTTP/3 | fails | not yet tested | not yet tested | not yet tested |
-| Node fetch | fails | not yet tested | not yet tested | not yet tested |
-| Node fetch, NODE_USE_ENV_PROXY=1 | works | not yet tested | not yet tested | not yet tested |
-| Node http | fails | not yet tested | not yet tested | not yet tested |
-| Bun fetch | unknown | not yet tested | not yet tested | not yet tested |
-| MCP server (Node child process) | unknown | not yet tested | not yet tested | not yet tested |
-| curl | works | not yet tested | not yet tested | not yet tested |
-| wget | works | not yet tested | not yet tested | not yet tested |
-| pip | works | not yet tested | not yet tested | not yet tested |
-| uv | works | not yet tested | not yet tested | not yet tested |
-| npm | works | not yet tested | not yet tested | not yet tested |
-| apt-get | works | not yet tested | not yet tested | not yet tested |
-| gh | works | not yet tested | not yet tested | not yet tested |
-| Claude Code | works | not yet tested | not yet tested | not yet tested |
+| ssh | fails | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| git over ssh | fails | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| scp | fails | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| rsync over ssh | fails | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| git:// | fails | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| ping | fails | not in image | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| traceroute | fails | not in image | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| dig | fails | not in image | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| nslookup | fails | not in image | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| host | fails | not in image | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| self-resolving program | fails | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| nc | fails | not in image | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| telnet | fails | not in image | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| psql | fails | not in image | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| redis-cli | fails | not in image | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| raw TCP (python3) | fails | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| raw UDP (python3) | fails | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| QUIC / HTTP/3 | fails | could not run: no HTTP/3 in curl | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| Node fetch | fails | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| Node fetch, NODE_USE_ENV_PROXY=1 | works | works | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| Node http | fails | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| Bun fetch | unknown | works | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| MCP server (Node child process) | unknown | fails: no proxy used | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| curl | works | works | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| wget | works | works | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| pip | works | works | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| uv | works | works | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| npm | works | works | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| apt-get | works | works | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| gh | works | works | 0.2.0, ID b776445a4c5d | 2026-10-25 |
+| Claude Code | works | works | 0.2.0, ID b776445a4c5d | 2026-10-25 |
