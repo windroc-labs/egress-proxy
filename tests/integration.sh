@@ -188,6 +188,12 @@ wait_health healthy || fail healthy "the proxy did not become healthy"
   fail healthy "docker ps does not show (healthy)"
 ok healthy
 
+# The built image is egress-proxy, not compose's default <project>-<service>.
+[[ $(compose config --images) == egress-proxy ]] || fail image_named "compose names the image $(compose config --images)"
+[[ $(inspect '{{.Config.Image}}') == egress-proxy ]] || fail image_named "$PX runs image $(inspect '{{.Config.Image}}')"
+! docker image inspect egress-proxy-proxy >/dev/null 2>&1 || fail image_named "an egress-proxy-proxy image exists"
+ok image_named
+
 # AC10: label contract v1.
 want_labels=$'windroc.egress.contract=1\nwindroc.egress.network.workers.name=egress-workers\nwindroc.egress.network.workers.proxy=http://egress-proxy-workers:4750\nwindroc.egress.networks=workers'
 got_labels=$(inspect '{{range $k, $v := .Config.Labels}}{{println $k "=" $v}}{{end}}' | sed 's/ = /=/' | grep '^windroc\.egress\.' | sort)

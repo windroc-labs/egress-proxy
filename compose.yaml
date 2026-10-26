@@ -7,6 +7,8 @@ name: egress-proxy
 services:
   proxy:
     build: .
+    # The built image's tag; without it compose names it <project>-<service>.
+    image: egress-proxy
     container_name: egress-proxy
     restart: unless-stopped
     # Longer than the entrypoint's own 10 s grace for its smokescreens, so a stop exits 0.

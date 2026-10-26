@@ -22,7 +22,7 @@ its config at start, `start.sh` is the start command, and `verify-egress` only c
    `mkdir -p ~/.egress && cp config.example.yaml ~/.egress/config.local.yaml`
 2. From this checkout: `./start.sh`
 
-`start.sh` builds the image, renders `~/.egress/compose.networks.yaml` (one caller network
+`start.sh` builds the image `egress-proxy`, renders `~/.egress/compose.networks.yaml` (one caller network
 per config section: the attachments, `EGRESS_NETWORKS` and the labels) with the image,
 creates the networks that do not exist yet (each `egress-<key>` internal, and
 `egress-uplink`; compose uses them as external), and runs `docker compose up -d` with it.
@@ -39,6 +39,9 @@ compose project `egress-proxy` on the same networks, with the same labels and al
 callers attached to the networks stay attached. Then remove by hand the old image,
 `docker image rm egress-gateway`, and in a checkout where you built the entrypoint,
 `rm -rf gateway` (its ignored build output).
+
+Earlier versions named the image `egress-proxy-proxy`; after `./start.sh` remove it by hand:
+`docker image rm egress-proxy-proxy`.
 
 ## Commands
 
