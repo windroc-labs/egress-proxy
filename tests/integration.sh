@@ -656,4 +656,22 @@ ok network_not_internal
 docker network rm egress-badnet >/dev/null
 cp "$work/config.saved" "$EGRESS_CONFIG_DIR/config.local.yaml"
 
+# An existing egress-uplink with IPv6 stops start.sh before anything starts: the uplink is
+# IPv4 only. Without it, start.sh creates egress-uplink IPv4 only.
+compose down
+docker network rm egress-uplink >/dev/null
+docker network create --ipv6 --subnet fd5e:9d1c:7a3b::/64 egress-uplink >/dev/null
+rc=0
+out=$(start 2>&1) || rc=$?
+[[ $rc == 1 && $out == *"network egress-uplink exists with internal and IPv6 false true, want false false"* ]] ||
+  fail uplink_not_ipv4_only "start.sh exited $rc: $out"
+[[ -z $(docker ps -aq --filter "name=^$PX\$") ]] || fail uplink_not_ipv4_only "$PX was started"
+ok uplink_not_ipv4_only
+docker network rm egress-uplink >/dev/null
+start
+[[ $(docker network inspect --format '{{.Internal}} {{.EnableIPv6}}' egress-uplink) == "false false" ]] ||
+  fail uplink_created_ipv4_only "egress-uplink: $(docker network inspect --format '{{.Internal}} {{.EnableIPv6}}' egress-uplink)"
+wait_health healthy || fail uplink_created_ipv4_only "not healthy on the new egress-uplink"
+ok uplink_created_ipv4_only
+
 echo "all checks passed"
