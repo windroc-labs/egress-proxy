@@ -195,7 +195,7 @@ pub fn write_all(run_dir: &Path, config: &Config, facts: &Facts) -> Result<(), S
 }
 
 /// What to do when the running policy is stale. Only the drift messages use it.
-const RESTART: &str = "restart the proxy (docker compose restart proxy)";
+const RESTART: &str = "run ./start.sh";
 
 /// How a network's running policy compares with the one the config now gives.
 #[derive(Debug)]
@@ -610,7 +610,7 @@ mod tests {
         let err = drift(&config(TWO), &f, dir.path()).unwrap_err();
         assert_eq!(
             err,
-            "networks [api, workers] differ from the running networks [workers]; restart the proxy (docker compose restart proxy)"
+            "networks [api, workers] differ from the running networks [workers]; run ./start.sh"
         );
     }
 
@@ -623,7 +623,7 @@ mod tests {
         );
         assert_eq!(
             Drift::Differs.message("workers", config),
-            "network workers: running policy differs from /etc/egress/config.local.yaml; restart the proxy (docker compose restart proxy)"
+            "network workers: running policy differs from /etc/egress/config.local.yaml; run ./start.sh"
         );
         let missing = io::Error::new(io::ErrorKind::NotFound, "gone");
         assert_eq!(

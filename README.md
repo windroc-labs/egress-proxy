@@ -40,20 +40,20 @@ egress-gateway`, and in a checkout where you built the entrypoint, `rm -rf gatew
 
 | Task | Command |
 | --- | --- |
-| Start, upgrade, add or remove a caller network (idempotent) | `./start.sh` |
-| Apply a policy change within existing sections | `docker compose restart proxy` |
+| Start, upgrade, or apply a config change (idempotent) | `./start.sh` |
 | Health | `docker ps --filter name=egress-proxy` (status column), `docker inspect --format '{{json .State.Health}}' egress-proxy` |
 | Logs (config errors name the network and key) | `docker logs egress-proxy` |
 | Stop | `docker compose stop` |
 | Check a caller network's allows and denies ([Verify](#verify)) | `./verify-egress <network>` |
 | Check how a worker image's tools behave behind the proxy | `./verify-egress --tools <image>` |
 
-A config change takes effect only on restart (or `./start.sh` for an added or removed
-section); until then the proxy reports `unhealthy`, and a restart with sections that
-differ from the attached networks exits 2 with `run ./start.sh`.
+A config change takes effect when `./start.sh` runs: it restarts the proxy when the
+running policy differs from the config, and otherwise leaves it running. Until then the
+proxy reports `unhealthy`, and a restart with sections that differ from the attached
+networks exits 2 with `run ./start.sh`.
 A restart drops every in-flight connection on every caller network; callers keep their
 proxy settings and need no restart. After the Mac joins another network (e.g. a new
-Wi-Fi), restart the proxy.
+Wi-Fi), restart the proxy: `docker compose restart proxy`.
 
 ## Policy
 
@@ -77,7 +77,8 @@ mini-op's `mini-op`, `mini-op-net` and `mini-op-proxy`. Removing a section detac
   their address, e.g. `host.docker.internal:11434` for Ollama on `workers`, or the mini's
   ssh port on `mini-op`. The proxy resolves each name at start and opens only that port
   of the addresses it had then (smokescreen `allow_addresses`), for every caller on that
-  network; after a name's address changes, restart the proxy. In allowlist mode the ACL,
+  network; after a name's address changes, restart the proxy (`docker compose restart
+  proxy`). In allowlist mode the ACL,
   which has no ports, lists those start-time addresses, not the name: callers connect to
   the address (a CONNECT by name is denied), and a later DNS answer opens nothing. There
   an exception must be an address a deny rule covers (e.g. a LAN address); list public
@@ -132,7 +133,7 @@ On macOS the first run raises "Allow Python to find devices on local networks?",
 | --- | --- | --- |
 | `proxy_found`, `proxy_contract`, `proxy_healthy`, `network_advertised`, `network_internal` | the label contract and Docker health | exactly one proxy, contract 1, healthy, `<network>` advertised, its Docker network internal |
 | `host_listener` | curl on the host to the listener | it answers |
-| `plan` | `proxy plan` | the proxy printed the checks; it refuses while the running policy differs from the config (restart the proxy) |
+| `plan` | `proxy plan` | the proxy printed the checks; it refuses while the running policy differs from the config (run `./start.sh`) |
 | `proxy_deny` | CONNECT through the network's proxy | 407: one address per deny-floor range, `169.254.169.254`, `[::ffff:127.0.0.1]`, `host.docker.internal` (by name and address), the proxy's own addresses, the host's addresses and one more address in each of their prefixes, its default gateways, the host listener, each `deny_ranges` range, each `verify.deny_targets` entry, `localtest.me` (a public name for 127.0.0.1), a public host (allowlist), and the other networks' exceptions (where this network's policy denies their addresses) and allows |
 | `proxy_allow` | an https request through the proxy | CONNECT 200 and an HTTP answer (any status): `example.com` (denylist) or each non-glob `allow` entry (allowlist) |
 | `exception_open`, `exception_other_port` | CONNECT through the proxy | each exception reaches its target (200), and the next port of that host is denied (407) where this network's policy denies that address. In allowlist mode a named exception is probed at the addresses the proxy resolved at start |

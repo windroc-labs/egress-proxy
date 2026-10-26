@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The egress proxy's start command: start, upgrade, or apply an added or removed caller
-# network. Idempotent: with the same checkout and config it changes nothing.
+# The egress proxy's start command: start, upgrade, or apply a config change (an added or
+# removed caller network, or a policy edit). Idempotent: with the same checkout and config
+# it changes nothing and restarts nothing.
 #
 # The config's sections are the only list of caller networks. Compose cannot read them, so
 # this renders a compose override from them with the proxy image itself (`proxy
@@ -42,3 +43,13 @@ mv "$tmp" "$override"
 # --remove-orphans: an install from before the rename to proxy runs compose service
 # gateway; its container is an orphan now and would keep serving the caller networks.
 "${base[@]}" -f "$override" up -d --remove-orphans
+
+# A policy edit within the sections changes no compose file, so compose keeps the running
+# container: restart it when its running policy differs from the config (`proxy drift`
+# exits 3). A container compose just created or started reads this config itself.
+rc=0
+"${base[@]}" -f "$override" exec -T proxy /proxy drift >/dev/null 2>&1 || rc=$?
+if ((rc == 3)); then
+  echo "start.sh: the running policy differs from the config; restarting the proxy" >&2
+  "${base[@]}" -f "$override" restart proxy
+fi

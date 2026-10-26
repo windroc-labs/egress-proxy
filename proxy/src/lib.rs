@@ -3,6 +3,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod drift;
 pub mod facts;
 pub mod files;
 pub mod health;

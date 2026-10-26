@@ -1,7 +1,5 @@
 # Example of ~/.egress/config.local.yaml, the egress proxy's local config. Copy it there
-# and edit it. After a change to a section's policy, restart the proxy:
-#   docker compose restart proxy
-# After adding or removing a section, run the start command instead: ./start.sh
+# and edit it. After any change, run the start command: ./start.sh
 # A missing key, an unknown key or a bad value stops the proxy at start; `docker logs
 # egress-proxy` names the network and the key. Keep LAN and other private addresses in
 # your local copy only, never in this repo.

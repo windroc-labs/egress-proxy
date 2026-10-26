@@ -102,7 +102,7 @@ fn drift_refused() {
     assert_eq!(
         text(&out.stderr),
         format!(
-            "proxy: network mini-op: running policy differs from {}; restart the proxy (docker compose restart proxy)\n",
+            "proxy: network mini-op: running policy differs from {}; run ./start.sh\n",
             state.config.display()
         )
     );

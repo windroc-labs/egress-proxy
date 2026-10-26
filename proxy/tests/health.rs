@@ -145,7 +145,7 @@ fn drift_names_network() {
     let (code, out) = check(&s);
     assert_eq!(code, Some(1), "{out}");
     let want = format!(
-        "FAIL network workers: running policy differs from {}; restart the proxy (docker compose restart proxy)",
+        "FAIL network workers: running policy differs from {}; run ./start.sh",
         s.config.display()
     );
     assert!(out.contains(&want), "{out}");
@@ -262,7 +262,7 @@ fn network_added_without_restart_fails() {
     let (code, out) = health(&s.config, &s.run_dir, "workers,api");
     assert_eq!(code, Some(1), "{out}");
     assert!(
-        out.contains("FAIL networks [api, workers] differ from the running networks [workers]; restart the proxy (docker compose restart proxy)"),
+        out.contains("FAIL networks [api, workers] differ from the running networks [workers]; run ./start.sh"),
         "{out}"
     );
 }

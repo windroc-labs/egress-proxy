@@ -293,8 +293,9 @@ sudo kill -9 "$smokescreen_pid"
 wait_restart "$started" || fail restarts_after_child_exit "not back to healthy"
 ok restarts_after_child_exit
 
-# AC6 + AC7: an edit without a restart turns health unhealthy; the restart applies it to a
-# caller that keeps running with the same proxy settings.
+# AC6 + AC7: an edit without a restart turns health unhealthy; the start command restarts
+# the proxy and applies it to a caller that keeps running with the same proxy settings, and
+# a second run with no change restarts nothing.
 docker run -d --name "$LONG" --network egress-workers --entrypoint sleep "$PROBE_IMAGE" 600 >/dev/null
 long_started=$(docker inspect --format '{{.State.StartedAt}}' "$LONG")
 long_connect() {
@@ -306,12 +307,18 @@ wait_health unhealthy || fail unhealthy_on_config_drift "still healthy after the
 inspect '{{range .State.Health.Log}}{{.Output}}{{end}}' | grep -q 'network workers: running policy differs from' ||
   fail unhealthy_on_config_drift "the health log does not name the network"
 ok unhealthy_on_config_drift
-compose restart proxy
-wait_health healthy || fail restart_applies_policy "not healthy after the restart"
-[[ $(long_connect) == 407 ]] || fail restart_applies_policy "1.1.1.1 is still allowed after the restart"
+started=$(inspect '{{.State.StartedAt}}')
+start
+[[ $(inspect '{{.State.StartedAt}}') != "$started" ]] || fail start_applies_policy "start.sh did not restart the proxy"
+wait_health healthy || fail start_applies_policy "not healthy after start.sh"
+[[ $(long_connect) == 407 ]] || fail start_applies_policy "1.1.1.1 is still allowed after start.sh"
 [[ $(docker inspect --format '{{.State.StartedAt}}' "$LONG") == "$long_started" ]] ||
-  fail restart_applies_policy "the caller container was restarted"
-ok restart_applies_policy
+  fail start_applies_policy "the caller container was restarted"
+ok start_applies_policy
+started=$(inspect '{{.State.StartedAt}}')
+start
+[[ $(inspect '{{.State.StartedAt}}') == "$started" ]] || fail start_unchanged_no_restart "start.sh restarted the proxy"
+ok start_unchanged_no_restart
 docker rm -f "$LONG" >/dev/null
 
 # AC8 + AC15: a config error stops the proxy at start and the log names it.
@@ -497,8 +504,8 @@ networks:
     verify:
       deny_targets: ["$lan_ip:22", "$lan_ip:2223"]
 EOF
-  compose restart proxy >/dev/null
-  wait_health healthy || fail verify_config "not healthy after the restart"
+  start
+  wait_health healthy || fail verify_config "not healthy after start.sh"
 }
 # verify <check> <want exit> <args...>: runs verify-egress, prints its output, and checks
 # its exit code; leaves the output in $verify_out.
@@ -537,7 +544,7 @@ for line in "| curl | works | works | $probe_id | $(date -u +%Y-%m-%d) |" \
 done
 ok verify_egress_tools
 two_networks_config
-compose restart proxy >/dev/null
+start
 wait_health healthy || fail verify_egress_tools "not healthy after restoring the fixture"
 
 # -------- Stage C: add and remove a network through the config alone --------

@@ -381,9 +381,9 @@ expect pre_rename_image "$out" 1 "FAIL plan egress-proxy: the proxy image has no
 
 scenario drift_message
 echo 2 >"$FAKE/plan.rc"
-echo "proxy: network workers: running policy differs from /etc/egress/config.local.yaml; restart the proxy (docker compose restart proxy)" >"$FAKE/plan.err"
+echo "proxy: network workers: running policy differs from /etc/egress/config.local.yaml; run ./start.sh" >"$FAKE/plan.err"
 out=$(run workers)
-expect drift_message "$out" 1 "FAIL plan egress-proxy: proxy: network workers: running policy differs from /etc/egress/config.local.yaml; restart the proxy (docker compose restart proxy), want a plan"
+expect drift_message "$out" 1 "FAIL plan egress-proxy: proxy: network workers: running policy differs from /etc/egress/config.local.yaml; run ./start.sh, want a plan"
 
 # malformed <case> <plan line> <reason>: the line fails `plan` before any probe runs.
 malformed() {
