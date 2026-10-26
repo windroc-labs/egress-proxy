@@ -47,9 +47,11 @@ mv "$tmp" "$override"
 # stay: compose reuses them by name.
 old=$(docker ps -aq --filter label=com.docker.compose.project=egress --filter label=windroc.egress.contract)
 if [[ -n $old ]]; then
-  mapfile -t old_ids <<<"$old"
   echo "start.sh: removing the proxy container of the old compose project egress" >&2
-  docker rm -f "${old_ids[@]}" >/dev/null
+  # A read loop, not mapfile: the Mac's bash is 3.2.
+  while read -r id; do
+    docker rm -f "$id" >/dev/null
+  done <<<"$old"
 fi
 
 # A policy edit within the sections changes no compose file, so compose keeps the running
