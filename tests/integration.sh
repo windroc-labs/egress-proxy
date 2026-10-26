@@ -613,6 +613,9 @@ start
 [[ $(inspect '{{index .Config.Labels "com.docker.compose.project"}}') == egress-proxy ]] ||
   fail upgrade_replaces_old "$PX is not in compose project egress-proxy"
 wait_health healthy || fail upgrade_replaces_old "$PX not healthy after the upgrade"
+# The old container is gone before the new one starts: two containers holding one alias
+# would make the new proxy resolve the old one's address and exit.
+[[ $(inspect '{{.RestartCount}}') == 0 ]] || fail upgrade_replaces_old "$PX restarted during the upgrade"
 expect_networks upgrade_replaces_old testnet workers
 [[ $(upgrade_nets) == "$nets_before" ]] || fail upgrade_keeps_networks "the caller networks were recreated"
 ok upgrade_keeps_networks

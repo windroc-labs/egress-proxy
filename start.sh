@@ -9,8 +9,9 @@
 # to the config, outside the checkout, so another egress version renders the same networks.
 #
 # Exit codes: 0 started; 2 no config or a config error (the error names the network and
-# key); any other: the failing docker command's. On failure the override and the running
-# proxy are left as they were.
+# key); any other: the failing docker command's. On a config error the override and the
+# running proxy are left as they were; an upgrade removes the old project's container
+# before `up`, so a failing `up` leaves no proxy running.
 set -euo pipefail
 
 repo=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
@@ -40,11 +41,10 @@ docker run --rm --pull never --network none --read-only --cap-drop ALL \
   "$image" compose >"$tmp" || exit $?
 mv "$tmp" "$override"
 
-"${base[@]}" -f "$override" up -d
-
 # An install from before the rename to proxy runs as compose project egress, which this
-# project does not manage: remove its container once this one is up. The caller networks
-# stay: compose reuses them by name.
+# project does not manage: remove its container before this one starts, since two
+# containers holding one alias would make the new one resolve the old one's address and
+# exit. The caller networks stay.
 old=$(docker ps -aq --filter label=com.docker.compose.project=egress --filter label=windroc.egress.contract)
 if [[ -n $old ]]; then
   echo "start.sh: removing the proxy container of the old compose project egress" >&2
@@ -53,6 +53,8 @@ if [[ -n $old ]]; then
     docker rm -f "$id" >/dev/null
   done <<<"$old"
 fi
+
+"${base[@]}" -f "$override" up -d
 
 # A policy edit within the sections changes no compose file, so compose keeps the running
 # container: restart it when its running policy differs from the config (`proxy drift`
