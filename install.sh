@@ -13,7 +13,11 @@
 # downgraded. A version that does not become healthy is rolled back (FR-9): the previous
 # version's own install entry, state/<its runtime set>/egress-install, reinstalls it.
 # After a successful install it removes the repo's images other than the current and the
-# previous one (FR-10). Layout of <dir>:
+# previous one (FR-10). A source-checkout install in <dir> (versions/<commit>/ and current,
+# the v0.5.0 layout callers' installers made before the image) is migrated (FR-11): the
+# config stays as it is; once this version is healthy, the checkouts and their locally
+# built images no container uses are removed; a version that is not healthy goes back to
+# the checkout's own start.sh. Layout of <dir>:
 #
 #   config.local.yaml          the user's config; written once, never replaced
 #   README.md, start.sh, verify-egress, config.example.yaml
