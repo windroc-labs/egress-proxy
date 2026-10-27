@@ -166,7 +166,7 @@ needs no network, GitHub login or registry to start or restart.
 | `config.example.yaml` | Every config option, with examples. |
 | `start.sh` | The start command: starts the proxy, or applies a change of `config.local.yaml`. |
 | `verify-egress` | Checks a caller network's allows and denies from a probe container on it. |
-| `effective-policy.txt` | The rules in effect per network, written by `start.sh` (in the versions that print them; absent before). |
+| `effective-policy.txt` | The rules in effect per network, rewritten by `start.sh` at every start. |
 | `README.md` | This file, rewritten at every install. |
 | `state/` | The active runtime set (`state/runtime`), the compose files, the rendered network file and the installed versions and digests (`state/installed`). Never edit it. |
 

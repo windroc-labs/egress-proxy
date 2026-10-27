@@ -119,11 +119,17 @@ done
 ok state_record
 
 got=$(cd "$dir" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | sort | xargs)
-[[ $got == "README.md config.example.yaml config.local.yaml start.sh state verify-egress" ]] || fail layout "$got"
+[[ $got == "README.md config.example.yaml config.local.yaml effective-policy.txt start.sh state verify-egress" ]] || fail layout "$got"
 got=$(find "$dir" \( -name '*.rs' -o -name Dockerfile -o -name Cargo.toml -o -name Cargo.lock -o -name tests -o -name proxy -o -name .github \) -print)
 [[ -z $got ]] || fail layout "source files: $got"
 grep -q "egress-proxy $version, image \`$image\`" "$dir/README.md" || fail layout "README.md: $(head -5 "$dir/README.md")"
 ok layout
+
+# FR-17, FR-18: the installed start.sh wrote the rules in effect, naming this version.
+grep -qF "for egress-proxy $version (image $image);" "$dir/effective-policy.txt" ||
+  fail rules_file "$(sed -n 2p "$dir/effective-policy.txt")"
+grep -q '^network workers ' "$dir/effective-policy.txt" || fail rules_file "$(cat "$dir/effective-policy.txt")"
+ok rules_file
 
 # FR-7: a config change applied by the start command: no build, the same image.
 started=$(inspect '{{.State.StartedAt}}')
@@ -132,6 +138,7 @@ printf '    deny_ranges: [198.51.100.0/24]\n' >>"$dir/config.local.yaml"
 [[ $(inspect '{{.State.StartedAt}}') != "$started" ]] || fail config_change "start.sh did not apply the change"
 wait_health || fail config_change "not healthy after the change"
 [[ $(inspect '{{.Config.Image}}') == "$image" ]] || fail config_change "$PX runs $(inspect '{{.Config.Image}}')"
+grep -qxF '    198.51.100.0/24' "$dir/effective-policy.txt" || fail config_change "the rules file lacks the new deny range"
 ok config_change
 grep -E '(^| )(build|buildx)( |$)' "$work/docker.log" && fail no_build "a build ran"
 ok no_build

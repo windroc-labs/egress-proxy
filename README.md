@@ -80,7 +80,7 @@ Codes 2–5 leave `~/.egress` and the running proxy as they were.
 | `start.sh` | the installer | the start command |
 | `verify-egress` | the installer | checks a caller network's allows and denies ([Verify](#verify)) |
 | `config.example.yaml` | the installer | every config option, with examples |
-| `effective-policy.txt` | `start.sh`, in the versions that print the rules in effect | each network's rules in effect; absent before |
+| `effective-policy.txt` | `start.sh`, at every start | each network's rules in effect: the floor, the start-time addresses and the config |
 | `state/` | the installer and `start.sh` | the runtime set, the compose file, the rendered networks file, the installed versions; never edit |
 
 Every generated file starts with a comment saying so. `start.sh` runs the installed image
@@ -100,6 +100,7 @@ image on the machine.
 | --- | --- |
 | Install, reinstall or upgrade | `egress-install --version X.Y.Z --digest sha256:<digest>` |
 | Start, or apply a config change (idempotent) | `~/.egress/start.sh` |
+| See each network's rules in effect | printed by `~/.egress/start.sh`; the last start's in `~/.egress/effective-policy.txt` |
 | Health | `docker ps --filter name=egress-proxy` (status column), `docker inspect --format '{{json .State.Health}}' egress-proxy` |
 | Logs (config errors name the network and key) | `docker logs egress-proxy` |
 | Stop | `docker stop egress-proxy` |
@@ -110,6 +111,10 @@ A config change takes effect when `~/.egress/start.sh` runs: it restarts the pro
 running policy differs from the config, and otherwise leaves it running. Until then the
 proxy reports `unhealthy`, and a restart with sections that differ from the attached
 networks exits 2 with `run ./start.sh`.
+Each run then prints each network's rules in effect ([Policy](#policy): the mode, the
+floor, the addresses of `host.docker.internal` and the proxy, `deny_ranges`, `allow`, and
+each exception with the addresses resolved at that start) and writes them to
+`effective-policy.txt`; a `docker restart` does not rewrite that file.
 A restart drops every in-flight connection on every caller network; callers keep their
 proxy settings and need no restart. After the Mac joins another network (e.g. a new
 Wi-Fi), restart the proxy: `docker restart egress-proxy`.

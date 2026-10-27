@@ -1,8 +1,9 @@
 //! Command line of the image's entrypoint. Not a management command: the image runs
 //! `proxy run`, its `HEALTHCHECK` runs `proxy health`, only start.sh runs
 //! `proxy compose`, in a throwaway container with `--network none`, and `proxy drift`,
-//! read-only, with `docker compose exec` in the proxy, and only verify-egress runs
-//! `proxy plan`, read-only, with `docker exec` in the proxy.
+//! read-only, with `docker compose exec` in the proxy, and `proxy rules`, read-only, the
+//! same way; only verify-egress runs `proxy plan`, read-only, with `docker exec` in the
+//! proxy.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -12,7 +13,7 @@ use ipnet::IpNet;
 use crate::facts::Resolver;
 use crate::plan::HostFacts;
 
-pub const USAGE: &str = "usage: proxy [run|health|compose|drift] [--config <path>] [--run-dir <dir>] [--smokescreen <path>] [--port <n>] [--resolve <host>=<ip>[,<ip>...]]...\n       proxy plan <key> --listener-port <n> [--host-addr <ip>/<len>]... [--default-gateway <ip>]... [--config <path>] [--run-dir <dir>]";
+pub const USAGE: &str = "usage: proxy [run|health|compose|drift|rules] [--config <path>] [--run-dir <dir>] [--smokescreen <path>] [--port <n>] [--resolve <host>=<ip>[,<ip>...]]...\n       proxy plan <key> --listener-port <n> [--host-addr <ip>/<len>]... [--default-gateway <ip>]... [--config <path>] [--run-dir <dir>]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -24,6 +25,8 @@ pub enum Mode {
     Plan,
     /// Exit 3 when the running policy differs from the config.
     Drift,
+    /// Print each caller network's rules in effect.
+    Rules,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +86,10 @@ pub fn parse_args<I: IntoIterator<Item = String>>(
         }
         Some("drift") => {
             opts.mode = Mode::Drift;
+            args.next();
+        }
+        Some("rules") => {
+            opts.mode = Mode::Rules;
             args.next();
         }
         Some("plan") => {
@@ -281,7 +288,7 @@ mod tests {
             .unwrap_err(),
             "--default-gateway: x is not an address"
         );
-        for mode in ["run", "health", "compose", "drift"] {
+        for mode in ["run", "health", "compose", "drift", "rules"] {
             for opt in ["--host-addr", "--default-gateway", "--listener-port"] {
                 assert_eq!(
                     parse(&[mode, opt, "1"]).unwrap_err(),
@@ -295,6 +302,14 @@ mod tests {
     #[test]
     fn compose_mode() {
         assert_eq!(parse(&["compose"]).unwrap().mode, Mode::Compose);
+    }
+
+    #[test]
+    fn rules_mode() {
+        let opts = parse(&["rules", "--config", "/c", "--run-dir", "/r"]).unwrap();
+        assert_eq!(opts.mode, Mode::Rules);
+        assert_eq!(opts.config, PathBuf::from("/c"));
+        assert_eq!(opts.run_dir, PathBuf::from("/r"));
     }
 
     #[test]
