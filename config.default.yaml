@@ -1,0 +1,20 @@
+# The egress proxy's local config (~/.egress/config.local.yaml): the only file to edit.
+# The installer wrote it once, from config.default.yaml, and never replaces it.
+#
+# - Every option, with examples: config.example.yaml next to this file.
+# - The rules in effect for each network: effective-policy.txt next to this file, written
+#   by start.sh at every start.
+# - After any change, run the start command: ~/.egress/start.sh
+#
+# A missing key, an unknown key or a bad value stops the proxy at start; `docker logs
+# egress-proxy` names the network and the key.
+
+# Format version; only 1 exists.
+version: 1
+
+# One section per caller network: the only list of them. start.sh attaches the proxy to
+# Docker network egress-<key> for each section.
+networks:
+  workers:
+    # denylist: everything public is allowed; private, local and LAN ranges are denied.
+    mode: denylist

@@ -1,5 +1,5 @@
 # Example of ~/.egress/config.local.yaml, the egress proxy's local config. Copy it there
-# and edit it. After any change, run the start command: ./start.sh
+# and edit it. After any change, run the start command: ~/.egress/start.sh
 # A missing key, an unknown key or a bad value stops the proxy at start; `docker logs
 # egress-proxy` names the network and the key. Keep LAN and other private addresses in
 # your local copy only, never in this repo.
@@ -10,7 +10,7 @@
 # Format version; only 1 exists.
 version: 1
 
-# One section per caller network: the only list of them. ./start.sh attaches the proxy to
+# One section per caller network: the only list of them. start.sh attaches the proxy to
 # Docker network egress-<key> for each section and advertises it in the proxy's labels
 # (docs/label-contract.md). Keys: lower-case letters, digits and "-"; "uplink" is reserved.
 networks:

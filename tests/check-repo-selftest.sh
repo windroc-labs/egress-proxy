@@ -86,6 +86,24 @@ mkdir -p "$dir/.github/actions/x"
 printf 'runs:\n  using: composite\n  steps:\n    - uses: actions/checkout@v5\n' >"$dir/.github/actions/x/action.yml"
 expect_only_failure uses_unpinned_action "$dir" "FAIL uses_pinned: .github/actions/x/action.yml:4:    - uses: actions/checkout@v5"
 
+# README.md's Setup: step 1 must be the install entry with a version and a digest, and
+# a checkout's ./start.sh must not be in it.
+dir=$(tree setup_step1)
+sed -e 's/^1\. Install the published image by its digest:$/1. Run the start command:/' \
+  -e 's/^   .egress-install --version X\.Y\.Z --digest sha256:<digest>., with/   the start command, with/' \
+  "$repo/README.md" >"$dir/README.md"
+out=$(run_check "$dir")
+if grep -q '^FAIL setup_install_entry: README.md Setup step 1 is not egress-install' <<<"$out" &&
+  [[ $(grep -c '^FAIL ' <<<"$out") == 1 && $(tail -n 1 <<<"$out") == exit=1 ]]; then
+  ok setup_step1
+else
+  fail setup_step1 "$out"
+fi
+
+dir=$(tree setup_checkout_start)
+awk '{ print } /^## Setup$/ { print ""; print "From a checkout: `./start.sh`" }' "$repo/README.md" >"$dir/README.md"
+expect_only_failure setup_checkout_start "$dir" "FAIL setup_install_entry: README.md Setup runs ./start.sh from a checkout"
+
 dir=$(tree network_key)
 printf 'networks:\n  %s:\n    mode: allowlist\n' "${c}${d}" >"$dir/notes.yaml"
 out=$(run_check "$dir")

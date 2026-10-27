@@ -26,6 +26,8 @@ echo '{}' >"$DOCKER_CONFIG/config.json"
 # The proxy's config directory; never the real ~/.egress.
 export EGRESS_CONFIG_DIR=$work/egress
 mkdir -p "$EGRESS_CONFIG_DIR"
+# The image start.sh builds from a checkout; compose.yaml takes it from EGRESS_IMAGE.
+export EGRESS_IMAGE=egress-proxy
 
 PX=egress-proxy
 PROXY=http://egress-proxy-workers:4750
@@ -45,7 +47,7 @@ host_listeners=()
 # exists (without it, compose would see a proxy with no caller networks).
 compose() {
   local files=(-f "$repo/compose.yaml")
-  [[ -f $EGRESS_CONFIG_DIR/compose.networks.yaml ]] && files+=(-f "$EGRESS_CONFIG_DIR/compose.networks.yaml")
+  [[ -f $EGRESS_CONFIG_DIR/state/compose.networks.yaml ]] && files+=(-f "$EGRESS_CONFIG_DIR/state/compose.networks.yaml")
   docker compose --project-directory "$repo" "${files[@]}" "$@"
 }
 
@@ -270,7 +272,7 @@ fi
 ok up_idempotent
 
 # AC13: start.sh refuses a missing config or a config error and changes nothing.
-override=$EGRESS_CONFIG_DIR/compose.networks.yaml
+override=$EGRESS_CONFIG_DIR/state/compose.networks.yaml
 cp "$override" "$work/override.before"
 rc=0
 err=$(EGRESS_CONFIG_DIR=$work/no-config "$repo/start.sh" 2>&1 >/dev/null) || rc=$?
@@ -617,7 +619,7 @@ sed -e "s/^name: egress-proxy\$/name: $OLD_PROJECT/" -e "s/^  proxy:\$/  $OLD_SE
   -e "s/^    container_name: $PX\$/    container_name: $OLD_PX/" -e "s/^    external: true\$/    enable_ipv6: false/" \
   "$repo/compose.yaml" >"$old/compose.yaml"
 sed -e "s/^  proxy:\$/  $OLD_SERVICE:/" -e "s/^    external: true\$/    internal: true/" \
-  "$EGRESS_CONFIG_DIR/compose.networks.yaml" >"$old/compose.networks.yaml"
+  "$EGRESS_CONFIG_DIR/state/compose.networks.yaml" >"$old/compose.networks.yaml"
 if ! grep -q "^name: $OLD_PROJECT\$" "$old/compose.yaml" || ! grep -q "container_name: $OLD_PX\$" "$old/compose.yaml" ||
   ! grep -q "^  $OLD_SERVICE:\$" "$old/compose.networks.yaml" || grep -qx '    external: true' "$old/compose.yaml" "$old/compose.networks.yaml"; then
   fail upgrade_replaces_old "cannot write the old compose files"

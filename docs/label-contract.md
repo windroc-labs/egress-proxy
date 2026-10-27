@@ -14,10 +14,10 @@ uses nothing else and never probes the proxy itself.
 | `windroc.egress.network.<key>.proxy` | the proxy URL for callers on that network: `http://egress-proxy-<key>:4750` |
 
 The network keys are the sections of the proxy's local config (`~/.egress/config.local.yaml`);
-`./start.sh` renders the networks and per-network labels from them, so they always match the
-networks the proxy is attached to. Every key in `windroc.egress.networks` has both `.name`
-and `.proxy` labels. The proxy URL uses the proxy's alias on that network, so it stays the
-same when the proxy restarts.
+the start command (`~/.egress/start.sh`) renders the networks and per-network labels from
+them, so they always match the networks the proxy is attached to. Every key in
+`windroc.egress.networks` has both `.name` and `.proxy` labels. The proxy URL uses the
+proxy's alias on that network, so it stays the same when the proxy restarts.
 
 ## Consumer rules
 

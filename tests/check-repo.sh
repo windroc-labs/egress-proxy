@@ -2,7 +2,7 @@
 # Repo lint (CI `lint` job): no reference to the sibling repos outside the docs (NFR-3),
 # every base image and action pinned, no keychain or platform-TLS crates in the proxy,
 # and the docs and the Dockerfile agreeing with the files they describe (labels, worker
-# tool rows).
+# tool rows, the install entry in README.md's Setup).
 # Prints `ok <check>` or `FAIL <check>: <detail>`; exits 1 if any check fails.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -118,6 +118,20 @@ else
     fi
   done
   fail tool_rows_documented "$detail"
+fi
+
+# README.md's Setup starts with the install entry, a version and a digest (FR-23); a
+# checkout's ./start.sh is for development, not in Setup.
+setup=$(awk '/^## Setup$/ { on = 1; next } /^## / { on = 0 } on' README.md 2>/dev/null || true)
+step1=$(awk '/^1\. / { on = 1 } /^2\. / { on = 0 } on' <<<"$setup")
+if [[ -z $setup ]]; then
+  fail setup_install_entry "README.md has no Setup section"
+elif [[ $step1 != *"egress-install --version "* || $step1 != *"--digest "* ]]; then
+  fail setup_install_entry "README.md Setup step 1 is not egress-install --version ... --digest ...: ${step1:-none}"
+elif grep -qF './start.sh' <<<"$setup"; then
+  fail setup_install_entry "README.md Setup runs ./start.sh from a checkout"
+else
+  ok setup_install_entry
 fi
 
 exit "$status"

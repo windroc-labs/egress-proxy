@@ -11,7 +11,7 @@ healthy and the worker image built by ensemble's broker (`docker image ls ensemb
 run
 
 ```
-./verify-egress --tools ensemble-worker:<key>
+~/.egress/verify-egress --tools ensemble-worker:<key>
 ```
 
 and replace the rows below with the rows it prints. Each row is one tool or one probe.

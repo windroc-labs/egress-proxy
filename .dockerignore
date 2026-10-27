@@ -1,4 +1,11 @@
 *
 !Dockerfile
 !proxy/
+!start.sh
+!verify-egress
+!egress-install
+!install.sh
+!compose.yaml
+!config.example.yaml
+!config.default.yaml
 proxy/target

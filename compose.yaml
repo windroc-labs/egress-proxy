@@ -1,14 +1,15 @@
 # The egress proxy: one container serving every caller network. Start, upgrade, or add
-# or remove a caller network with ./start.sh, never a bare `docker compose up`: the caller
-# networks, EGRESS_NETWORKS and their labels come from the compose override start.sh
-# renders from the config's sections (~/.egress/compose.networks.yaml); see README.md.
+# or remove a caller network with start.sh, never a bare `docker compose up`: the image
+# (EGRESS_IMAGE: the installed image by digest, or egress-proxy built from a checkout),
+# the caller networks, EGRESS_NETWORKS and their labels come from start.sh and the compose
+# override it renders from the config's sections (state/compose.networks.yaml in the
+# config directory); see README.md. Compose never builds or pulls the image.
 name: egress-proxy
 
 services:
   proxy:
-    build: .
-    # The built image's tag; without it compose names it <project>-<service>.
-    image: egress-proxy
+    image: ${EGRESS_IMAGE:?run start.sh, which sets EGRESS_IMAGE}
+    pull_policy: never
     container_name: egress-proxy
     restart: unless-stopped
     # Longer than the entrypoint's own 10 s grace for its smokescreens, so a stop exits 0.

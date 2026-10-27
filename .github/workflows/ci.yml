@@ -1,6 +1,6 @@
 # Every pull request: build and test the entrypoint, lint the repo, build the image and
 # run the Docker end-to-end checks, and build, check and publish the multi-arch image to a
-# local registry (the release path, without GHCR). CI aggregates every job for branch
+# local registry (the release path, without GHCR) and install it from there by digest. CI aggregates every job for branch
 # protection; release.yml calls this workflow before it publishes.
 name: ci
 
@@ -43,7 +43,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-      - run: shellcheck tests/*.sh start.sh verify-egress
+      - run: shellcheck tests/*.sh start.sh verify-egress install.sh egress-install
       - name: Check aggregate job dependencies
         run: |
           python3 -m pip install PyYAML==6.0.2
@@ -52,6 +52,7 @@ jobs:
       - run: tests/check-repo.sh
       - run: tests/check-repo-selftest.sh
       - run: tests/verify-egress-selftest.sh
+      - run: tests/install-selftest.sh
       - name: Dockerfile build checks
         run: docker build --check .
       - name: actionlint
@@ -62,7 +63,26 @@ jobs:
       - name: compose files are valid
         env:
           EGRESS_CONFIG_DIR: ${{ runner.temp }}
+          EGRESS_IMAGE: egress-proxy
         run: docker compose -f compose.yaml config -q
+
+  # The install entry and installer run on the user's Mac: macOS's own bash 3.2 and BSD
+  # tools, not Homebrew's.
+  macos:
+    name: macos
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Parse every script and run the install self-test with /bin/bash 3.2
+        shell: /bin/bash -e {0}
+        run: |
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+          bash --version | head -n 1
+          for f in egress-install install.sh start.sh verify-egress tests/*.sh; do bash -n "$f"; done
+          bash tests/install-selftest.sh
 
   integration:
     name: integration
@@ -101,10 +121,16 @@ jobs:
         run: >-
           python3 -B .github/release_image.py publish "$RUNNER_TEMP/layout"
           --repo localhost:5000/egress-proxy --version 0.0.0 --insecure
+      - name: Install it from the local registry by digest, end to end
+        env:
+          REGISTRY: ${{ job.services.registry.id }}
+        run: >-
+          tests/install-integration.sh localhost:5000/egress-proxy 0.0.0
+          "$(python3 -B .github/release_image.py digest "$RUNNER_TEMP/layout")" "$REGISTRY"
 
   ci:
     name: CI
-    needs: [rust, lint, integration, image]
+    needs: [rust, lint, macos, integration, image]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

@@ -12,55 +12,107 @@ networks are the sections of the local config, e.g. `workers` (denylist) and `mi
 [label contract](docs/label-contract.md).
 
 Contents: `Dockerfile` (smokescreen pinned by SHA-256, base images pinned by digest, the
-Rust entrypoint in `proxy/`, the `HEALTHCHECK`), `compose.yaml`, `start.sh`,
-`config.example.yaml`, `verify-egress`. There is no management command: the proxy applies
-its config at start, `start.sh` is the start command, and `verify-egress` only checks.
+Rust entrypoint in `proxy/`, the `HEALTHCHECK`, and the runtime files in `/egress`),
+`egress-install` (the install entry) and `install.sh` (the installer the image ships),
+`compose.yaml`, `start.sh`, `config.example.yaml`, `config.default.yaml`,
+`verify-egress`. There is no management command: the proxy applies its config at start,
+`start.sh` is the start command, and `verify-egress` only checks.
 
 ## Setup
 
-1. Copy the example config and edit it:
-   `mkdir -p ~/.egress && cp config.example.yaml ~/.egress/config.local.yaml`
-2. From this checkout: `./start.sh`
+1. Install the published image by its digest:
+   `egress-install --version X.Y.Z --digest sha256:<digest>`, with the version and the
+   index digest from the GitHub Release `vX.Y.Z` ([Release](#release)). It installs into
+   `~/.egress` (`--dir <path>` for another directory) and ends with
+   `egress-proxy X.Y.Z (sha256:…) installed in ~/.egress; start command: ~/.egress/start.sh`.
+2. To change the policy, edit `~/.egress/config.local.yaml` ([Policy](#policy)), then run
+   `~/.egress/start.sh`.
 
-`start.sh` builds the image `egress-proxy`, renders `~/.egress/compose.networks.yaml` (one caller network
-per config section: the attachments, `EGRESS_NETWORKS` and the labels) with the image,
-creates the networks that do not exist yet (each `egress-<key>` internal, and
+`egress-install` comes from a checkout of this repo at the tag `vX.Y.Z`, from a copy a
+caller's installer ships, or, after a first install, from
+`~/.egress/state/runtime/egress-install`. The installer it runs comes from the image, so
+the install is only as trusted as the digest: take it from the Release of the tag, or from
+a caller that pins it, never from a tag lookup.
+
+`egress-install` changes nothing until it has the image:
+
+- The image already on the machine (by digest): no network, GitHub login or registry is
+  needed, e.g. to reinstall the same version offline.
+- Else it pulls the image by digest, never by tag. The package is private: the pull uses
+  the machine's GitHub login, `gh`, whose account must be able to read the package
+  `ghcr.io/windroc/egress-proxy`, with scope `read:packages`
+  (`gh auth refresh -h github.com -s read:packages`). A credential helper in a throwaway
+  Docker client config asks `gh` at pull time, so the token is never written to a file or
+  printed, and the Docker login is left alone.
+
+It then copies the image's `/egress` out and runs its `install.sh`, which:
+
+1. writes the runtime files as one set under `~/.egress/state/` and switches the
+   top-level files to it with one rename, so a killed install leaves the old set or the
+   new one, never a mix;
+2. writes the default config (`config.default.yaml`) when `config.local.yaml` does not
+   exist, and never changes an existing one;
+3. runs `~/.egress/start.sh` and waits up to 120 s for the proxy to be healthy with the
+   [label contract](docs/label-contract.md)'s labels;
+4. records the version, digest and image as current, and the one before as previous, in
+   `~/.egress/state/installed`.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | installed |
+| 1 | another failure, e.g. the image's files could not be copied out, or `state/installed` has a newer format |
+| 2 | usage, or Docker is not running or not reachable |
+| 3 | no access to the image: the message names the GitHub login and scope needed |
+| 4 | the pull failed: the message names the image, digest and registry; the running proxy keeps running |
+| 5 | the image is not that version, or has no installer |
+| 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`) |
+| 7 | the start command failed |
+| 8 | the installer does not know the `--interface` this `egress-install` speaks |
+
+Codes 2–5 leave `~/.egress` and the running proxy as they were.
+
+`~/.egress` then holds only:
+
+| Path | Written by | What it is |
+| --- | --- | --- |
+| `config.local.yaml` | you (the installer writes the default once) | the only file to edit |
+| `README.md` | the installer, every install | each file's use, the commands, the installed version and digest |
+| `start.sh` | the installer | the start command |
+| `verify-egress` | the installer | checks a caller network's allows and denies ([Verify](#verify)) |
+| `config.example.yaml` | the installer | every config option, with examples |
+| `effective-policy.txt` | `start.sh`, in the versions that print the rules in effect | each network's rules in effect; absent before |
+| `state/` | the installer and `start.sh` | the runtime set, the compose file, the rendered networks file, the installed versions; never edit |
+
+Every generated file starts with a comment saying so. `start.sh` runs the installed image
+by digest and never builds or pulls: it renders `state/compose.networks.yaml` (one caller
+network per config section: the attachments, `EGRESS_NETWORKS` and the labels) with the
+image, creates the networks that do not exist yet (each `egress-<key>` internal, and
 `egress-uplink`; compose uses them as external), and runs `docker compose up -d` with it.
-It is idempotent: running it again changes nothing.
-Run it after pulling a new version of this repo, or from another checkout: the networks
-come from the config, so they stay. Never run a bare `docker compose up`: without the
-rendered file the proxy has no caller networks and exits 2 (fail closed).
-`restart: unless-stopped` brings the proxy back after a crash, a Docker Desktop restart,
-or a Mac restart (with Docker Desktop set to start at login).
-
-Upgrading an install from before the rename to proxy (compose project `egress`, container
-`egress-gateway`): `./start.sh` removes the old container, then starts `egress-proxy` in
-compose project `egress-proxy` on the same networks, with the same labels and aliases;
-callers attached to the networks stay attached. Then remove by hand the old image,
-`docker image rm egress-gateway`, and in a checkout where you built the entrypoint,
-`rm -rf gateway` (its ignored build output).
-
-Earlier versions named the image `egress-proxy-proxy`; after `./start.sh` remove it by hand:
-`docker image rm egress-proxy-proxy`.
+It is idempotent: running it again changes nothing. Never run a bare
+`docker compose up`: without the rendered file the proxy has no caller networks and exits
+2 (fail closed). `restart: unless-stopped` brings the proxy back after a crash, a Docker
+Desktop restart, or a Mac restart (with Docker Desktop set to start at login), from the
+image on the machine.
 
 ## Commands
 
 | Task | Command |
 | --- | --- |
-| Start, upgrade, or apply a config change (idempotent) | `./start.sh` |
+| Install, reinstall or upgrade | `egress-install --version X.Y.Z --digest sha256:<digest>` |
+| Start, or apply a config change (idempotent) | `~/.egress/start.sh` |
 | Health | `docker ps --filter name=egress-proxy` (status column), `docker inspect --format '{{json .State.Health}}' egress-proxy` |
 | Logs (config errors name the network and key) | `docker logs egress-proxy` |
-| Stop | `docker compose stop` |
-| Check a caller network's allows and denies ([Verify](#verify)) | `./verify-egress <network>` |
-| Check how a worker image's tools behave behind the proxy | `./verify-egress --tools <image>` |
+| Stop | `docker stop egress-proxy` |
+| Check a caller network's allows and denies ([Verify](#verify)) | `~/.egress/verify-egress <network>` |
+| Check how a worker image's tools behave behind the proxy | `~/.egress/verify-egress --tools <image>` |
 
-A config change takes effect when `./start.sh` runs: it restarts the proxy when the
+A config change takes effect when `~/.egress/start.sh` runs: it restarts the proxy when the
 running policy differs from the config, and otherwise leaves it running. Until then the
 proxy reports `unhealthy`, and a restart with sections that differ from the attached
 networks exits 2 with `run ./start.sh`.
 A restart drops every in-flight connection on every caller network; callers keep their
 proxy settings and need no restart. After the Mac joins another network (e.g. a new
-Wi-Fi), restart the proxy: `docker compose restart proxy`.
+Wi-Fi), restart the proxy: `docker restart egress-proxy`.
 
 ## Policy
 
@@ -84,8 +136,8 @@ proxy; its Docker network stays until `docker network rm egress-<key>`.
   their address, e.g. `host.docker.internal:11434` for Ollama on `workers`, or the mini's
   ssh port on `mini-op`. The proxy resolves each name at start and opens only that port
   of the addresses it had then (smokescreen `allow_addresses`), for every caller on that
-  network; after a name's address changes, restart the proxy (`docker compose restart
-  proxy`). In allowlist mode the ACL,
+  network; after a name's address changes, restart the proxy (`docker restart
+  egress-proxy`). In allowlist mode the ACL,
   which has no ports, lists those start-time addresses, not the name: callers connect to
   the address (a CONNECT by name is denied), and a later DNS answer opens nothing. There
   an exception must be an address a deny rule covers (e.g. a LAN address); list public
@@ -125,7 +177,7 @@ the Mac is offline.
 
 ## Verify
 
-`./verify-egress <network>` checks one caller network's policy from a probe container on
+`verify-egress <network>` checks one caller network's policy from a probe container on
 `egress-<network>` (a pinned curl image), against targets it discovers at run time. Nothing
 it probes is written in this repo: the proxy computes the checks (`proxy plan`, run
 read-only with `docker exec`) from its config and start facts, plus what verify-egress
@@ -140,7 +192,7 @@ On macOS the first run raises "Allow Python to find devices on local networks?",
 | --- | --- | --- |
 | `proxy_found`, `proxy_contract`, `proxy_healthy`, `network_advertised`, `network_internal` | the label contract and Docker health | exactly one proxy, contract 1, healthy, `<network>` advertised, its Docker network internal |
 | `host_listener` | curl on the host to the listener | it answers |
-| `plan` | `proxy plan` | the proxy printed the checks; it refuses while the running policy differs from the config (run `./start.sh`) |
+| `plan` | `proxy plan` | the proxy printed the checks; it refuses while the running policy differs from the config (run `start.sh`) |
 | `proxy_deny` | CONNECT through the network's proxy | 407: one address per deny-floor range, `169.254.169.254`, `[::ffff:127.0.0.1]`, `host.docker.internal` (by name and address), the proxy's own addresses, the host's addresses and one more address in each of their prefixes, its default gateways, the host listener, each `deny_ranges` range, each `verify.deny_targets` entry, `localtest.me` (a public name for 127.0.0.1), a public host (allowlist), and the other networks' exceptions (where this network's policy denies their addresses) and allows |
 | `proxy_allow` | an https request through the proxy | CONNECT 200 and an HTTP answer (any status): `example.com` (denylist) or each non-glob `allow` entry (allowlist) |
 | `exception_open`, `exception_other_port` | CONNECT through the proxy | each exception reaches its target (200), and the next port of that host is denied (407) where this network's policy denies that address. In allowlist mode a named exception is probed at the addresses the proxy resolved at start |
@@ -161,38 +213,55 @@ codes: 0 all passed, 1 a check failed, 2 usage or no Docker context or `python3`
 deny checks without changing the policy: list LAN hosts that matter, and the Mac's public
 IPv4 address, which verify-egress cannot discover behind NAT.
 
-`./verify-egress --tools <image>` runs each tool of the [worker tool table](docs/worker-tools.md)
+`verify-egress --tools <image>` runs each tool of the [worker tool table](docs/worker-tools.md)
 in one container of `<image>` (local only, non-root) on `egress-workers`, with the proxy
 variables a worker gets, and prints that table's rows with the image's ID and today's date.
 
 Acceptance runs on the test Mac mini through mini-op, never on a developer's Mac: there
-run `./verify-egress workers`, `./verify-egress mini-op` and `./verify-egress --tools
-<worker image>`, and record the tool rows in `docs/worker-tools.md`.
+run `~/.egress/verify-egress workers`, `~/.egress/verify-egress mini-op` and
+`~/.egress/verify-egress --tools <worker image>`, and record the tool rows in `docs/worker-tools.md`.
 
 ## Development
+
+Running from a checkout is for development only: `./start.sh` there builds the image
+`egress-proxy` from the checkout and runs it with the config in `$EGRESS_CONFIG_DIR`
+(default `~/.egress`; first `mkdir -p <dir> && cp config.example.yaml
+<dir>/config.local.yaml`). It is the same container, `egress-proxy`, so it replaces an
+installed proxy until `~/.egress/start.sh` runs again. It also upgrades an install from
+before the rename to proxy (compose project `egress`, container `egress-gateway`): it
+removes the old container, then starts `egress-proxy` in compose project `egress-proxy` on
+the same networks, with the same labels and aliases; callers attached to the networks stay
+attached. Then remove by hand the old images, `docker image rm egress-gateway
+egress-proxy-proxy`, and in a checkout where you built the entrypoint, `rm -rf gateway`
+(its ignored build output).
 
 - Entrypoint: `cd proxy && cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`.
 - Repo lint: `tests/check-repo.sh`; its comments describe each check.
 - verify-egress: `tests/verify-egress-selftest.sh` runs it against a fake `docker` (no
   daemon).
+- Install entry and installer: `tests/install-selftest.sh` runs `egress-install` and
+  `install.sh` against a fake `docker` and `gh` (no daemon).
 - Docker end-to-end: `tests/integration.sh` runs in CI only (Linux; it restarts the
-  Docker daemon and uses a throwaway Docker client config).
+  Docker daemon and uses a throwaway Docker client config), from a checkout's `start.sh`.
+  `tests/install-integration.sh` runs in CI's `image` job: it installs the image that job
+  published to its local registry by digest.
 - Release steps (`.github/release_image.py`): `python3 -B -m unittest discover -s .github -p 'test_*.py'`
   (requires `PyYAML==6.0.2`); no Docker or registry.
 - CI (`.github/workflows/ci.yml`) runs on every pull request and push to `main`, and as
   the first job of every release.
   Set `CI` as the only required status check in the `main` branch ruleset. It aggregates
-  `rust`, `lint`, `integration` and `image`, and fails if any dependency fails, is cancelled
+  `rust`, `lint`, `macos` (every script parsed, and the install self-test run, with
+  macOS's own bash 3.2 and BSD tools), `integration` and `image`, and fails if any dependency fails, is cancelled
   or is skipped. `image` runs the release path against a local registry: it builds both
   platforms (`.github/actions/build-image`, arm64 under QEMU), checks the layout and
-  publishes it as version `0.0.0`. When adding a job, add it to `ci.needs`; the `lint` job
+  publishes it as version `0.0.0`, then installs it from there. When adding a job, add it to `ci.needs`; the `lint` job
   checks completeness with `.github/check_ci_needs.py` (requires `PyYAML==6.0.2`).
 
 ## Release
 
 A release is the image `ghcr.io/windroc/egress-proxy:X.Y.Z` for `linux/amd64` and
 `linux/arm64`, plus the GitHub Release `vX.Y.Z` that gives its index digest. Install and pin
-it by that digest, never by the tag.
+it by that digest, never by the tag ([Setup](#setup)).
 
 1. Merge the change to `main`.
 2. Tag that `main` commit and push the tag: `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`.
