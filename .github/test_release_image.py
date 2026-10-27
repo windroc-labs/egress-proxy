@@ -308,5 +308,250 @@ class CheckTests(unittest.TestCase):
         self.assert_fails(self.check(root), "index.json")
 
 
+REPO = "ghcr.io/windroc/egress-proxy"
+INDEX_RAW = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}'
+INDEX_DIGEST = "sha256:" + hashlib.sha256(INDEX_RAW).hexdigest()
+NOT_FOUND = b"FATA[0001] Error parsing image name: reading manifest 1.2.3 in ghcr.io/windroc/egress-proxy: manifest unknown"
+
+
+class FakeTools:
+    """Stands in for skopeo, gh and docker behind subprocess.run: `registry` maps
+    `<repo>:<tag>` to raw index bytes, `configs` maps an arch to its image labels."""
+
+    def __init__(self, registry=None, configs=None, copy_writes=None, inspect_error=None,
+                 copy_rc=0, gh_view=(1, b"release not found"), gh_create_rc=0):
+        self.registry = dict(registry or {})
+        self.configs = configs or {"amd64": labels(), "arm64": labels()}
+        self.copy_writes = copy_writes
+        self.inspect_error = inspect_error
+        self.copy_rc = copy_rc
+        self.gh_view = gh_view
+        self.gh_create_rc = gh_create_rc
+        self.calls = []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append(list(args))
+        tool = args[0]
+        if tool == "skopeo" and args[1] == "inspect":
+            ref = args[-1].removeprefix("docker://")
+            if self.inspect_error:
+                return completed(args, 1, b"", self.inspect_error)
+            if "--config" in args:
+                arch = args[args.index("--override-arch") + 1]
+                return completed(args, 0, json.dumps({"config": {"Labels": self.configs[arch]}}).encode())
+            if ref not in self.registry:
+                return completed(args, 1, b"", NOT_FOUND)
+            return completed(args, 0, self.registry[ref])
+        if tool == "skopeo" and args[1] == "copy":
+            if self.copy_rc == 0:
+                self.registry[args[-1].removeprefix("docker://")] = self.copy_writes
+            return completed(args, self.copy_rc, b"", b"copy failed" if self.copy_rc else b"")
+        if tool == "gh" and args[1:3] == ["release", "view"]:
+            return completed(args, self.gh_view[0], b"", self.gh_view[1])
+        if tool == "gh" and args[1:3] == ["release", "create"]:
+            return completed(args, self.gh_create_rc, b"", b"" if self.gh_create_rc == 0 else b"HTTP 422")
+        if tool == "docker":
+            return completed(args, 0)
+        raise AssertionError(f"unexpected command {args}")
+
+    def ran(self, *prefix):
+        return [c for c in self.calls if c[:len(prefix)] == list(prefix)]
+
+
+def with_tools(tools, *argv, env=None):
+    with mock.patch.object(subprocess, "run", side_effect=tools):
+        return run_main(*argv, env=env)
+
+
+class BuildTests(unittest.TestCase):
+    def test_build_args(self):
+        out_dir = Path(self.enterContext(tempfile.TemporaryDirectory())) / "layout"
+        tools = FakeTools()
+        code, _, err = with_tools(tools, "build", "--version", VERSION, "--revision", REVISION,
+                                  "--contract", CONTRACT, "--out", str(out_dir))
+        self.assertEqual(code, 0, err)
+        (args,) = tools.ran("docker", "buildx", "build")
+        self.assertIn("--platform=linux/amd64,linux/arm64", args)
+        self.assertIn("--provenance=false", args)
+        self.assertIn("--sbom=false", args)
+        for key, value in labels().items():
+            self.assertIn(f"--label={key}={value}", args)
+        self.assertIn(f"--output=type=oci,dest={out_dir},tar=false", args)
+        self.assertEqual(args[-1], str(release_image.REPO_ROOT))
+
+    def test_out_exists(self):
+        out_dir = self.enterContext(tempfile.TemporaryDirectory())
+        tools = FakeTools()
+        code, _, err = with_tools(tools, "build", "--version", VERSION, "--revision", REVISION,
+                                  "--contract", CONTRACT, "--out", out_dir)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL build:", err)
+        self.assertEqual(tools.calls, [])
+
+    def test_build_fails(self):
+        out_dir = Path(self.enterContext(tempfile.TemporaryDirectory())) / "layout"
+        with mock.patch.object(subprocess, "run", return_value=completed([], 1)):
+            code, _, err = run_main("build", "--version", VERSION, "--revision", REVISION,
+                                    "--contract", CONTRACT, "--out", str(out_dir))
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL build: docker buildx build exited 1", err)
+
+
+class ExistingTests(unittest.TestCase):
+    def existing(self, tools, revision=REVISION):
+        return with_tools(tools, "existing", "--repo", REPO, "--version", VERSION, "--revision", revision,
+                          "--contract", CONTRACT, "--authfile", "/tmp/auth.json")
+
+    def test_absent(self):
+        tools = FakeTools()
+        self.assertEqual(self.existing(tools)[:2], (0, "absent\n"))
+        (args,) = tools.calls
+        self.assertEqual(args, ["skopeo", "inspect", "--raw", "--authfile", "/tmp/auth.json",
+                                f"docker://{REPO}:{VERSION}"])
+
+    def test_not_found_wordings(self):
+        for stderr in (b"manifest unknown", b"name unknown: repository name not known", b"404 Not Found"):
+            with self.subTest(stderr=stderr):
+                tools = FakeTools(inspect_error=stderr)
+                self.assertEqual(self.existing(tools)[:2], (0, "absent\n"))
+
+    def test_resume_same_revision(self):
+        tools = FakeTools(registry={f"{REPO}:{VERSION}": INDEX_RAW})
+        code, out, err = self.existing(tools)
+        self.assertEqual((code, out), (0, f"resume {INDEX_DIGEST}\n"), err)
+        configs = tools.ran("skopeo", "inspect", "--config")
+        self.assertEqual(sorted(c[c.index("--override-arch") + 1] for c in configs), ["amd64", "arm64"])
+        for c in configs:
+            self.assertEqual(c[-1], f"docker://{REPO}@{INDEX_DIGEST}")
+
+    def test_other_revision(self):
+        tools = FakeTools(registry={f"{REPO}:{VERSION}": INDEX_RAW},
+                          configs={"amd64": labels(**{"org.opencontainers.image.revision": "f" * 40}),
+                                   "arm64": labels()})
+        code, out, err = self.existing(tools)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"FAIL existing: {REPO}:{VERSION} already published from {'f' * 40}", err)
+
+    def test_resume_bad_platform_labels(self):
+        tools = FakeTools(registry={f"{REPO}:{VERSION}": INDEX_RAW},
+                          configs={"amd64": labels(), "arm64": labels(**{"io.windroc.egress-proxy.contract": None})})
+        code, _, err = self.existing(tools)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL existing:", err)
+        self.assertIn("linux/arm64", err)
+
+    def test_registry_error(self):
+        tools = FakeTools(inspect_error=b"denied: permission_denied: read_package")
+        code, out, err = self.existing(tools)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("FAIL existing: skopeo inspect exited 1: denied: permission_denied: read_package", err)
+
+
+class PublishTests(unittest.TestCase):
+    def setUp(self):
+        self.root = self.enterContext(tempfile.TemporaryDirectory())
+        self.digest = build_layout(self.root)
+        self.raw = (Path(self.root) / "blobs" / "sha256" / self.digest[7:]).read_bytes()
+
+    def publish(self, tools, *extra):
+        return with_tools(tools, "publish", self.root, "--repo", REPO, "--version", VERSION, *extra)
+
+    def test_publish(self):
+        tools = FakeTools(copy_writes=self.raw)
+        code, out, err = self.publish(tools, "--authfile", "/tmp/auth.json")
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"ok publish {REPO}:{VERSION} {self.digest}", out)
+        (copy,) = tools.ran("skopeo", "copy")
+        self.assertEqual(copy, ["skopeo", "copy", "--all", "--preserve-digests", "--authfile", "/tmp/auth.json",
+                                f"oci:{self.root}", f"docker://{REPO}:{VERSION}"])
+        inspects = tools.ran("skopeo", "inspect", "--raw")
+        self.assertEqual(len(inspects), 2)
+        self.assertLess(tools.calls.index(inspects[0]), tools.calls.index(copy))
+        self.assertEqual(len(tools.ran("skopeo", "inspect", "--config")), 2)
+
+    def test_insecure_local_registry(self):
+        tools = FakeTools(copy_writes=self.raw)
+        code, _, err = with_tools(tools, "publish", self.root, "--repo", "localhost:5000/egress-proxy",
+                                  "--version", "0.0.0", "--insecure")
+        self.assertEqual(code, 0, err)
+        (copy,) = tools.ran("skopeo", "copy")
+        self.assertIn("--dest-tls-verify=false", copy)
+        for c in tools.ran("skopeo", "inspect"):
+            self.assertIn("--tls-verify=false", c)
+
+    def test_exists(self):
+        tools = FakeTools(registry={f"{REPO}:{VERSION}": INDEX_RAW})
+        code, _, err = self.publish(tools)
+        self.assertEqual(code, 1)
+        self.assertIn(f"FAIL publish: {REPO}:{VERSION} already exists", err)
+        self.assertEqual(tools.ran("skopeo", "copy"), [])
+
+    def test_registry_error_before_copy(self):
+        tools = FakeTools(inspect_error=b"unauthorized: authentication required")
+        code, _, err = self.publish(tools)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL publish: skopeo inspect exited 1: unauthorized", err)
+        self.assertEqual(tools.ran("skopeo", "copy"), [])
+
+    def test_copy_fails(self):
+        tools = FakeTools(copy_rc=1)
+        code, _, err = self.publish(tools)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL publish: skopeo copy exited 1: copy failed", err)
+
+    def test_digest_mismatch(self):
+        tools = FakeTools(copy_writes=INDEX_RAW)
+        code, _, err = self.publish(tools)
+        self.assertEqual(code, 1)
+        self.assertIn(f"FAIL publish: {REPO}:{VERSION} is {INDEX_DIGEST}, want {self.digest}", err)
+
+    def test_registry_labels_differ(self):
+        tools = FakeTools(copy_writes=self.raw,
+                          configs={"amd64": labels(), "arm64": labels(**{"org.opencontainers.image.version": "9.9.9"})})
+        code, _, err = self.publish(tools)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL publish:", err)
+        self.assertIn("org.opencontainers.image.version", err)
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_absent(self):
+        tools = FakeTools()
+        code, _, err = with_tools(tools, "release-absent", "--tag", "v1.2.3")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(tools.calls, [["gh", "release", "view", "v1.2.3"]])
+
+    def test_exists(self):
+        code, _, err = with_tools(FakeTools(gh_view=(0, b"")), "release-absent", "--tag", "v1.2.3")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL release: v1.2.3 already exists", err)
+
+    def test_gh_error(self):
+        code, _, err = with_tools(FakeTools(gh_view=(1, b"HTTP 401: Bad credentials")),
+                                  "release-absent", "--tag", "v1.2.3")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL release: gh release view exited 1: HTTP 401: Bad credentials", err)
+
+    def create(self, tools):
+        return with_tools(tools, "release-create", "--version", VERSION, "--contract", CONTRACT,
+                          "--digest", INDEX_DIGEST, "--revision", REVISION, "--repo", REPO)
+
+    def test_create(self):
+        tools = FakeTools()
+        code, _, err = self.create(tools)
+        self.assertEqual(code, 0, err)
+        (args,) = tools.ran("gh", "release", "create")
+        self.assertEqual(args[:8], ["gh", "release", "create", "v1.2.3", "--verify-tag", "--title", "v1.2.3", "--notes"])
+        notes = args[8]
+        for fragment in (f"`{VERSION}`", f"`{CONTRACT}`", f"`{REPO}:{VERSION}`", INDEX_DIGEST,
+                         f"docker pull {REPO}@{INDEX_DIGEST}", "`linux/amd64`", "`linux/arm64`", REVISION):
+            self.assertIn(fragment, notes)
+
+    def test_create_fails(self):
+        code, _, err = self.create(FakeTools(gh_create_rc=1))
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL release: gh release create exited 1: HTTP 422", err)
+
+
 if __name__ == "__main__":
     unittest.main()

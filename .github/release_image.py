@@ -1,6 +1,7 @@
 """Release steps for the egress-proxy image (release.yml and ci.yml's `image` job): the tag's
-version, the label contract version, and the checks of the built OCI image layout (the
-image labels and NFR-5: no source, tests or credential in anything published).
+version, the label contract version, the build to an OCI image layout and its checks (the
+image labels and NFR-5: no source, tests or credential in anything published), the copy of
+exactly those bytes to the registry, and the GitHub Release.
 
 Stdlib only: it runs in the release job that holds write permissions, which installs
 nothing. Each subcommand prints `ok <step> ...` lines, or `FAIL <step>: <detail>` on stderr
@@ -39,6 +40,8 @@ FORBIDDEN_DIRS = {".git", ".github", "src", "tests", "target"}
 TOKEN_RE = re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}")
 VERSION_RE = re.compile(r"refs/tags/v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))")
 CONTRACT_RE = re.compile(r'^\s+windroc\.egress\.contract:\s*"?(\d+)"?\s*$', re.MULTILINE)
+# skopeo's wording when the tag (or the whole repository) does not exist.
+NOT_FOUND_RE = re.compile(r"manifest unknown|name unknown|not found", re.IGNORECASE)
 
 
 class Fail(Exception):
@@ -198,6 +201,77 @@ def check_layout(root, version, revision, contract):
     return lines
 
 
+def skopeo(command, options, refs, authfile, insecure, tls_flag="--tls-verify=false"):
+    result = ["skopeo", command, *options]
+    if authfile:
+        result += ["--authfile", authfile]
+    if insecure:
+        result.append(tls_flag)
+    return result + refs
+
+
+def registry_index(repo, version, authfile, insecure, step):
+    """The registry's index digest for `repo:version`, or None if the tag does not exist."""
+    result = run(skopeo("inspect", ["--raw"], [f"docker://{repo}:{version}"], authfile, insecure))
+    if result.returncode == 0:
+        return "sha256:" + hashlib.sha256(result.stdout).hexdigest()
+    if NOT_FOUND_RE.search(stderr_text(result)):
+        return None
+    raise Fail(step, f"skopeo inspect exited {result.returncode}: {stderr_text(result)}")
+
+
+def registry_labels(repo, digest, platform, authfile, insecure, step):
+    os_name, arch = platform.split("/")
+    result = run(skopeo("inspect", ["--config", "--override-os", os_name, "--override-arch", arch],
+                        [f"docker://{repo}@{digest}"], authfile, insecure))
+    if result.returncode != 0:
+        raise Fail(step, f"skopeo inspect --config {platform} exited {result.returncode}: {stderr_text(result)}")
+    try:
+        return (json.loads(result.stdout).get("config") or {}).get("Labels") or {}
+    except ValueError:
+        raise Fail(step, f"{repo}@{digest} {platform}: the image config is not JSON") from None
+
+
+def check_registry_labels(repo, digest, want, authfile, insecure, step):
+    """Every platform of `repo@digest` carries the labels in `want` (a platform -> labels map)."""
+    for platform, labels in want.items():
+        have = registry_labels(repo, digest, platform, authfile, insecure, step)
+        for key, value in labels.items():
+            if have.get(key) != value:
+                raise Fail(step, f"{repo}@{digest} {platform}: label {key} is {have.get(key)!r}, want {value!r}")
+
+
+def layout_labels(root):
+    """Each platform's image labels in the layout (which `check` has verified)."""
+    layout = Layout(root)
+    index = json.loads(layout.blob(layout.index_descriptor()))
+    result = {}
+    for descriptor in index.get("manifests", []):
+        config = json.loads(layout.blob(json.loads(layout.blob(descriptor))["config"]))
+        result[platform_of(descriptor)] = (config.get("config") or {}).get("Labels") or {}
+    return result
+
+
+def release_notes(version, contract, digest, revision, repo):
+    return f"""egress-proxy {version}: the multi-arch image, built by CI from this tag's commit.
+
+| | |
+| --- | --- |
+| Version | `{version}` |
+| Label contract | `{contract}` (`docs/label-contract.md`) |
+| Image | `{repo}:{version}` |
+| Index digest | `{digest}` |
+| Platforms | {", ".join(f"`{p}`" for p in PLATFORMS)} |
+| Revision | `{revision}` |
+
+Install and pin by digest, never by the tag:
+
+```
+docker pull {repo}@{digest}
+```
+"""
+
+
 def cmd_version(args):
     match = VERSION_RE.fullmatch(args.ref)
     if not match:
@@ -235,6 +309,76 @@ def cmd_check(args):
         print(line)
 
 
+def cmd_build(args):
+    out = Path(args.out)
+    if out.exists():
+        raise Fail("build", f"{out} already exists")
+    command = ["docker", "buildx", "build", f"--platform={','.join(PLATFORMS)}",
+               "--provenance=false", "--sbom=false"]
+    command += [f"--label={k}={v}" for k, v in image_labels(args.version, args.revision, args.contract).items()]
+    command += [f"--output=type=oci,dest={out},tar=false", str(REPO_ROOT)]
+    # The build log streams to the job log.
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise Fail("build", f"docker buildx build exited {result.returncode}")
+    print(f"ok build {out}")
+
+
+def cmd_existing(args):
+    digest = registry_index(args.repo, args.version, args.authfile, args.insecure, "existing")
+    if digest is None:
+        print("absent")
+        return
+    # Only a run of this same commit may finish the Release (resume); the tag never moves.
+    want = image_labels(args.version, args.revision, args.contract)
+    for platform in PLATFORMS:
+        have = registry_labels(args.repo, digest, platform, args.authfile, args.insecure, "existing")
+        revision = have.get("org.opencontainers.image.revision")
+        if revision != args.revision:
+            raise Fail("existing", f"{args.repo}:{args.version} already published from {revision}")
+        for key, value in want.items():
+            if have.get(key) != value:
+                raise Fail("existing", f"{args.repo}@{digest} {platform}: label {key} is "
+                                       f"{have.get(key)!r}, want {value!r}")
+    print(f"resume {digest}")
+
+
+def cmd_publish(args):
+    ref = f"{args.repo}:{args.version}"
+    want = Layout(args.layout).index_descriptor()["digest"]
+    if registry_index(args.repo, args.version, args.authfile, args.insecure, "publish") is not None:
+        raise Fail("publish", f"{ref} already exists")
+    result = run(skopeo("copy", ["--all", "--preserve-digests"], [f"oci:{args.layout}", f"docker://{ref}"],
+                        args.authfile, args.insecure, "--dest-tls-verify=false"))
+    if result.returncode != 0:
+        raise Fail("publish", f"skopeo copy exited {result.returncode}: {stderr_text(result)}")
+    have = registry_index(args.repo, args.version, args.authfile, args.insecure, "publish")
+    if have != want:
+        raise Fail("publish", f"{ref} is {have}, want {want}")
+    keys = image_labels("", "", "").keys()
+    expected = {p: {k: labels.get(k) for k in keys} for p, labels in layout_labels(args.layout).items()}
+    check_registry_labels(args.repo, want, expected, args.authfile, args.insecure, "publish")
+    print(f"ok publish {ref} {want}")
+
+
+def cmd_release_absent(args):
+    result = run(["gh", "release", "view", args.tag])
+    if result.returncode == 0:
+        raise Fail("release", f"{args.tag} already exists")
+    if "release not found" not in stderr_text(result):
+        raise Fail("release", f"gh release view exited {result.returncode}: {stderr_text(result)}")
+    print(f"ok release {args.tag} does not exist yet")
+
+
+def cmd_release_create(args):
+    tag = f"v{args.version}"
+    notes = release_notes(args.version, args.contract, args.digest, args.revision, args.repo)
+    result = run(["gh", "release", "create", tag, "--verify-tag", "--title", tag, "--notes", notes])
+    if result.returncode != 0:
+        raise Fail("release", f"gh release create exited {result.returncode}: {stderr_text(result)}")
+    print(f"ok release {tag} {args.digest}")
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
@@ -260,6 +404,37 @@ def parser():
     for flag in ("--version", "--revision", "--contract"):
         s.add_argument(flag, required=True)
     s.set_defaults(func=cmd_check)
+
+    s = sub.add_parser("build", help="build both platforms into a new OCI layout directory")
+    for flag in ("--version", "--revision", "--contract", "--out"):
+        s.add_argument(flag, required=True)
+    s.set_defaults(func=cmd_build)
+
+    registry = argparse.ArgumentParser(add_help=False)
+    registry.add_argument("--repo", required=True)
+    registry.add_argument("--version", required=True)
+    registry.add_argument("--authfile")
+    registry.add_argument("--insecure", action="store_true", help="plain-HTTP registry (CI's local one)")
+
+    s = sub.add_parser("existing", parents=[registry],
+                       help="print `absent`, or `resume <digest>` if this commit already published the tag")
+    s.add_argument("--revision", required=True)
+    s.add_argument("--contract", required=True)
+    s.set_defaults(func=cmd_existing)
+
+    s = sub.add_parser("publish", parents=[registry],
+                       help="copy the layout to <repo>:<version> unless the tag exists, then verify it")
+    s.add_argument("layout")
+    s.set_defaults(func=cmd_publish)
+
+    s = sub.add_parser("release-absent", help="fail if the GitHub Release exists")
+    s.add_argument("--tag", required=True)
+    s.set_defaults(func=cmd_release_absent)
+
+    s = sub.add_parser("release-create", help="create the GitHub Release for v<version>")
+    for flag in ("--version", "--contract", "--digest", "--revision", "--repo"):
+        s.add_argument(flag, required=True)
+    s.set_defaults(func=cmd_release_create)
     return p
 
 
