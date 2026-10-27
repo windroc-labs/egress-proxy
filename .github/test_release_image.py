@@ -608,5 +608,74 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("release_image.py check", with_token[0]["run"])
 
 
+def runs(job):
+    return [s.get("run", "") for s in job["steps"]]
+
+
+class ReleaseWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.wf = load("workflows/release.yml")
+        self.jobs = self.wf["jobs"]
+
+    def test_release_gated_on_ci(self):
+        self.assertEqual(self.wf["on"], {"push": {"tags": ["v*"]}})
+        self.assertEqual(self.wf["permissions"], {"contents": "read"})
+        self.assertIs(self.wf["concurrency"]["cancel-in-progress"], False)
+        self.assertTrue(self.wf["concurrency"]["group"].startswith("release-"))
+        self.assertEqual(self.jobs["checks"]["uses"], "./.github/workflows/ci.yml")
+        self.assertEqual(self.jobs["prepare"]["needs"], "checks")
+        self.assertEqual(self.jobs["build"]["needs"], "prepare")
+        self.assertEqual(sorted(self.jobs["publish"]["needs"]), ["build", "prepare"])
+        self.assertIn("needs.prepare.result == 'success'", self.jobs["publish"]["if"])
+        self.assertEqual(set(self.jobs), {"checks", "prepare", "build", "publish"})
+
+    def test_prepare_guards(self):
+        prepare = self.jobs["prepare"]
+        self.assertEqual(prepare["permissions"], {"contents": "read", "packages": "read"})
+        self.assertEqual(prepare["steps"][0]["with"]["fetch-depth"], 0)
+        script = "\n".join(runs(prepare))
+        for command in ("release_image.py version", "release_image.py on-main", "release_image.py contract",
+                        "release_image.py release-absent", "release_image.py existing"):
+            self.assertIn(command, script)
+        self.assertEqual({s["uses"].split("@")[0] for s in prepare["steps"] if "uses" in s}, {"actions/checkout"})
+
+    def test_resume_path(self):
+        self.assertIn("needs.prepare.outputs.state == 'absent'", self.jobs["build"]["if"])
+        self.assertIn("needs.build.result == 'skipped' && needs.prepare.outputs.state == 'resume'",
+                      " ".join(self.jobs["publish"]["if"].split()))
+        for step in self.jobs["publish"]["steps"]:
+            text = step.get("uses", "") + step.get("run", "")
+            if any(k in text for k in ("download-artifact", "release_image.py check", "release_image.py publish")):
+                self.assertEqual(step.get("if"), "needs.prepare.outputs.state == 'absent'", text)
+        create = [s for s in self.jobs["publish"]["steps"] if "release-create" in s.get("run", "")]
+        self.assertEqual(len(create), 1)
+        self.assertNotIn("if", create[0])
+
+    def test_write_job_trust(self):
+        publish = self.jobs["publish"]
+        self.assertEqual(publish["permissions"], {"contents": "write", "packages": "write"})
+        self.assertEqual({s["uses"].split("@")[0] for s in publish["steps"] if "uses" in s},
+                         {"actions/checkout", "actions/download-artifact"})
+        self.assertFalse(any("pip" in r for r in runs(publish)))
+        with_token = [s for s in publish["steps"] if "EGRESS_RELEASE_TOKEN" in step_env(s)]
+        self.assertEqual(len(with_token), 1)
+        self.assertIn("release_image.py check", with_token[0]["run"])
+        build = self.jobs["build"]
+        self.assertEqual(build["permissions"], {"contents": "read"})
+        self.assertIn("./.github/actions/build-image", [s.get("uses") for s in build["steps"]])
+
+    def test_credential_scope(self):
+        for name, job in self.jobs.items():
+            for step in job.get("steps", []):
+                run = step.get("run", "")
+                if "skopeo login" in run:
+                    self.assertIn(name, ("prepare", "publish"))
+                    self.assertLess(run.index("trap 'rm -f \"$auth\"' EXIT"), run.index("skopeo login"), name)
+                    self.assertIn("--password-stdin", run)
+        cleanup = [s for s in self.jobs["publish"]["steps"] if s.get("if") == "always()"]
+        self.assertEqual(len(cleanup), 1)
+        self.assertIn("rm -f", cleanup[0]["run"])
+
+
 if __name__ == "__main__":
     unittest.main()

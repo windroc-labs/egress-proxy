@@ -1,0 +1,167 @@
+# A pushed version tag vX.Y.Z: every CI check (ci.yml, gated on its CI aggregate), then the
+# multi-arch image built and checked in a job without write permissions, published to GHCR
+# as exactly those bytes, and the GitHub Release with the index digest. See README.md ›
+# Release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# One run per tag at a time, never cancelled mid-publish; distinct from ci.yml's group,
+# which the called workflow uses.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/windroc/egress-proxy
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  # Every guard before anything is built or written: a vX.Y.Z tag on a main commit, no
+  # Release yet, and the version not published yet (or published by this commit: resume).
+  prepare:
+    name: prepare
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      revision: ${{ steps.meta.outputs.revision }}
+      contract: ${{ steps.meta.outputs.contract }}
+      state: ${{ steps.existing.outputs.state }}
+      digest: ${{ steps.existing.outputs.digest }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          # origin/main, for the ancestry check.
+          fetch-depth: 0
+      - name: Version, revision and contract; the commit is on main
+        id: meta
+        run: |
+          version=$(python3 -B .github/release_image.py version "$GITHUB_REF")
+          revision=$(git rev-parse HEAD)
+          python3 -B .github/release_image.py on-main "$revision"
+          contract=$(python3 -B .github/release_image.py contract)
+          { echo "version=$version"; echo "revision=$revision"; echo "contract=$contract"; } >>"$GITHUB_OUTPUT"
+      - name: The Release does not exist yet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: python3 -B .github/release_image.py release-absent --tag "v$VERSION"
+      - name: The version is not published yet, or this commit published it (resume)
+        id: existing
+        env:
+          TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          REVISION: ${{ steps.meta.outputs.revision }}
+          CONTRACT: ${{ steps.meta.outputs.contract }}
+        run: |
+          auth=$RUNNER_TEMP/ghcr-auth.json
+          trap 'rm -f "$auth"' EXIT
+          skopeo login --authfile "$auth" --username "$GITHUB_ACTOR" --password-stdin ghcr.io <<<"$TOKEN"
+          result=$(python3 -B .github/release_image.py existing --repo "$IMAGE" --version "$VERSION" \
+            --revision "$REVISION" --contract "$CONTRACT" --authfile "$auth")
+          read -r state digest <<<"$result"
+          { echo "state=$state"; echo "digest=$digest"; } >>"$GITHUB_OUTPUT"
+
+  # Third-party actions and the Rust build run here, with read permissions only.
+  build:
+    name: build
+    needs: prepare
+    if: needs.prepare.outputs.state == 'absent'
+    runs-on: ubuntu-24.04
+    # arm64 builds under QEMU.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: The checkout is the commit prepare checked
+        env:
+          REVISION: ${{ needs.prepare.outputs.revision }}
+        run: test "$(git rev-parse HEAD)" = "$REVISION"
+      - uses: ./.github/actions/build-image
+        with:
+          version: ${{ needs.prepare.outputs.version }}
+          revision: ${{ needs.prepare.outputs.revision }}
+          out: ${{ runner.temp }}/layout
+          scan-token: ${{ github.token }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: layout
+          path: ${{ runner.temp }}/layout
+          retention-days: 1
+          if-no-files-found: error
+
+  # The only job with write permissions: first-party actions, stdlib Python, skopeo and gh.
+  publish:
+    name: publish
+    needs: [prepare, build]
+    if: >-
+      !cancelled() && needs.prepare.result == 'success' &&
+      (needs.build.result == 'success' ||
+      (needs.build.result == 'skipped' && needs.prepare.outputs.state == 'resume'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      REVISION: ${{ needs.prepare.outputs.revision }}
+      CONTRACT: ${{ needs.prepare.outputs.contract }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - if: needs.prepare.outputs.state == 'absent'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: layout
+          path: ${{ runner.temp }}/layout
+      # Every blob is checked against its digest, so what is pushed is what build checked.
+      - name: Check the downloaded layout
+        if: needs.prepare.outputs.state == 'absent'
+        env:
+          EGRESS_RELEASE_TOKEN: ${{ github.token }}
+        run: >-
+          python3 -B .github/release_image.py check "$RUNNER_TEMP/layout" --version "$VERSION"
+          --revision "$REVISION" --contract "$CONTRACT"
+      - name: Publish to GHCR and verify it by digest
+        id: publish
+        if: needs.prepare.outputs.state == 'absent'
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          auth=$RUNNER_TEMP/ghcr-auth.json
+          trap 'rm -f "$auth"' EXIT
+          skopeo login --authfile "$auth" --username "$GITHUB_ACTOR" --password-stdin ghcr.io <<<"$TOKEN"
+          python3 -B .github/release_image.py publish "$RUNNER_TEMP/layout" --repo "$IMAGE" \
+            --version "$VERSION" --authfile "$auth"
+          digest=$(python3 -B .github/release_image.py digest "$RUNNER_TEMP/layout")
+          echo "digest=$digest" >>"$GITHUB_OUTPUT"
+      - name: Create the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DIGEST: ${{ steps.publish.outputs.digest || needs.prepare.outputs.digest }}
+        run: >-
+          python3 -B .github/release_image.py release-create --version "$VERSION"
+          --contract "$CONTRACT" --digest "$DIGEST" --revision "$REVISION" --repo "$IMAGE"
+      - name: Remove the registry credential
+        if: always()
+        run: rm -f "$RUNNER_TEMP/ghcr-auth.json"
