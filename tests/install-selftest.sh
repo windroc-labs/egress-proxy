@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Self-test of the installer, install.sh (CI `lint` job): runs the unmodified script, and
-# the start.sh it installs, against a fake `docker` (and fake `cp`, `mv` and `sleep`
-# that only add the hooks the kill tests need) on PATH, so no Docker daemon, registry or
-# credential is ever reached: DOCKER_HOST points at a socket that does not exist.
+# Self-test of the install entry, egress-install, and the installer, install.sh (CI `lint`
+# job): runs the unmodified scripts, and the start.sh the installer installs, against a
+# fake `docker` and `gh` (and fake `cp`, `mv` and `sleep` that only add the hooks the kill
+# tests need) on PATH, so no Docker daemon, registry or credential is ever reached:
+# DOCKER_HOST points at a socket that does not exist.
 # Prints `ok <case>` or `FAIL <case>: <detail>`; exits 1 if any case fails.
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -32,6 +33,11 @@ export REAL_CP REAL_MV
 #   health         the container's health (default healthy)
 #   up_fails       `compose up` fails
 #   block_start    start.sh's first docker call blocks on the hold fifo
+#   image_missing  `image inspect` of the image fails, until a pull succeeds
+#   pull_err       the pull fails with this error; pull_config, helper_out and
+#                  token_files record its client config, what the credential helper
+#                  answered and the files under TMPDIR holding the token
+#   egress/        the image's /egress, as `docker cp` copies it
 cat >"$work/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -43,6 +49,7 @@ block() {
 }
 case $1 in
   image)
+    [[ ! -f $FAKE/image_missing ]] || exit 1
     if [[ $3 == --format ]]; then
       cat "$FAKE/label" 2>/dev/null || echo "<no value>"
     elif [[ -f $FAKE/block_start ]]; then
@@ -64,6 +71,23 @@ case $1 in
       if [[ $4 == *EnableIPv6* ]]; then echo "false false"; else echo true; fi
     fi
     ;;
+  pull)
+    rm -rf "$FAKE/pull_config"
+    "$REAL_CP" -R "$DOCKER_CONFIG" "$FAKE/pull_config"
+    if grep -qF '"credHelpers":{"ghcr.io":"egress-gh"}' "$DOCKER_CONFIG/config.json"; then
+      echo ghcr.io | docker-credential-egress-gh get >"$FAKE/helper_out"
+    fi
+    grep -rlF "$FAKE_TOKEN" "$TMPDIR" >"$FAKE/token_files" 2>/dev/null || true
+    if [[ -f $FAKE/pull_err ]]; then
+      cat "$FAKE/pull_err" >&2
+      exit 1
+    fi
+    rm -f "$FAKE/image_missing"
+    echo "$3"
+    ;;
+  create) echo cid1 ;;
+  cp) "$REAL_CP" -R "$FAKE/egress/." "$3" ;;
+  context) echo my-context ;;
   compose)
     if [[ " $* " == *" up "* ]]; then
       [[ ! -f $FAKE/up_fails ]] || exit 1
@@ -93,6 +117,18 @@ if [[ -f $FAKE/block_mv && $* == *.runtime.tmp.* ]]; then
 fi
 exec "$REAL_MV" "$@"
 FAKE
+# The fake gh: logged in to github.com, unless gh_logged_out; gh_calls logs every call.
+export FAKE_TOKEN=gho_SELFTESTselftestSELFTESTselftest0123
+cat >"$work/bin/gh" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE/gh_calls"
+[[ ! -f $FAKE/gh_logged_out ]] || exit 1
+case "$1 $2" in
+  "auth token") printf '%s\n' "$FAKE_TOKEN" ;;
+  "api user") echo octo ;;
+esac
+FAKE
+chmod +x "$work/bin/gh"
 # The installer's health wait polls 60 times, 2 s apart: no waiting here.
 printf '#!/usr/bin/env bash\nexit 0\n' >"$work/fast/sleep"
 chmod +x "$work/bin/docker" "$work/bin/cp" "$work/bin/mv" "$work/fast/sleep"
@@ -343,5 +379,120 @@ install 1.0.0 a
 is "$rc" 0 || bad+="the next install: exit $rc: $(out); "
 bad+=$(complete_set 1.0.0)
 check killed_first_install "$bad" "$(st is "$bad" "")"
+
+# -------- egress-install --------
+# The image's installer, for these cases: records its arguments, exits install_rc.
+mkdir -p "$FAKE/egress" "$work/tmpdir"
+cat >"$FAKE/egress/install.sh" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >"$FAKE/handoff"
+exit "$(cat "$FAKE/install_rc" 2>/dev/null || echo 0)"
+FAKE
+# bootstrap <version> <digest> [args...]: runs egress-install into $dir with TMPDIR
+# $work/tmpdir; stdout in $work/out, stderr in $work/err, exit code in $rc.
+bootstrap() {
+  rc=0
+  TMPDIR=$work/tmpdir PATH="$work/fast:$work/bin:$PATH" bash "$repo/egress-install" --version "$1" \
+    --digest "$2" --dir "$dir" "${@:3}" >"$work/out" 2>"$work/err" || rc=$?
+}
+err() { cat "$work/err"; }
+reset() {
+  dir=$work/egress-$1
+  rm -rf "$FAKE/pull_config"
+  rm -f "$FAKE"/{image_missing,pull_err,gh_logged_out,handoff,helper_out,gh_calls,calls,token_files,install_rc}
+}
+D=$(digest e)
+IMG=$REPO@$D
+# no_temp: egress-install left nothing in TMPDIR.
+no_temp() { is "$(find "$work/tmpdir" -mindepth 1 -print)" ""; }
+
+reset bs_usage
+bootstrap 1.0 "$D"
+check bs_usage "exit $rc: $(err)" "$(st is "$rc $(err)" "2 usage: egress-install --version X.Y.Z --digest sha256:<64 hex> [--dir <path>]")"
+bootstrap 1.0.0 sha256:abc
+is "$rc" 2 || fail bs_usage "a short digest: exit $rc"
+
+reset present_no_gh
+bootstrap 1.0.0 "$D"
+want="--interface 1 --version 1.0.0 --digest $D --dir $dir --image $IMG --files $work/tmpdir/"
+bad=""
+is "$rc" 0 || bad+="exit $rc: $(err); "
+like "$(cat "$FAKE/handoff" 2>/dev/null)" "$want" || bad+="handoff: $(cat "$FAKE/handoff" 2>/dev/null); "
+is "$(grep -c ' pull ' "$FAKE/calls" || true)" 0 || bad+="it pulled; "
+[[ ! -f $FAKE/gh_calls ]] || bad+="it called gh: $(cat "$FAKE/gh_calls"); "
+no_temp || bad+="temp files left"
+check present_no_gh "$bad" "$(st is "$bad" "")"
+
+reset handoff_exit
+echo 6 >"$FAKE/install_rc"
+bootstrap 1.0.0 "$D"
+check handoff_exit "exit $rc" "$(st is "$rc" 6)"
+
+reset gh_helper
+touch "$FAKE/image_missing"
+mkdir -p "$DOCKER_CONFIG/contexts"
+bootstrap 1.0.0 "$D"
+bad=""
+is "$rc" 0 || bad+="exit $rc: $(err); "
+is "$(cat "$FAKE/pull_config/config.json" 2>/dev/null)" '{"currentContext":"my-context","credHelpers":{"ghcr.io":"egress-gh"}}' ||
+  bad+="config.json: $(cat "$FAKE/pull_config/config.json" 2>/dev/null); "
+is "$(readlink "$FAKE/pull_config/contexts")" "$DOCKER_CONFIG/contexts" || bad+="contexts not kept; "
+is "$(cat "$FAKE/helper_out" 2>/dev/null)" "{\"ServerURL\":\"ghcr.io\",\"Username\":\"octo\",\"Secret\":\"$FAKE_TOKEN\"}" ||
+  bad+="helper answered: $(cat "$FAKE/helper_out" 2>/dev/null); "
+is "$(cat "$FAKE/token_files")" "" || bad+="token in files under TMPDIR: $(cat "$FAKE/token_files"); "
+grep -rqF "$FAKE_TOKEN" "$FAKE/pull_config" && bad+="token in the pull's client config; "
+like "$(out)$(err)" "$FAKE_TOKEN" && bad+="token in the output; "
+like "$(cat "$FAKE/handoff" 2>/dev/null)" "--image $IMG " || bad+="no handoff after the pull; "
+no_temp || bad+="temp files left"
+check gh_helper "$bad" "$(st is "$bad" "")"
+rmdir "$DOCKER_CONFIG/contexts"
+
+reset gh_helper_other_registry
+touch "$FAKE/image_missing"
+EGRESS_IMAGE_REPO=localhost:5000/egress-proxy bootstrap 1.0.0 "$D"
+bad=""
+is "$rc" 0 || bad+="exit $rc: $(err); "
+is "$(cat "$FAKE/pull_config/config.json" 2>/dev/null)" '{"currentContext":"my-context"}' ||
+  bad+="config.json: $(cat "$FAKE/pull_config/config.json" 2>/dev/null); "
+[[ ! -f $FAKE/gh_calls ]] || bad+="it called gh: $(cat "$FAKE/gh_calls"); "
+like "$(cat "$FAKE/handoff" 2>/dev/null)" "--image localhost:5000/egress-proxy@$D " || bad+="handoff: $(cat "$FAKE/handoff" 2>/dev/null)"
+check gh_helper_other_registry "$bad" "$(st is "$bad" "")"
+
+reset no_access
+touch "$FAKE/image_missing" "$FAKE/gh_logged_out"
+echo "Error response from daemon: Head \"https://ghcr.io/v2/windroc/egress-proxy/manifests/$D\": denied" >"$FAKE/pull_err"
+bootstrap 1.0.0 "$D"
+want="egress-install: no access to $REPO: needs a GitHub login (gh auth login) whose account can read the package $REPO, with scope read:packages (gh auth refresh -h github.com -s read:packages); nothing was changed"
+bad=""
+is "$rc $(err)" "3 $want" || bad+="exit $rc: $(err); "
+gone "$dir" || bad+="$dir was created; "
+[[ ! -f $FAKE/handoff ]] || bad+="the installer ran; "
+no_temp || bad+="temp files left"
+check no_access "$bad" "$(st is "$bad" "")"
+
+reset pull_fails
+touch "$FAKE/image_missing"
+echo "Error response from daemon: Get \"https://ghcr.io/v2/\": dial tcp: lookup ghcr.io: no such host" >"$FAKE/pull_err"
+bootstrap 1.0.0 "$D"
+bad=""
+is "$rc" 4 || bad+="exit $rc; "
+like "$(err)" "egress-install: cannot pull $IMG from registry ghcr.io (Error response from daemon: Get" || bad+="$(err); "
+like "$(err)" "nothing was changed and the running proxy, if any, keeps running" || bad+="$(err); "
+gone "$dir" || bad+="$dir was created; "
+[[ ! -f $FAKE/handoff ]] || bad+="the installer ran; "
+no_temp || bad+="temp files left"
+check pull_fails "$bad" "$(st is "$bad" "")"
+
+reset pull_fails_digest_401
+D401=sha256:$(printf '401403%058d' 0)
+touch "$FAKE/image_missing"
+echo "Error response from daemon: Get \"https://ghcr.io/v2/windroc/egress-proxy/manifests/$D401\": net/http: TLS handshake timeout" >"$FAKE/pull_err"
+bootstrap 1.0.0 "$D401"
+check pull_fails_digest_401 "exit $rc: $(err)" "$(st like "$rc $(err)" "4 egress-install: cannot pull $REPO@$D401 from registry ghcr.io")"
+
+reset no_installer
+rm "$FAKE/egress/install.sh"
+bootstrap 1.0.0 "$D"
+check no_installer "exit $rc: $(err)" "$(st is "$rc $(err)" "5 egress-install: $IMG has no installer (/egress/install.sh)")"
 
 exit "$status"

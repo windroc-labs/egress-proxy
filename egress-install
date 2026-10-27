@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# egress-install --version X.Y.Z --digest sha256:<64 hex> [--dir <path>]
+#
+# The egress proxy's install entry (README.md, Setup): installs or reinstalls the
+# published image ghcr.io/windroc/egress-proxy@<digest> into <dir> (default ~/.egress).
+# It only gets the image and hands over to the installer the image ships
+# (/egress/install.sh, interface 1); everything else happens there.
+#
+# 1. The image already on this machine (by digest): no network, GitHub or registry.
+# 2. Else it is pulled by digest, never by tag. For ghcr.io the pull uses this machine's
+#    GitHub login (`gh`, scope read:packages) through a credential helper that asks gh
+#    at pull time, in a throwaway Docker client config: the token is never written to a
+#    file or printed, and the user's Docker login is left alone. Without a gh login, or
+#    for another registry (EGRESS_IMAGE_REPO, tests only), the pull is anonymous.
+# 3. Its /egress files are copied out (docker create, docker cp) and its install.sh runs.
+#
+# Steps 1-3 change nothing outside a temp directory, removed on exit: a failure there
+# leaves <dir> and the running proxy as they were.
+#
+# Exit codes: 0 installed; 2 usage, or no Docker context; 3 no access to the image; 4 the
+# pull failed; 5 the image has no installer; other: the installer's (install.sh).
+#
+# Callers may ship a copy of this file: keep its arguments and its handoff to install.sh
+# (interface 1) stable. Runs on macOS's bash 3.2 and on Linux.
+set -euo pipefail
+
+usage() {
+  echo "usage: egress-install --version X.Y.Z --digest sha256:<64 hex> [--dir <path>]" >&2
+  exit 2
+}
+
+version="" digest="" dir=${HOME:-}/.egress
+while (($# > 0)); do
+  (($# >= 2)) || usage
+  case $1 in
+    --version) version=$2 ;;
+    --digest) digest=$2 ;;
+    --dir) dir=$2 ;;
+    *) usage ;;
+  esac
+  shift 2
+done
+[[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
+[[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || usage
+[[ -n $dir && $dir != /.egress ]] || usage
+
+repo=${EGRESS_IMAGE_REPO:-ghcr.io/windroc/egress-proxy}
+image=$repo@$digest
+registry=${repo%%/*}
+
+tmp=$(mktemp -d)
+cid=""
+cleanup() {
+  if [[ -n $cid ]]; then docker rm -f "$cid" >/dev/null 2>&1 || true; fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+# -------- The image --------
+if ! docker image inspect "$image" >/dev/null 2>&1; then
+  # The pull's own client config: the user's contexts (with their TLS material), the
+  # current context, no stored credential, and for ghcr.io the gh helper.
+  if ! context=$(docker context show 2>/dev/null) || [[ -z $context ]]; then
+    echo "egress-install: cannot read the current Docker context" >&2
+    exit 2
+  fi
+  user_config=${DOCKER_CONFIG:-$HOME/.docker}
+  mkdir -p "$tmp/docker" "$tmp/bin"
+  if [[ -d $user_config/contexts ]]; then ln -s "$user_config/contexts" "$tmp/docker/contexts"; fi
+  helpers=""
+  if [[ $registry == ghcr.io ]] && gh auth token --hostname github.com >/dev/null 2>&1; then
+    # It holds no token: it asks gh each time docker asks it, and prints the answer only
+    # to docker, with the printf builtin (no heredoc, temp file or argv).
+    cat >"$tmp/bin/docker-credential-egress-gh" <<'HELPER'
+#!/usr/bin/env bash
+set -euo pipefail
+case ${1:-} in
+  get)
+    login=$(gh api user --jq .login)
+    token=$(gh auth token --hostname github.com)
+    printf '{"ServerURL":"ghcr.io","Username":"%s","Secret":"%s"}\n' "$login" "$token"
+    ;;
+  list) printf '{}\n' ;;
+esac
+HELPER
+    chmod 0700 "$tmp/bin/docker-credential-egress-gh"
+    helpers=',"credHelpers":{"ghcr.io":"egress-gh"}'
+  fi
+  printf '{"currentContext":"%s"%s}\n' "$context" "$helpers" >"$tmp/docker/config.json"
+
+  if ! PATH="$tmp/bin:$PATH" DOCKER_CONFIG=$tmp/docker docker pull -q "$image" >/dev/null 2>"$tmp/pull.err"; then
+    # Judge docker's error without the image ref: a digest may contain 401 or 403.
+    err=$(cat "$tmp/pull.err")
+    err=${err//"$image"/}
+    err=${err//"${digest#sha256:}"/}
+    if grep -qiE 'unauthorized|denied|forbidden|authentication required|error getting credentials|(^|[^0-9])40[13]([^0-9]|$)' <<<"$err"; then
+      echo "egress-install: no access to $repo: needs a GitHub login (gh auth login) whose account can read the package $repo, with scope read:packages (gh auth refresh -h github.com -s read:packages); nothing was changed" >&2
+      exit 3
+    fi
+    last=$(grep -v '^[[:space:]]*$' "$tmp/pull.err" | tail -n 1 || true)
+    echo "egress-install: cannot pull $image from registry $registry (${last:-no error message}); nothing was changed and the running proxy, if any, keeps running" >&2
+    exit 4
+  fi
+fi
+
+# -------- Its files, and its installer --------
+cid=$(docker create --pull never "$image")
+mkdir "$tmp/files"
+docker cp "$cid:/egress/." "$tmp/files" >/dev/null 2>&1 || true
+docker rm -f "$cid" >/dev/null 2>&1 || true
+cid=""
+if [[ ! -f $tmp/files/install.sh ]]; then
+  echo "egress-install: $image has no installer (/egress/install.sh)" >&2
+  exit 5
+fi
+
+# Its exit code is this script's (set -e); the EXIT trap still removes the temp files.
+bash "$tmp/files/install.sh" --interface 1 --version "$version" --digest "$digest" --dir "$dir" \
+  --image "$image" --files "$tmp/files"
