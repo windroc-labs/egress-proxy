@@ -62,6 +62,7 @@ jobs:
       - name: compose files are valid
         env:
           EGRESS_CONFIG_DIR: ${{ runner.temp }}
+          EGRESS_IMAGE: egress-proxy
         run: docker compose -f compose.yaml config -q
 
   integration:
