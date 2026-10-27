@@ -330,6 +330,7 @@ failed() {
   fi
   [[ ${EGRESS_INSTALL_ROLLBACK:-} != 1 && -n $rb_digest ]] || exit "$code"
   entry=$state/$rb_runtime/egress-install
+  # Safe: an entry only gets the image; that version's own install.sh runs, over interface 1.
   [[ -n $rb_runtime && -f $entry ]] || entry=$files/egress-install
   echo "install.sh: rolling back to egress-proxy $rb_version ($rb_digest)" >&2
   # This version's rules file: the previous start.sh rewrites it, or (before S4) has none.

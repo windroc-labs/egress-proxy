@@ -7,7 +7,8 @@
 # every call and refuses any build. <registry container> is the registry's container,
 # stopped to take the registry offline, then started again for the upgrades: images built
 # FROM the installed one with other version labels, one never healthy, pushed there.
-# Linux CI only: it starts the proxy and its networks. Prints `ok <check>` per check and stops at the first `FAIL <check>: <detail>`.
+# Linux CI only: it starts the proxy and its networks. Prints `ok <check>` per check and
+# stops at the first `FAIL <check>: <detail>`.
 set -euo pipefail
 
 if [[ $(uname -s) != Linux ]]; then

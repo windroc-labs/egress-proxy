@@ -11,7 +11,11 @@
 #    GitHub login (`gh`, scope read:packages) through a credential helper that asks gh
 #    at pull time, in a throwaway Docker client config: the token is never written to a
 #    file or printed, and the user's Docker login is left alone. Without a gh login, or
-#    for another registry (EGRESS_IMAGE_REPO, tests only), the pull is anonymous.
+#    for another registry, the pull is anonymous.
+#
+# EGRESS_IMAGE_REPO (default ghcr.io/windroc/egress-proxy) is the repo pulled from, and
+# part of the handoff: install.sh's rollback runs the previous version's egress-install
+# with the repo of that version's recorded image. Tests set it to a local registry.
 # 3. Its /egress files are copied out (docker create, docker cp) and its install.sh runs.
 #
 # Steps 1-3 change nothing outside a temp directory, removed on exit: a failure there
