@@ -215,8 +215,7 @@ chmod 0644 "$new/README.md"
 } >"$new/digest"
 
 # -------- Switch --------
-# values <file>: a runtime set data file's values, its lines not starting with # (an older
-# version's set has no header).
+# values <file>: a runtime set data file's values, its lines not starting with #.
 values() { sed '/^#/d' "$1"; }
 # replace <src> <dst>: renames <src> over <dst> in one rename(2), also when <dst> is a
 # symlink to a directory (GNU mv -T, BSD mv -h).
@@ -236,6 +235,7 @@ link_top() {
 }
 old_links=""
 [[ -n $active && -f $state/runtime/links ]] && old_links=$(values "$state/runtime/links")
+new_links=$(values "$new/links")
 # Names the active set also has resolve into whichever set is active: link them first.
 for f in $LINKS; do
   if grep -qxF "$f" <<<"$old_links"; then link_top "$f"; fi
@@ -245,7 +245,7 @@ replace "$state/.runtime.tmp.$$" "$state/runtime"
 for f in $LINKS; do link_top "$f"; done
 # A name only the old set had would now dangle.
 for f in $old_links; do
-  grep -qxF "$f" <<<"$(values "$new/links")" && continue
+  grep -qxF "$f" <<<"$new_links" && continue
   if [[ -L $dir/$f && $(readlink "$dir/$f") == state/runtime/* ]]; then rm -f "$dir/$f"; fi
 done
 

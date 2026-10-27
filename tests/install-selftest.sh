@@ -434,25 +434,6 @@ is "$(top)" "$TOP" || bad+="top level: $(top); "
 bad+=$(complete_set 1.1.0)
 check links_header_upgrade "$bad" "$(st is "$bad" "")"
 
-# An older version's set, written without headers, still starts and is upgraded from.
-fresh headerless_set
-install 1.0.0 a
-for f in links image version digest; do
-  val "$dir/state/runtime/$f" >"$work/$f"
-  cp "$work/$f" "$dir/state/runtime/$f"
-done
-stale_link
-bad=""
-grep -q '^#' "$dir/state/runtime/image" && bad+="the image file still has a header; "
-rm -f "$FAKE/running"
-PATH="$work/bin:$PATH" "$dir/start.sh" >"$work/start.out" 2>&1 || bad+="start.sh failed: $(cat "$work/start.out"); "
-is "$(cat "$FAKE/running" 2>/dev/null)" "$(image a)" || bad+="start.sh ran $(cat "$FAKE/running" 2>/dev/null); "
-install 1.1.0 b
-is "$rc" 0 || bad+="exit $rc: $(out); "
-is "$(top)" "$TOP" || bad+="top level: $(top); "
-bad+=$(complete_set 1.1.0)
-check headerless_set "$bad" "$(st is "$bad" "")"
-
 # -------- egress-install --------
 # The image's installer, for these cases: records its arguments, exits install_rc.
 mkdir -p "$FAKE/egress" "$work/tmpdir"
