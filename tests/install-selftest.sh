@@ -394,7 +394,7 @@ top_level=$( (cd "$dir" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | sor
 is "$top_level" "README.md config.example.yaml config.local.yaml effective-policy.txt start.sh state verify-egress" ||
   bad+="top level: $top_level; "
 is "$(find "$dir/state" -maxdepth 1 -name '.effective-policy.txt.*' | wc -l | tr -d ' ')" 1 ||
-  bad+="state/: $(ls -A "$dir/state" | xargs); "
+  bad+="state/: $( (cd "$dir/state" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | sort | xargs)); "
 check rules_killed "$bad" "$(st is "$bad" "")"
 rm -f "$dir"/.effective-policy.txt.* "$dir/state"/.effective-policy.txt.* "$dir/state"/.rules.err.*
 
