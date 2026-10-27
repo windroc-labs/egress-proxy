@@ -622,6 +622,31 @@ rolled_back rollback_s3_entry 11 1.1.0 b \
 gone "$dir/effective-policy.txt" || fail rollback_s3_entry "1.1.0's rules file is left: $(sed -n 2p "$dir/effective-policy.txt")"
 grep -qF "egress-proxy 1.0.0, image" "$dir/README.md" || fail rollback_s3_entry "README.md is not 1.0.0's"
 
+# The previous version's runtime set has no egress-install: the rollback runs this image's
+# own, handing it the repo of the recorded image, the previous version, digest and dir.
+fb=$work/fallback-files
+mkdir -p "$fb"
+"$REAL_CP" -p "$files"/* "$fb/"
+cat >"$fb/egress-install" <<'ENTRY'
+#!/usr/bin/env bash
+echo "EGRESS_IMAGE_REPO=$EGRESS_IMAGE_REPO EGRESS_INSTALL_ROLLBACK=$EGRESS_INSTALL_ROLLBACK $*" >"$FAKE/entry_call"
+ENTRY
+fresh rollback_entry_fallback
+rm -f "$FAKE/entry_call"
+echo 1.0.0 >"$FAKE/label"
+rc=0
+PATH="$work/fast:$work/bin:$PATH" bash "$files/install.sh" --interface 1 --version 1.0.0 --digest "$(digest a)" \
+  --dir "$dir" --image "localhost:5000/egress-proxy@$(digest a)" --files "$files" >"$work/out" 2>&1 || rc=$?
+is "$rc" 0 || fail rollback_entry_fallback "the 1.0.0 install: exit $rc: $(out)"
+rm "$dir/state/$(record current_runtime)/egress-install"
+echo 1.1.0 >"$FAKE/label"
+echo starting >"$FAKE/health.$(digest b)"
+rc=0
+PATH="$work/fast:$work/bin:$PATH" bash "$fb/install.sh" --interface 1 --version 1.1.0 --digest "$(digest b)" \
+  --dir "$dir" --image "$(image b)" --files "$fb" >"$work/out" 2>&1 || rc=$?
+check rollback_entry_fallback "exit $rc: $(cat "$FAKE/entry_call" 2>/dev/null): $(out)" "$(st is "$rc $(cat "$FAKE/entry_call" 2>/dev/null)" \
+  "11 EGRESS_IMAGE_REPO=localhost:5000/egress-proxy EGRESS_INSTALL_ROLLBACK=1 --version 1.0.0 --digest $(digest a) --dir $dir")"
+
 fresh format
 install 1.0.0 a
 sed 's/^format=1$/format=2/' "$dir/state/installed" >"$work/record.2"
