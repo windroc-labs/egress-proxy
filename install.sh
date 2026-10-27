@@ -34,13 +34,22 @@
 # option takes exactly one value; later interfaces add only optional options; unknown
 # options are ignored with a warning. EGRESS_INSTALL_ROLLBACK=1 in the environment (which
 # egress-install passes on) marks a rollback: install the given version, newer running
-# proxy or not; older installers ignore it. Exit codes, shared with egress-install: 0
-# installed, or a newer running proxy kept; 1 other failure; 2 usage; 5 the image is not
-# that version, or has no contract label; 6 not healthy within 120 s, 7 start.sh failed,
-# each with no previous version to roll back to (or in a rollback): this one is left as
-# it is; 8 unsupported interface; 9 not healthy, and the rollback failed too; 10 the
-# running proxy serves another label contract, nothing changed; 11 not healthy, rolled
-# back to the previous version, which is healthy. (3 and 4 are egress-install's.)
+# proxy or not; older installers ignore it.
+#
+# Exit codes, shared with egress-install (3 and 4 are egress-install's):
+#   0   installed, or a newer running proxy kept
+#   1   other failure
+#   2   usage
+#   5   the image is not that version, or has no contract label
+#   6   not healthy within 120 s, with no previous version to roll back to (or in a
+#       rollback): this one is left as it is
+#   7   start.sh failed, with no previous version to roll back to (or in a rollback):
+#       this one is left as it is
+#   8   unsupported interface
+#   9   did not start or was not healthy, and the rollback failed too
+#   10  the running proxy serves another label contract, nothing changed
+#   11  did not start or was not healthy, rolled back to the previous version, which is
+#       healthy
 #
 # Runs on macOS's bash 3.2 and on Linux.
 set -euo pipefail
