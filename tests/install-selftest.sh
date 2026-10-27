@@ -47,6 +47,7 @@ export REAL_CP REAL_CHMOD REAL_MV
 #   cp_fails       `docker cp` fails
 #   rules          what `proxy rules` prints (default: RULES below)
 #   rules_fail     `proxy rules` fails as a proxy that has not started does
+#   rules_block    `proxy rules` blocks on the hold fifo
 cat >"$work/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -109,6 +110,7 @@ case $1 in
       [[ ! -f $FAKE/up_fails ]] || exit 1
       echo "$EGRESS_IMAGE" >"$FAKE/running"
     elif [[ " $* " == *" /proxy rules "* ]]; then
+      [[ ! -f $FAKE/rules_block ]] || block
       if [[ -f $FAKE/rules_fail ]]; then
         echo "proxy: not started: x" >&2
         exit 1
@@ -367,6 +369,34 @@ is "$(rules_body)" "No rules reported within 30 s of this start: not started: x.
 [[ $(sed -n 2p "$rules") =~ $time_re ]] || bad+="line 2: $(sed -n 2p "$rules"); "
 is "$(grep -c '/proxy rules' "$FAKE/calls" || true)" 30 || bad+="$(grep -c '/proxy rules' "$FAKE/calls" || true) tries, want 30; "
 check rules_unavailable "$bad" "$(st is "$bad" "")"
+
+# A start killed while it waits for the rules (no EXIT trap runs) leaves its temp file in
+# state/, not in the top level (FR-15).
+touch "$FAKE/rules_block"
+rm -f "$FAKE/blocked"
+PATH="$work/bin:$PATH" "$dir/start.sh" >"$work/out" 2>&1 &
+pid=$!
+for ((i = 0; i < 100; i++)); do
+  [[ -f $FAKE/blocked ]] && break
+  sleep 0.1
+done
+kill -9 "$pid" 2>/dev/null || true
+wait "$pid" 2>/dev/null || true
+rm -f "$FAKE/rules_block"
+bad=""
+if [[ -f $FAKE/blocked ]]; then
+  echo >"$FAKE/hold"
+  sleep 0.3
+else
+  bad+="start.sh never asked for the rules: $(out); "
+fi
+top_level=$( (cd "$dir" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | sort | xargs))
+is "$top_level" "README.md config.example.yaml config.local.yaml effective-policy.txt start.sh state verify-egress" ||
+  bad+="top level: $top_level; "
+is "$(find "$dir/state" -maxdepth 1 -name '.effective-policy.txt.*' | wc -l | tr -d ' ')" 1 ||
+  bad+="state/: $(ls -A "$dir/state" | xargs); "
+check rules_killed "$bad" "$(st is "$bad" "")"
+rm -f "$dir"/.effective-policy.txt.* "$dir/state"/.effective-policy.txt.* "$dir/state"/.rules.err.*
 
 # An existing install is left as it was by a refused argument or image.
 before=$(tree)

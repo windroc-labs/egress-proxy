@@ -130,9 +130,10 @@ fi
 # The rules in effect (README.md › Policy), from the running proxy's start facts. A proxy
 # that has not reported them within 30 s (it failed to start, is still starting, or runs
 # a policy other than the config's) gets a rules file that says so; the exit code stays
-# as above.
+# as above. The temp files are in state/, so a killed start leaves the top level as
+# README.md › Setup lists it.
 rules_file=$config_dir/effective-policy.txt
-rules_tmp=$(mktemp "$config_dir/.effective-policy.txt.XXXXXX")
+rules_tmp=$(mktemp "$config_dir/state/.effective-policy.txt.XXXXXX")
 rules_err=$(mktemp "$config_dir/state/.rules.err.XXXXXX")
 trap 'rm -f "$tmp" "$rules_tmp" "$rules_err"' EXIT
 version=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image" 2>/dev/null) ||
