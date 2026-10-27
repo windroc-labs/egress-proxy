@@ -4,4 +4,6 @@
 shipped them in the image's `/egress`: the first installer of interface 1, written before
 the rules file (S4) and the rollback (S5). `tests/install-selftest.sh` case
 `rollback_s3_entry` installs them as the previous version's image, to check that a newer
-installer rolls back through an older version's install entry (NFR-6). Never edit them.
+installer rolls back through an older version's install entry (NFR-6). Never edit them,
+beyond `egress-install`'s image name, moved to `ghcr.io/windroc-labs/egress-proxy` with
+the repo (WDRC-334).

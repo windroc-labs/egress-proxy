@@ -2,7 +2,8 @@
 # egress-install --version X.Y.Z --digest sha256:<64 hex> [--dir <path>]
 #
 # The egress proxy's install entry (README.md, Setup): installs or reinstalls the
-# published image ghcr.io/windroc/egress-proxy@<digest> into <dir> (default ~/.egress).
+# published image ghcr.io/windroc-labs/egress-proxy@<digest> into <dir>
+# (default ~/.egress).
 # It only gets the image and hands over to the installer the image ships
 # (/egress/install.sh, interface 1); everything else happens there.
 #
@@ -17,8 +18,8 @@
 # Steps 1-3 change nothing outside a temp directory, removed on exit: a failure there
 # leaves <dir> and the running proxy as they were.
 #
-# EGRESS_IMAGE_REPO (default ghcr.io/windroc/egress-proxy) is the repo pulled from, and
-# part of the handoff: install.sh's rollback runs the previous version's egress-install
+# EGRESS_IMAGE_REPO (default ghcr.io/windroc-labs/egress-proxy) is the repo pulled from,
+# and part of the handoff: install.sh's rollback runs the previous version's egress-install
 # with the repo of that version's recorded image. Tests set it to a local registry.
 #
 # Exit codes: 0 installed; 1 another failure (e.g. copying the image's files); 2 usage, or
@@ -49,7 +50,7 @@ done
 [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || usage
 [[ -n $dir && $dir != /.egress ]] || usage
 
-repo=${EGRESS_IMAGE_REPO:-ghcr.io/windroc/egress-proxy}
+repo=${EGRESS_IMAGE_REPO:-ghcr.io/windroc-labs/egress-proxy}
 image=$repo@$digest
 registry=${repo%%/*}
 

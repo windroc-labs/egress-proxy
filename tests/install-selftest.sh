@@ -227,7 +227,7 @@ for f in start.sh verify-egress compose.yaml config.example.yaml config.default.
   fi
 done
 
-REPO=ghcr.io/windroc/egress-proxy
+REPO=ghcr.io/windroc-labs/egress-proxy
 # digest <char>: a digest of 64 times <char>.
 digest() { printf 'sha256:%s' "$(printf "%064d" 0 | tr 0 "$1")"; }
 image() { echo "$REPO@$(digest "$1")"; }
@@ -1272,7 +1272,7 @@ check gh_helper_other_registry "$bad" "$(st is "$bad" "")"
 
 reset no_access
 touch "$FAKE/image_missing" "$FAKE/gh_logged_out"
-echo "Error response from daemon: Head \"https://ghcr.io/v2/windroc/egress-proxy/manifests/$D\": denied" >"$FAKE/pull_err"
+echo "Error response from daemon: Head \"https://ghcr.io/v2/windroc-labs/egress-proxy/manifests/$D\": denied" >"$FAKE/pull_err"
 bootstrap 1.0.0 "$D"
 want="egress-install: no access to $REPO: needs a GitHub login (gh auth login) whose account can read the package $REPO, with scope read:packages (gh auth refresh -h github.com -s read:packages); nothing was changed"
 bad=""
@@ -1298,7 +1298,7 @@ check pull_fails "$bad" "$(st is "$bad" "")"
 reset pull_fails_digest_401
 D401=sha256:$(printf '401403%058d' 0)
 touch "$FAKE/image_missing"
-echo "Error response from daemon: Get \"https://ghcr.io/v2/windroc/egress-proxy/manifests/$D401\": net/http: TLS handshake timeout" >"$FAKE/pull_err"
+echo "Error response from daemon: Get \"https://ghcr.io/v2/windroc-labs/egress-proxy/manifests/$D401\": net/http: TLS handshake timeout" >"$FAKE/pull_err"
 bootstrap 1.0.0 "$D401"
 check pull_fails_digest_401 "exit $rc: $(err)" "$(st like "$rc $(err)" "4 egress-install: cannot pull $REPO@$D401 from registry ghcr.io")"
 

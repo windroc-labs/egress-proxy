@@ -36,7 +36,7 @@ def labels(**override):
     result = {
         "org.opencontainers.image.version": VERSION,
         "org.opencontainers.image.revision": REVISION,
-        "org.opencontainers.image.source": "https://github.com/windroc/egress-proxy",
+        "org.opencontainers.image.source": "https://github.com/windroc-labs/egress-proxy",
         "io.windroc.egress-proxy.contract": CONTRACT,
     }
     result.update(override)
@@ -314,10 +314,10 @@ class CheckTests(unittest.TestCase):
         self.assert_fails(self.check(root), "index.json")
 
 
-REPO = "ghcr.io/windroc/egress-proxy"
+REPO = "ghcr.io/windroc-labs/egress-proxy"
 INDEX_RAW = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}'
 INDEX_DIGEST = "sha256:" + hashlib.sha256(INDEX_RAW).hexdigest()
-NOT_FOUND = b"FATA[0001] Error parsing image name: reading manifest 1.2.3 in ghcr.io/windroc/egress-proxy: manifest unknown"
+NOT_FOUND = b"FATA[0001] Error parsing image name: reading manifest 1.2.3 in ghcr.io/windroc-labs/egress-proxy: manifest unknown"
 
 
 class FakeTools:

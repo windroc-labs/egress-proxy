@@ -48,7 +48,7 @@ every platform's image config; a locally built image has none of them:
 | --- | --- |
 | `org.opencontainers.image.version` | the release version `X.Y.Z` (tag `vX.Y.Z`) |
 | `org.opencontainers.image.revision` | the commit the image was built from |
-| `org.opencontainers.image.source` | `https://github.com/windroc/egress-proxy` |
+| `org.opencontainers.image.source` | `https://github.com/windroc-labs/egress-proxy` |
 | `io.windroc.egress-proxy.contract` | this contract's version, copied from compose.yaml's `windroc.egress.contract` at build |
 
 They describe the image, for comparing versions; they are not part of the discovery rules
