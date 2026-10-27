@@ -70,6 +70,22 @@ row=$(grep -n "^row 'curl' " "$repo/verify-egress" | cut -d: -f1)
 n=$((row - $(grep -n "^row 'ssh' " "$repo/verify-egress" | cut -d: -f1) + 1))
 expect_only_failure tool_row "$dir" "FAIL tool_rows_documented: row $n: verify-egress 'curl|works', docs/worker-tools.md 'curl|fails'"
 
+# Local refs (`uses: ./…`) run the same commit's code, so they count as pinned; an
+# unpinned ref fails in a workflow and in a composite action alike.
+dir=$(tree uses_local)
+printf 'jobs:\n  checks:\n    uses: ./.github/workflows/ci.yml\n' >"$dir/.github/workflows/local.yml"
+out=$(run_check "$dir")
+if [[ $(tail -n 1 <<<"$out") == exit=0 ]]; then ok uses_local; else fail uses_local "$out"; fi
+
+dir=$(tree uses_unpinned)
+printf 'jobs:\n  x:\n    steps:\n      - uses: actions/checkout@v5\n' >"$dir/.github/workflows/unpinned.yml"
+expect_only_failure uses_unpinned "$dir" "FAIL uses_pinned: .github/workflows/unpinned.yml:4:      - uses: actions/checkout@v5"
+
+dir=$(tree uses_unpinned_action)
+mkdir -p "$dir/.github/actions/x"
+printf 'runs:\n  using: composite\n  steps:\n    - uses: actions/checkout@v5\n' >"$dir/.github/actions/x/action.yml"
+expect_only_failure uses_unpinned_action "$dir" "FAIL uses_pinned: .github/actions/x/action.yml:4:    - uses: actions/checkout@v5"
+
 dir=$(tree network_key)
 printf 'networks:\n  %s:\n    mode: allowlist\n' "${c}${d}" >"$dir/notes.yaml"
 out=$(run_check "$dir")

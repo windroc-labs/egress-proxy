@@ -54,11 +54,12 @@ fi
 
 none_found no_syntax_directive grep -niE '^#[[:space:]]*syntax[[:space:]]*=' Dockerfile
 
-# Every `uses:` in a workflow is pinned to a full commit SHA.
+# Every `uses:` in a workflow or composite action is pinned to a full commit SHA. A local
+# `uses: ./<path>` runs that path at the same commit, so it is pinned already.
 unpinned=""
-for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
+for wf in .github/workflows/*.yml .github/workflows/*.yaml .github/actions/*/action.yml .github/actions/*/action.yaml; do
   [[ -f $wf ]] || continue
-  unpinned+=$(grep -nE '^[[:space:]-]*uses:' "$wf" | grep -vE 'uses:[[:space:]]*[^[:space:]@]+@[0-9a-f]{40}([[:space:]]|$)' | sed "s|^|$wf:|" || true)
+  unpinned+=$(grep -nE '^[[:space:]-]*uses:' "$wf" | grep -vE 'uses:[[:space:]]*([^[:space:]@]+@[0-9a-f]{40}([[:space:]]|$)|\./)' | sed "s|^|$wf:|" || true)
 done
 if [[ -n $unpinned ]]; then
   fail uses_pinned "$unpinned"
