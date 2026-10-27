@@ -351,6 +351,11 @@ is "$got" "$LINKS | $(image a) 1.0.0 $(digest a)" || bad+="data file values: $go
 check headers "$bad" "$(st is "$bad" "")"
 check readme_version "$(head -5 "$dir/README.md")" \
   "$(st grep -qF "egress-proxy 1.0.0, image \`$(image a)\`" "$dir/README.md")"
+# The reinstall row names the outcomes besides an install: keep-newer (FR-12), rollback (FR-9).
+row=$(grep -F '| Reinstall, or install another version' "$dir/README.md" || true)
+want="exit 0 also when it keeps a newer, healthy running proxy instead of downgrading;"
+want+=" exit 11 when the new version was not healthy and it rolled back to the previous one"
+check readme_outcomes "$row" "$(st like "$row" "$want")"
 
 # -------- The rules in effect (FR-17, FR-18) --------
 rules=$dir/effective-policy.txt
