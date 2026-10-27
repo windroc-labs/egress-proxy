@@ -251,16 +251,17 @@ ok rollback
 # 122d7454 in versions/<commit>/, current linking to it, the config beside them, and the
 # proxy built from the checkout by its start.sh. The stand-in checkout is
 # tests/fixtures/v050-egress (that commit's start.sh and compose.yaml) with a Dockerfile
-# FROM 0.0.3 in place of the Rust build. Its builds run on the docker-driver builder, as
-# derive's do.
+# FROM 0.0.3 in place of the Rust build, adding a layer of its own as a source build does:
+# without one the build is 0.0.3's image, which the migrated proxy uses, and stays. Its
+# builds run on the docker-driver builder, as derive's do.
 export BUILDX_BUILDER=default
 legacy=$work/legacy
 commit=122d7454d738db4a9b7e0c4a89d2cfa5ff564339
 checkout=$legacy/versions/$commit
 mkdir -p "$checkout"
 cp "$repo/tests/fixtures/v050-egress/start.sh" "$repo/tests/fixtures/v050-egress/compose.yaml" "$checkout/"
-echo "FROM $image_repo@$d3" >"$checkout/Dockerfile"
 echo "$commit" >"$checkout/COMMIT"
+printf 'FROM %s\nCOPY COMMIT /v050-commit\n' "$image_repo@$d3" >"$checkout/Dockerfile"
 ln -s "$checkout" "$legacy/current"
 # Readable by the proxy's user: Docker Desktop maps a 0600 file, Linux does not.
 printf 'version: 1\nnetworks:\n  workers:\n    mode: denylist\n' >"$legacy/config.local.yaml"
@@ -274,7 +275,7 @@ wait_health || fail migrate "the source checkout's proxy is not healthy"
 # An older build's name for the same image, and an image of the old name egress-gateway
 # that a (stopped) container uses.
 docker tag egress-proxy egress-proxy-proxy
-printf 'FROM %s\nLABEL io.windroc.test=gateway\n' "$image_repo@$d3" >"$work/gateway.Dockerfile"
+printf 'FROM %s\nCOPY gateway.Dockerfile /gateway\n' "$image_repo@$d3" >"$work/gateway.Dockerfile"
 "$real_docker" buildx build --builder default --load -q -t egress-gateway -f "$work/gateway.Dockerfile" "$work" >/dev/null
 docker create --name egress-test-gateway egress-gateway >/dev/null
 # A caller on the workers network, attached before the migration, from the probe image
