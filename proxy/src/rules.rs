@@ -6,49 +6,30 @@ use std::fmt::Write as _;
 use std::net::SocketAddr;
 
 use crate::cli::Opts;
-use crate::config::{self, Config, Mode, listen_alias, network_name};
-use crate::drift::DIFFERS;
-use crate::facts::{self, Facts, HOST_DOCKER_INTERNAL};
-use crate::policy::{self, DENY_FLOOR, Drift};
+use crate::config::{Config, Mode, listen_alias, network_name};
+use crate::drift::{self, DIFFERS};
+use crate::facts::{Facts, HOST_DOCKER_INTERNAL};
+use crate::policy::{self, DENY_FLOOR};
 
 /// Prints the rules in effect; returns 0, 2 when it cannot tell (not started yet or a
 /// config error) and [`DIFFERS`] when the running policy is not the config's, so it never
 /// reports rules that are not in force.
 pub fn run(opts: &Opts) -> u8 {
-    let facts = match facts::read(&opts.run_dir.join("facts.json")) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("proxy: not started: {e}");
-            return 2;
-        }
-    };
-    let config = match config::load_served(&opts.config, opts.advertised.as_deref()) {
-        Ok(c) => c,
+    let in_force = match drift::read(opts) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("proxy: {e}");
             return 2;
         }
     };
-    match policy::drift(&config, &facts, &opts.run_dir) {
-        Ok(outcomes) => {
-            let stale: Vec<String> = outcomes
-                .iter()
-                .filter(|(_, outcome)| !matches!(outcome, Drift::Matches))
-                .map(|(key, outcome)| outcome.message(key, &opts.config))
-                .collect();
-            if !stale.is_empty() {
-                for line in stale {
-                    eprintln!("proxy: {line}");
-                }
-                return DIFFERS;
-            }
+    let stale = in_force.stale();
+    if !stale.is_empty() {
+        for line in stale {
+            eprintln!("proxy: {line}");
         }
-        Err(e) => {
-            eprintln!("proxy: {e}");
-            return DIFFERS;
-        }
+        return DIFFERS;
     }
-    print!("{}", render(&config, &facts));
+    print!("{}", render(&in_force.config, &in_force.facts));
     0
 }
 
@@ -145,6 +126,7 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
+    use crate::config;
 
     fn config(text: &str) -> Config {
         config::parse(Path::new("/c.yaml"), text).unwrap()
