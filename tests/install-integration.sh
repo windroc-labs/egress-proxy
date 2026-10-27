@@ -39,7 +39,7 @@ cat >"$work/bin/docker" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >>"$work/docker.log"
 case " \$* " in
-  *" --project-directory $work/legacy/"*) ;;
+  *" --project-directory $work/legacy/current "* | *" --project-directory $work/legacy/versions/"*) ;;
   *" build "* | *" buildx "*)
     echo "install-integration.sh: a build ran: docker \$*" >&2
     exit 99
@@ -277,7 +277,10 @@ docker tag egress-proxy egress-proxy-proxy
 printf 'FROM %s\nLABEL io.windroc.test=gateway\n' "$image_repo@$d3" >"$work/gateway.Dockerfile"
 "$real_docker" buildx build --builder default --load -q -t egress-gateway -f "$work/gateway.Dockerfile" "$work" >/dev/null
 docker create --name egress-test-gateway egress-gateway >/dev/null
-# A caller on the workers network, attached before the migration.
+# A caller on the workers network, attached before the migration, from the probe image
+# verify-egress pins.
+PROBE_IMAGE=$(sed -n 's/^PROBE_IMAGE=//p' "$repo/verify-egress")
+[[ -n $PROBE_IMAGE ]] || fail migrate_callers "no PROBE_IMAGE line in verify-egress"
 docker run -d --name egress-test-caller --network egress-workers --entrypoint sleep "$PROBE_IMAGE" 3600 >/dev/null
 nets() { docker network inspect --format '{{.Id}}' egress-workers egress-uplink; }
 nets_before=$(nets)

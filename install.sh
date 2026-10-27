@@ -188,7 +188,7 @@ if [[ -e $dir/current || -L $dir/current || -e $dir/versions || -L $dir/versions
     checkout=yes
     if [[ -z $cur_digest && ${EGRESS_INSTALL_ROLLBACK:-} != 1 ]]; then migrating=yes; fi
   else
-    old_commit="" found=""
+    found=""
     for e in current versions; do
       if [[ -e $dir/$e || -L $dir/$e ]]; then found+="${found:+ and }$dir/$e"; fi
     done

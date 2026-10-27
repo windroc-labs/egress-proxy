@@ -273,7 +273,7 @@ fresh() {
   dir=$work/egress-$1
   rm -f "$FAKE/running" "$FAKE/health" "$FAKE/up_fails" "$FAKE/calls" "$FAKE/contract" "$FAKE"/run_* \
     "$FAKE"/label.* "$FAKE"/health.* "$FAKE"/up_fails.* "$FAKE/logs" "$FAKE/images" "$FAKE/rm_fails" \
-    "$FAKE"/legacy.* "$FAKE/in_use" "$FAKE/old_start" "$FAKE/old_start_rc"
+    "$FAKE"/legacy.* "$FAKE/in_use" "$FAKE/old_start" "$FAKE/old_start_rc" "$FAKE/old_start_image"
   rm -rf "$FAKE"/egress.*
 }
 out() { cat "$work/out"; }
@@ -904,7 +904,7 @@ check links_header_upgrade "$bad" "$(st is "$bad" "")"
 # made before the image (v0.5.0): commit $COMMIT checked out in versions/, current
 # linking to it by absolute path, a download left over, the old start.sh's output beside
 # a 0600 config. Its start.sh logs its run to $FAKE/old_start, then starts the old proxy
-# (image egress-proxy), or exits $FAKE/old_start_rc.
+# (image egress-proxy, or $FAKE/old_start_image), or exits $FAKE/old_start_rc.
 COMMIT=0123456789abcdef0123456789abcdef01234567
 OLD_CONFIG=$'version: 1\nnetworks:\n  workers:\n    mode: denylist'
 checkout_install() {
@@ -915,7 +915,7 @@ checkout_install() {
 #!/usr/bin/env bash
 echo "EGRESS_CONFIG_DIR=${EGRESS_CONFIG_DIR:-} $0" >>"$FAKE/old_start"
 rc=$(cat "$FAKE/old_start_rc" 2>/dev/null || echo 0)
-if ((rc == 0)); then echo egress-proxy >"$FAKE/running"; fi
+if ((rc == 0)); then cat "$FAKE/old_start_image" 2>/dev/null >"$FAKE/running" || echo egress-proxy >"$FAKE/running"; fi
 exit "$rc"
 OLD
   "$REAL_CHMOD" 0755 "$v/start.sh"
@@ -999,12 +999,14 @@ fresh migrate_resumed
 install 1.0.0 a
 checkout_install
 conf=$(config_id)
+echo "egress-proxy:latest sha256:id-old1" >"$FAKE/legacy.egress-proxy"
 install 1.1.0 b
 bad=""
 is "$rc" 0 || bad+="exit $rc; "
 is "$(top)" "$LAYOUT" || bad+="top: $(top); "
 is "$(config_id)" "$conf" || bad+="config changed; "
-is "$(grep -cxF "$(migrated_line 0)" "$work/out" || true)" 1 || bad+="no migrated line; "
+is "$(cat "$FAKE/legacy.egress-proxy")" "" || bad+="old image left; "
+is "$(grep -cxF "$(migrated_line 1)" "$work/out" || true)" 1 || bad+="no migrated line; "
 check migrate_resumed "$bad: $(out)" "$(st is "$bad" "")"
 
 # Entries named current or versions without the source-checkout shape are left alone.
@@ -1069,6 +1071,24 @@ echo egress-proxy >"$FAKE/running"
 echo 2 >"$FAKE/run_contract"
 install 1.0.0 a
 check migrate_contract_differs "exit $rc: $(out)" "$(st is "$rc $(is "$(tree)" "$before" && echo same)" "10 same")"
+fresh migrate_refused_image
+mkdir -p "$dir"
+checkout_install
+before=$(tree)
+echo "<no value>" >"$FAKE/contract"
+install 1.0.0 a
+rm -f "$FAKE/contract"
+check migrate_refused_image "exit $rc: $(out)" "$(st is "$rc $(is "$(tree)" "$before" && echo same)" "5 same")"
+# A newer, published proxy kept: nothing changes, the checkout included.
+fresh migrate_keep_newer
+install 1.2.0 c
+checkout_install
+conf=$(config_id)
+echo 1.2.0 >"$FAKE/run_label"
+echo "$REPO@$(digest c)" >"$FAKE/run_repodigests"
+install 1.1.0 b
+check migrate_keep_newer "exit $rc: $(out)" \
+  "$(st is "$rc $(checkout_kept && echo kept) $(grep -c 'migrated the source-checkout' "$work/out" || true)" "0 kept 0")"
 
 # -------- A failed migration: back to the source checkout (FR-11) --------
 OLD_START=""
@@ -1126,6 +1146,15 @@ echo starting >"$FAKE/health.$(digest a)"
 echo starting >"$FAKE/health.egress-proxy"
 install 1.0.0 a
 migrate_failed migrate_rollback_not_healthy 9 "$NOT_HEALTHY" \
+  "install.sh: rolling back to the source-checkout install ($OLD_START) failed (not healthy within 120 s); see docker logs egress-proxy"
+
+# The old start.sh left this version running: not the old proxy, so not healthy.
+failed_migration migrate_rollback_same_image
+touch "$FAKE/up_fails.$(digest a)"
+image a >"$FAKE/old_start_image"
+install 1.0.0 a
+migrate_failed migrate_rollback_same_image 9 \
+  "install.sh: the start command failed (exit 1) for egress-proxy 1.0.0 ($(digest a)); see docker logs egress-proxy" \
   "install.sh: rolling back to the source-checkout install ($OLD_START) failed (not healthy within 120 s); see docker logs egress-proxy"
 
 # No start.sh to go back to: as a first install, the new version is left as it is.
