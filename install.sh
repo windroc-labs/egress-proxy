@@ -109,9 +109,11 @@ if [[ -n $format ]] && ! [[ $format =~ ^[0-9]+$ && $format -le 1 ]]; then
   die 1 "$record has format $format; this installer knows format 1; nothing was changed"
 fi
 
+# The last healthy install's digest, read once: nothing writes the record before Record.
+cur_digest=$(record_get current_digest)
 # The rollback target (FR-9): the last healthy install, unless it is this digest.
 rb_version=$(record_get current_version)
-rb_digest=$(record_get current_digest)
+rb_digest=$cur_digest
 rb_image=$(record_get current_image)
 rb_runtime=$(record_get current_runtime)
 [[ $rb_digest != "$digest" ]] || rb_digest=""
@@ -141,10 +143,9 @@ if [[ ${EGRESS_INSTALL_ROLLBACK:-} != 1 ]] &&
   fi
   # Published: pulled by the digest this directory's record names. A RepoDigest alone is
   # not enough: Docker's containerd image store gives a retagged local build one too.
-  r_digest=$(record_get current_digest)
-  if [[ $r_running == true && $r_health == healthy && $r_contract == "$contract" && -n $r_digest && " $r_digests " == *" ${image%@*}@$r_digest "* &&
+  if [[ $r_running == true && $r_health == healthy && $r_contract == "$contract" && -n $cur_digest && " $r_digests " == *" ${image%@*}@$cur_digest "* &&
     $r_version =~ $semver ]] && newer "$r_version" "$version"; then
-    echo "install.sh: kept the running egress-proxy $r_version ($r_digest), newer than $version; nothing was changed"
+    echo "install.sh: kept the running egress-proxy $r_version ($cur_digest), newer than $version; nothing was changed"
     exit 0
   fi
 fi
@@ -377,8 +378,7 @@ done
   failed 6 "egress-proxy $version ($digest) did not become healthy within 120 s; see docker logs egress-proxy"
 
 # -------- Record --------
-old_digest=$(record_get current_digest)
-if [[ -n $old_digest && $old_digest != "$digest" ]]; then
+if [[ -n $cur_digest && $cur_digest != "$digest" ]]; then
   prev=current
 else
   prev=previous
