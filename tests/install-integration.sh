@@ -233,7 +233,8 @@ rc=0
 out=$("$repo/egress-install" --version 0.0.4 --digest "$d4" --dir "$dir" 2>&1) || rc=$?
 ((rc == 11)) || fail rollback "egress-install exited $rc: $out"
 [[ $out == *"egress-proxy 0.0.4 ($d4) did not become healthy within 120 s"* ]] || fail rollback "$out"
-[[ $out == *"rolled back to egress-proxy 0.0.3 ($d3), which is healthy"* ]] || fail rollback "$out"
+[[ $out == *"rolled back to egress-proxy 0.0.3 ($d3), which is healthy; egress-proxy 0.0.4 was not installed; see docker logs egress-proxy" ]] ||
+  fail rollback "$out"
 [[ $(inspect '{{.Config.Image}}') == "$image_repo@$d3" ]] || fail rollback "$PX runs $(inspect '{{.Config.Image}}')"
 [[ $(inspect '{{.State.Health.Status}}') == healthy ]] || fail rollback "$PX is $(inspect '{{.State.Health.Status}}')"
 grep -qxF "current_digest=$d3" "$dir/state/installed" || fail rollback "$(cat "$dir/state/installed")"

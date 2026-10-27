@@ -506,12 +506,17 @@ old_image() {
 }
 LOGS_HEAD="install.sh: the last 20 lines of docker logs egress-proxy:"
 # rolled_back <case> <code> <failed version> <its digest char> <cause line> <previous version> <its digest char>
+# With no $FAKE/logs the proxy printed nothing (it never started): no log lines either.
 rolled_back() {
   local bad=""
   is "$rc" "$2" || bad+="exit $rc; "
-  like "$(out)" "$5" || bad+="no cause line; "
-  like "$(out)" "$LOGS_HEAD"$'\nproxy: no route' || bad+="no log lines; "
-  is "$(tail -n 1 "$work/out")" "install.sh: rolled back to egress-proxy $6 ($(digest "$7")), which is healthy; egress-proxy $3 was not installed" ||
+  grep -qxF "$5" "$work/out" || bad+="no cause line; "
+  if [[ -e $FAKE/logs ]]; then
+    like "$(out)" "$LOGS_HEAD"$'\nproxy: no route' || bad+="no log lines; "
+  else
+    like "$(out)" "$LOGS_HEAD" && bad+="log lines of a proxy that never started; "
+  fi
+  is "$(tail -n 1 "$work/out")" "install.sh: rolled back to egress-proxy $6 ($(digest "$7")), which is healthy; egress-proxy $3 was not installed; see docker logs egress-proxy" ||
     bad+="last line: $(tail -n 1 "$work/out"); "
   is "$(cat "$FAKE/running") $(record current_version) $(record current_digest) $(val "$dir/state/runtime/version")" \
     "$(image "$7") $6 $(digest "$7") $6" || bad+="running $(cat "$FAKE/running"), active $(val "$dir/state/runtime/version"): $(cat "$dir/state/installed"); "
@@ -537,7 +542,13 @@ rm -f "$FAKE/health.$(digest d)"
 
 touch "$FAKE/up_fails.$(digest d)"
 install 1.3.0 d
-rolled_back rollback_start_fails 11 1.3.0 d "install.sh: the start command failed (exit 1) for egress-proxy 1.3.0 ($(digest d))" 1.2.0 c
+rolled_back rollback_start_fails 11 1.3.0 d \
+  "install.sh: the start command failed (exit 1) for egress-proxy 1.3.0 ($(digest d)); see docker logs egress-proxy" 1.2.0 c
+rm -f "$FAKE/logs"
+install 1.3.0 d
+rolled_back rollback_never_started 11 1.3.0 d \
+  "install.sh: the start command failed (exit 1) for egress-proxy 1.3.0 ($(digest d)); see docker logs egress-proxy" 1.2.0 c
+echo "proxy: no route" >"$FAKE/logs"
 rm -f "$FAKE/up_fails.$(digest d)"
 
 # no_rollback <case> <code> <message>: exit <code> with <message>, no rollback.
@@ -557,7 +568,9 @@ no_rollback not_healthy_first_install 6 \
 fresh start_fails_first_install
 touch "$FAKE/up_fails"
 install 1.0.0 a
-no_rollback start_fails_first_install 7 "install.sh: the start command failed (exit 1) for egress-proxy 1.0.0"
+no_rollback start_fails_first_install 7 \
+  "install.sh: the start command failed (exit 1) for egress-proxy 1.0.0 ($(digest a)); see docker logs egress-proxy"
+like "$(out)" "$LOGS_HEAD" && fail start_fails_first_install "log lines of a proxy that never started: $(out)"
 
 fresh not_healthy_reinstall
 install 1.0.0 a

@@ -338,12 +338,12 @@ failed() {
     bash "$entry" --version "$rb_version" --digest "$rb_digest" --dir "$dir" || rc=$?
   ((rc == 0)) ||
     die 9 "rolling back to egress-proxy $rb_version ($rb_digest) failed (exit $rc); see docker logs egress-proxy"
-  die 11 "rolled back to egress-proxy $rb_version ($rb_digest), which is healthy; egress-proxy $version was not installed"
+  die 11 "rolled back to egress-proxy $rb_version ($rb_digest), which is healthy; egress-proxy $version was not installed; see docker logs egress-proxy"
 }
 
 rc=0
 "$dir/start.sh" || rc=$?
-((rc == 0)) || failed 7 "the start command failed (exit $rc) for egress-proxy $version ($digest)"
+((rc == 0)) || failed 7 "the start command failed (exit $rc) for egress-proxy $version ($digest); see docker logs egress-proxy"
 
 # healthy: the proxy runs this image, is healthy, and has every label of the contract.
 healthy() {
