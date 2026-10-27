@@ -139,7 +139,8 @@ version=$(docker image inspect --format '{{index .Config.Labels "org.opencontain
   version=""
 [[ -n $version && $version != "<no value>" ]] || version="development build"
 rules="" reported=""
-for ((i = 0; i < 30; i++)); do
+deadline=$((SECONDS + 30))
+for ((i = 0; i < 30 && SECONDS < deadline; i++)); do
   ((i == 0)) || sleep 1
   if rules=$("${base[@]}" -f "$override" exec -T proxy /proxy rules 2>"$rules_err"); then
     reported=yes
