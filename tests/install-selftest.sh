@@ -35,8 +35,12 @@ export REAL_CP REAL_CHMOD REAL_MV
 #   calls          every call, with the EGRESS_IMAGE it saw
 #   label          the image's org.opencontainers.image.version label (none: <no value>)
 #   contract       the image's io.windroc.egress-proxy.contract label (default 1)
+#   label.<digest>, health.<digest>, up_fails.<digest>, egress.<digest>/
+#                  label, health, up_fails and egress/ for the image of that digest only
 #   running        the image `compose up` last started (what inspect reports)
 #   health         the container's health (default healthy)
+#   created        the image of the last `docker create`
+#   logs           what `docker logs` prints
 #   run_state, run_health, run_contract
 #                  what the running-proxy check sees of the container: running (default
 #                  true), health (default: health's), windroc.egress.contract (default 1)
@@ -64,8 +68,10 @@ block() {
   read -r _ <"$FAKE/hold" || true
   exit 1
 }
-# or <default>: the scenario file $FAKE/<name>, else <default>.
+# or <name> <default>: the scenario file $FAKE/<name>, else <default>.
 or() { cat "$FAKE/$1" 2>/dev/null || echo "$2"; }
+# of <name> <image>: the scenario file name for <image>: <name>.<digest> if it exists.
+of() { if [[ -e $FAKE/$1.${2##*@} ]]; then echo "$1.${2##*@}"; else echo "$1"; fi; }
 case $1 in
   image)
     [[ ! -f $FAKE/image_missing ]] || exit 1
@@ -73,8 +79,8 @@ case $1 in
       case $4 in
         # The running proxy's image (`inspect`'s ID below).
         *RepoDigests*) printf '%s|%s\n' "$(or run_label "<no value>")" "$(or run_repodigests "")" ;;
-        *egress-proxy.contract*) printf '%s|%s\n' "$(or label "<no value>")" "$(or contract 1)" ;;
-        *) or label "<no value>" ;;
+        *egress-proxy.contract*) printf '%s|%s\n' "$(or "$(of label "$5")" "<no value>")" "$(or contract 1)" ;;
+        *) or "$(of label "$5")" "<no value>" ;;
       esac
     elif [[ -f $FAKE/block_start ]]; then
       block
@@ -88,7 +94,7 @@ case $1 in
         "$(or run_health "$(or health healthy)")" "$(or run_contract 1)"
       exit 0
     fi
-    printf '%s\n%s\n' "$(cat "$FAKE/health" 2>/dev/null || echo healthy)" "$(cat "$FAKE/running")"
+    printf '%s\n%s\n' "$(or "$(of health "$(cat "$FAKE/running")")" healthy)" "$(cat "$FAKE/running")"
     printf '%s\n' windroc.egress.contract=1 windroc.egress.networks=workers \
       windroc.egress.network.workers.name=egress-workers \
       windroc.egress.network.workers.proxy=http://egress-proxy-workers:4750
@@ -116,18 +122,22 @@ case $1 in
     echo "$3"
     ;;
   version) [[ ! -f $FAKE/daemon_down ]] || exit 1 ;;
-  create) echo cid1 ;;
+  create)
+    echo "$4" >"$FAKE/created"
+    echo cid1
+    ;;
+  logs) or logs "" ;;
   cp)
     if [[ -f $FAKE/cp_fails ]]; then
       echo "Error response from daemon: write $3/install.sh: no space left on device" >&2
       exit 1
     fi
-    "$REAL_CP" -R "$FAKE/egress/." "$3"
+    "$REAL_CP" -R "$FAKE/$(of egress "$(cat "$FAKE/created")")/." "$3"
     ;;
   context) echo my-context ;;
   compose)
     if [[ " $* " == *" up "* ]]; then
-      [[ ! -f $FAKE/up_fails ]] || exit 1
+      [[ ! -f $FAKE/$(of up_fails "$EGRESS_IMAGE") ]] || exit 1
       echo "$EGRESS_IMAGE" >"$FAKE/running"
     elif [[ " $* " == *" /proxy rules "* ]]; then
       [[ ! -f $FAKE/rules_block ]] || block
@@ -233,7 +243,9 @@ install_killed() {
 }
 fresh() {
   dir=$work/egress-$1
-  rm -f "$FAKE/running" "$FAKE/health" "$FAKE/up_fails" "$FAKE/calls" "$FAKE/contract" "$FAKE"/run_*
+  rm -f "$FAKE/running" "$FAKE/health" "$FAKE/up_fails" "$FAKE/calls" "$FAKE/contract" "$FAKE"/run_* \
+    "$FAKE"/label.* "$FAKE"/health.* "$FAKE"/up_fails.* "$FAKE/logs"
+  rm -rf "$FAKE"/egress.*
 }
 out() { cat "$work/out"; }
 tree() { (cd "$dir" && find . -exec ls -ld {} + | sort) 2>/dev/null || true; }
@@ -446,24 +458,110 @@ is "$rc $(record previous_version) $(sets)" "0 1.1.0 2" || bad+="exit $rc, sets 
 [[ -d $dir/state/$(record previous_runtime) && -d $dir/state/$(record current_runtime) ]] || bad+="a recorded set is gone"
 check old_sets_pruned "$bad" "$(st is "$bad" "")"
 
-# -------- Failures --------
-cp "$dir/state/installed" "$work/record.before"
-echo starting >"$FAKE/health"
-install 1.3.0 d
-# Its last line: start.sh's output (the rules) comes first.
-check not_healthy "exit $rc: $(out)" "$(st like "$rc $(tail -n 1 "$work/out")" \
-  "6 install.sh: egress-proxy 1.3.0 ($(digest d)) did not become healthy within 120 s; see docker logs egress-proxy")"
-cmp -s "$dir/state/installed" "$work/record.before" || fail not_healthy "the state record changed"
-# Until S5's rollback, the new set stays active.
-is "$(val "$dir/state/runtime/version")" 1.3.0 || fail not_healthy "the active set is $(val "$dir/state/runtime/version")"
-rm -f "$FAKE/health"
+# -------- Failures and the rollback (FR-9, NFR-6) --------
+# old_image <digest char> <version> [<files dir>]: the image of that digest is version
+# <version>, and ships <files dir> (default: this repo's) as its /egress.
+old_image() {
+  echo "$2" >"$FAKE/label.$(digest "$1")"
+  mkdir -p "$FAKE/egress.$(digest "$1")"
+  "$REAL_CP" -R "${3:-$files}/." "$FAKE/egress.$(digest "$1")"
+}
+LOGS_HEAD="install.sh: the last 20 lines of docker logs egress-proxy:"
+# rolled_back <case> <code> <failed version> <its digest char> <cause line> <previous version> <its digest char>
+rolled_back() {
+  local bad=""
+  is "$rc" "$2" || bad+="exit $rc; "
+  like "$(out)" "$5" || bad+="no cause line; "
+  like "$(out)" "$LOGS_HEAD"$'\nproxy: no route' || bad+="no log lines; "
+  is "$(tail -n 1 "$work/out")" "install.sh: rolled back to egress-proxy $6 ($(digest "$7")), which is healthy; egress-proxy $3 was not installed" ||
+    bad+="last line: $(tail -n 1 "$work/out"); "
+  is "$(cat "$FAKE/running") $(record current_version) $(record current_digest) $(val "$dir/state/runtime/version")" \
+    "$(image "$7") $6 $(digest "$7") $6" || bad+="running $(cat "$FAKE/running"), active $(val "$dir/state/runtime/version"): $(cat "$dir/state/installed"); "
+  # The previous version's installer pruned the failed version's runtime set.
+  is "$(grep -lx "$3" "$dir"/state/runtime.*/version || true)" "" || bad+="the $3 runtime set is left; "
+  check "$1" "$bad: $(out)" "$(st is "$bad" "")"
+}
 
-touch "$FAKE/up_fails"
+# The install above: 1.2.0 (digest c) current, 1.1.0 previous.
+old_image c 1.2.0
+echo "proxy: no route" >"$FAKE/logs"
+echo starting >"$FAKE/health.$(digest d)"
 install 1.3.0 d
-check start_fails "exit $rc: $(out)" \
-  "$(st like "$rc $(out)" "7 install.sh: the start command failed (exit 1) for egress-proxy 1.3.0")"
-cmp -s "$dir/state/installed" "$work/record.before" || fail start_fails "the state record changed"
-rm -f "$FAKE/up_fails"
+rolled_back rollback 11 1.3.0 d \
+  "install.sh: egress-proxy 1.3.0 ($(digest d)) did not become healthy within 120 s; see docker logs egress-proxy" 1.2.0 c
+is "$(record previous_version)" 1.1.0 || fail rollback "previous: $(record previous_version)"
+grep -qF "for egress-proxy 1.2.0 (image $(image c));" "$dir/effective-policy.txt" ||
+  fail rollback "the rules file is not 1.2.0's: $(sed -n 2p "$dir/effective-policy.txt")"
+rm -f "$FAKE/health.$(digest d)"
+
+touch "$FAKE/up_fails.$(digest d)"
+install 1.3.0 d
+rolled_back rollback_start_fails 11 1.3.0 d "install.sh: the start command failed (exit 1) for egress-proxy 1.3.0 ($(digest d))" 1.2.0 c
+rm -f "$FAKE/up_fails.$(digest d)"
+
+# no_rollback <case> <code> <message>: exit <code> with <message>, no rollback.
+no_rollback() {
+  local bad=""
+  is "$rc" "$2" || bad+="exit $rc; "
+  like "$(out)" "$3" || bad+="no '$3'; "
+  like "$(out)" "rolling back" && bad+="it rolled back; "
+  check "$1" "$bad: $(out)" "$(st is "$bad" "")"
+}
+fresh not_healthy_first_install
+echo starting >"$FAKE/health"
+install 1.0.0 a
+no_rollback not_healthy_first_install 6 \
+  "install.sh: egress-proxy 1.0.0 ($(digest a)) did not become healthy within 120 s; see docker logs egress-proxy"
+
+fresh start_fails_first_install
+touch "$FAKE/up_fails"
+install 1.0.0 a
+no_rollback start_fails_first_install 7 "install.sh: the start command failed (exit 1) for egress-proxy 1.0.0"
+
+fresh not_healthy_reinstall
+install 1.0.0 a
+old_image a 1.0.0
+echo starting >"$FAKE/health"
+install 1.0.0 a
+no_rollback not_healthy_reinstall 6 "did not become healthy within 120 s"
+
+fresh rollback_mode
+install 1.0.0 a
+old_image a 1.0.0
+echo starting >"$FAKE/health.$(digest b)"
+EGRESS_INSTALL_ROLLBACK=1 install 1.1.0 b
+no_rollback rollback_mode 6 "did not become healthy within 120 s"
+
+fresh rollback_fails
+install 1.0.0 a
+old_image a 1.0.0
+echo starting >"$FAKE/health"
+install 1.1.0 b
+check rollback_fails "exit $rc: $(out)" "$(st is "$rc $(tail -n 1 "$work/out")" \
+  "9 install.sh: rolling back to egress-proxy 1.0.0 ($(digest a)) failed (exit 6); see docker logs egress-proxy")"
+
+# NFR-6: version 1.0.0 shipped the S3 installer, interface 1, with no rollback and no
+# rules file (S4). A newer installer rolls back through that version's own install entry,
+# and leaves no rules file behind that 1.0.0's start.sh would not rewrite.
+s3=$work/s3-files
+mkdir -p "$s3"
+"$REAL_CP" -p "$files"/* "$s3/"
+"$REAL_CP" -p "$repo/tests/fixtures/s3-egress/install.sh" "$repo/tests/fixtures/s3-egress/egress-install" \
+  "$repo/tests/fixtures/s3-egress/start.sh" "$s3/"
+fresh rollback_s3_entry
+echo 1.0.0 >"$FAKE/label"
+rc=0
+PATH="$work/fast:$work/bin:$PATH" bash "$s3/install.sh" --interface 1 --version 1.0.0 --digest "$(digest a)" \
+  --dir "$dir" --image "$(image a)" --files "$s3" >"$work/out" 2>&1 || rc=$?
+is "$rc" 0 || fail rollback_s3_entry "the S3 install: exit $rc: $(out)"
+old_image a 1.0.0 "$s3"
+echo "proxy: no route" >"$FAKE/logs"
+echo starting >"$FAKE/health.$(digest b)"
+install 1.1.0 b
+rolled_back rollback_s3_entry 11 1.1.0 b \
+  "install.sh: egress-proxy 1.1.0 ($(digest b)) did not become healthy within 120 s; see docker logs egress-proxy" 1.0.0 a
+gone "$dir/effective-policy.txt" || fail rollback_s3_entry "1.1.0's rules file is left: $(sed -n 2p "$dir/effective-policy.txt")"
+grep -qF "egress-proxy 1.0.0, image" "$dir/README.md" || fail rollback_s3_entry "README.md is not 1.0.0's"
 
 fresh format
 install 1.0.0 a

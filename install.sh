@@ -10,7 +10,9 @@
 # records the installed version. First it checks the running proxy (FR-12): one of
 # another label contract stops the install; a healthy one of a higher version, published
 # (pulled by the digest <dir>'s record names) and of the same contract is kept, not
-# downgraded. Layout of <dir>:
+# downgraded. A version that does not become healthy is rolled back (FR-9): the previous
+# version's own install entry, state/<its runtime set>/egress-install, reinstalls it.
+# Layout of <dir>:
 #
 #   config.local.yaml          the user's config; written once, never replaced
 #   README.md, start.sh, verify-egress, config.example.yaml
@@ -33,9 +35,11 @@
 # egress-install passes on) marks a rollback: install the given version, newer running
 # proxy or not; older installers ignore it. Exit codes, shared with egress-install: 0
 # installed, or a newer running proxy kept; 1 other failure; 2 usage; 5 the image is not
-# that version, or has no contract label; 6 not healthy within 120 s; 7 start.sh failed;
-# 8 unsupported interface; 10 the running proxy serves another label contract, nothing
-# changed. (3 and 4 are egress-install's.)
+# that version, or has no contract label; 6 not healthy within 120 s, 7 start.sh failed,
+# each with no previous version to roll back to (or in a rollback): this one is left as
+# it is; 8 unsupported interface; 9 not healthy, and the rollback failed too; 10 the
+# running proxy serves another label contract, nothing changed; 11 not healthy, rolled
+# back to the previous version, which is healthy. (3 and 4 are egress-install's.)
 #
 # Runs on macOS's bash 3.2 and on Linux.
 set -euo pipefail
@@ -103,6 +107,13 @@ format=$(record_get format)
 if [[ -n $format ]] && ! [[ $format =~ ^[0-9]+$ && $format -le 1 ]]; then
   die 1 "$record has format $format; this installer knows format 1; nothing was changed"
 fi
+
+# The rollback target (FR-9): the last healthy install, unless it is this digest.
+rb_version=$(record_get current_version)
+rb_digest=$(record_get current_digest)
+rb_image=$(record_get current_image)
+rb_runtime=$(record_get current_runtime)
+[[ $rb_digest != "$digest" ]] || rb_digest=""
 
 # -------- The running proxy (FR-12) --------
 # A rollback installs the version it is given, so it skips this check: the newer version
@@ -303,9 +314,35 @@ if [[ ! -e $dir/config.local.yaml && ! -L $dir/config.local.yaml ]]; then
   echo "install.sh: wrote the default config $dir/config.local.yaml"
 fi
 
+# failed <code> <message>: this version did not come up. Says so with the proxy's last log
+# lines (a rollback replaces the container, and its logs with it), then rolls back to the
+# previous version through that version's own install entry (interface 1, NFR-6), unless
+# this is a rollback or there is no previous version: exit 11 when it is healthy again, 9
+# when the rollback failed too, else <code>.
+failed() {
+  local code=$1 logs entry rc=0
+  echo "install.sh: $2" >&2
+  logs=$(docker logs --tail 20 egress-proxy 2>&1) || logs=""
+  if [[ -n $logs ]]; then
+    echo "install.sh: the last 20 lines of docker logs egress-proxy:" >&2
+    printf '%s\n' "$logs" >&2
+  fi
+  [[ ${EGRESS_INSTALL_ROLLBACK:-} != 1 && -n $rb_digest ]] || exit "$code"
+  entry=$state/$rb_runtime/egress-install
+  [[ -n $rb_runtime && -f $entry ]] || entry=$files/egress-install
+  echo "install.sh: rolling back to egress-proxy $rb_version ($rb_digest)" >&2
+  # This version's rules file: the previous start.sh rewrites it, or (before S4) has none.
+  rm -f "$dir/effective-policy.txt"
+  EGRESS_IMAGE_REPO=${rb_image%@*} EGRESS_INSTALL_ROLLBACK=1 \
+    bash "$entry" --version "$rb_version" --digest "$rb_digest" --dir "$dir" || rc=$?
+  ((rc == 0)) ||
+    die 9 "rolling back to egress-proxy $rb_version ($rb_digest) failed (exit $rc); see docker logs egress-proxy"
+  die 11 "rolled back to egress-proxy $rb_version ($rb_digest), which is healthy; egress-proxy $version was not installed"
+}
+
 rc=0
 "$dir/start.sh" || rc=$?
-((rc == 0)) || die 7 "the start command failed (exit $rc) for egress-proxy $version ($digest)"
+((rc == 0)) || failed 7 "the start command failed (exit $rc) for egress-proxy $version ($digest)"
 
 # healthy: the proxy runs this image, is healthy, and has every label of the contract.
 healthy() {
@@ -335,7 +372,7 @@ for ((i = 0; i < 60; i++)); do
   sleep 2
 done
 [[ -n $up ]] ||
-  die 6 "egress-proxy $version ($digest) did not become healthy within 120 s; see docker logs egress-proxy"
+  failed 6 "egress-proxy $version ($digest) did not become healthy within 120 s; see docker logs egress-proxy"
 
 # -------- Record --------
 old_digest=$(record_get current_digest)

@@ -60,7 +60,13 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
 3. writes the default config (`config.default.yaml`) when `config.local.yaml` does not
    exist, and never changes an existing one;
 4. runs `~/.egress/start.sh` and waits up to 120 s for the proxy to be healthy with the
-   [label contract](docs/label-contract.md)'s labels;
+   [label contract](docs/label-contract.md)'s labels. If the start command fails or the
+   proxy is not healthy in time, it prints the proxy's last 20 log lines and rolls back:
+   the previous version's own `egress-install` (kept in its runtime set) reinstalls that
+   version from its image, with its runtime files and its `start.sh`, and the install
+   exits 11 naming the version that failed. With no previous version (a first install,
+   or a reinstall of the current one) the new version is left as it is (exit 6 or 7).
+   Callers' connections drop once more for the rollback;
 5. records the version, digest and image as current, and the one before as previous, in
    `~/.egress/state/installed`.
 
@@ -72,10 +78,12 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
 | 3 | no access to the image: the message names the GitHub login and scope needed |
 | 4 | the pull failed: the message names the image, digest and registry; the running proxy keeps running |
 | 5 | the image is not that version, has no contract label, or has no installer |
-| 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`) |
-| 7 | the start command failed |
+| 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`), and there was no previous version to roll back to: it is left as it is |
+| 7 | the start command failed, and there was no previous version to roll back to |
 | 8 | the installer does not know the `--interface` this `egress-install` speaks |
+| 9 | the proxy was not healthy or the start command failed, and the rollback to the previous version failed too |
 | 10 | the running proxy serves another label contract: the message names both versions and contracts |
+| 11 | the proxy was not healthy or the start command failed; rolled back to the previous version, which is healthy |
 
 Codes 2–5 and 10 leave `~/.egress` and the running proxy as they were.
 
