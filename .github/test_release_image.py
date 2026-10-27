@@ -15,6 +15,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import yaml
+
 import release_image
 
 INDEX = "application/vnd.oci.image.index.v1+json"
@@ -551,6 +553,59 @@ class ReleaseTests(unittest.TestCase):
         code, _, err = self.create(FakeTools(gh_create_rc=1))
         self.assertEqual(code, 1)
         self.assertIn("FAIL release: gh release create exited 1: HTTP 422", err)
+
+
+GITHUB = Path(__file__).parent
+
+
+def load(path):
+    data = yaml.safe_load((GITHUB / path).read_text())
+    # YAML 1.1 reads the key `on` as True.
+    data["on"] = data.pop(True, data.get("on"))
+    return data
+
+
+def step_env(step):
+    return step.get("env") or {}
+
+
+class WorkflowTests(unittest.TestCase):
+    def test_ci_is_callable_with_image_job(self):
+        ci = load("workflows/ci.yml")
+        self.assertIn("workflow_call", ci["on"])
+        self.assertIn("image", ci["jobs"]["ci"]["needs"])
+        image = ci["jobs"]["image"]
+        self.assertEqual(image["permissions"], {"contents": "read"})
+        self.assertRegex(image["services"]["registry"]["image"], r"@sha256:[0-9a-f]{64}$")
+        uses = [s.get("uses") for s in image["steps"]]
+        self.assertIn("./.github/actions/build-image", uses)
+        publish = [s for s in image["steps"] if "release_image.py publish" in s.get("run", "")]
+        self.assertEqual(len(publish), 1)
+        self.assertIn("--repo localhost:5000/egress-proxy", publish[0]["run"])
+        self.assertIn("--insecure", publish[0]["run"])
+
+    def test_lint_runs_every_github_test(self):
+        lint = load("workflows/ci.yml")["jobs"]["lint"]
+        self.assertTrue(any("-p 'test_*.py'" in s.get("run", "") for s in lint["steps"]))
+
+    def test_build_image_action(self):
+        action = load("actions/build-image/action.yml")
+        self.assertEqual(action["runs"]["using"], "composite")
+        steps = action["runs"]["steps"]
+        uses = [s["uses"].split("@")[0] for s in steps if "uses" in s]
+        self.assertEqual(uses, ["docker/setup-qemu-action", "docker/setup-buildx-action"])
+        qemu, buildx = (s for s in steps if "uses" in s)
+        self.assertRegex(qemu["with"]["image"], r"@sha256:[0-9a-f]{64}$")
+        self.assertIs(qemu["with"]["cache-image"], False)
+        self.assertRegex(buildx["with"]["driver-opts"], r"@sha256:[0-9a-f]{64}$")
+        self.assertRegex(buildx["with"]["version"], r"^v\d+\.\d+\.\d+$")
+        runs = [s.get("run", "") for s in steps]
+        self.assertTrue(any("release_image.py build" in r for r in runs))
+        self.assertTrue(any("release_image.py check" in r for r in runs))
+        # The scan token reaches only the stdlib check step, never a third-party action.
+        with_token = [s for s in steps if "EGRESS_RELEASE_TOKEN" in step_env(s)]
+        self.assertEqual(len(with_token), 1)
+        self.assertIn("release_image.py check", with_token[0]["run"])
 
 
 if __name__ == "__main__":

@@ -1,11 +1,14 @@
 # Every pull request: build and test the entrypoint, lint the repo, build the image and
-# run the Docker end-to-end checks. CI aggregates every job for branch protection.
+# run the Docker end-to-end checks, and build, check and publish the multi-arch image to a
+# local registry (the release path, without GHCR). CI aggregates every job for branch
+# protection; release.yml calls this workflow before it publishes.
 name: ci
 
 on:
   pull_request:
   push:
     branches: [main]
+  workflow_call:
 
 permissions:
   contents: read
@@ -44,7 +47,7 @@ jobs:
       - name: Check aggregate job dependencies
         run: |
           python3 -m pip install PyYAML==6.0.2
-          python3 -B -m unittest discover -s .github -p test_ci_needs.py -v
+          python3 -B -m unittest discover -s .github -p 'test_*.py' -v
           python3 -B .github/check_ci_needs.py
       - run: tests/check-repo.sh
       - run: tests/check-repo-selftest.sh
@@ -71,9 +74,37 @@ jobs:
           persist-credentials: false
       - run: tests/integration.sh
 
+  image:
+    name: image
+    runs-on: ubuntu-24.04
+    # arm64 builds under QEMU.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    services:
+      registry:
+        image: docker.io/library/registry:3.1.2@sha256:d4032d4cc323c1731c707931ecada07a53076eac38e3b61ae57533f170f2c6c3
+        ports: ["5000:5000"]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - id: revision
+        run: echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+      - uses: ./.github/actions/build-image
+        with:
+          version: 0.0.0
+          revision: ${{ steps.revision.outputs.sha }}
+          out: ${{ runner.temp }}/layout
+          scan-token: ${{ github.token }}
+      - name: Publish to the local registry and verify it by digest
+        run: >-
+          python3 -B .github/release_image.py publish "$RUNNER_TEMP/layout"
+          --repo localhost:5000/egress-proxy --version 0.0.0 --insecure
+
   ci:
     name: CI
-    needs: [rust, lint, integration]
+    needs: [rust, lint, integration, image]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
