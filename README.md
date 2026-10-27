@@ -47,29 +47,48 @@ a caller that pins it, never from a tag lookup.
 
 It then copies the image's `/egress` out and runs its `install.sh`, which:
 
-1. writes the runtime files as one set under `~/.egress/state/` and switches the
+1. checks the running proxy, `egress-proxy`, and changes nothing when it serves another
+   [label contract](docs/label-contract.md) (exit 10) or when it is a newer version to
+   keep: healthy, of the same contract, with a higher version label, and published, i.e.
+   pulled by the digest `~/.egress/state/installed` names as current (a local build, even
+   tagged `ghcr.io/windroc/egress-proxy:<higher>`, is replaced). Keeping it, it says so
+   and exits 0. A newer version is never downgraded, so callers pinning an older one
+   share the newest;
+2. writes the runtime files as one set under `~/.egress/state/` and switches the
    top-level files to it with one rename, so a killed install leaves the old set or the
    new one, never a mix;
-2. writes the default config (`config.default.yaml`) when `config.local.yaml` does not
+3. writes the default config (`config.default.yaml`) when `config.local.yaml` does not
    exist, and never changes an existing one;
-3. runs `~/.egress/start.sh` and waits up to 120 s for the proxy to be healthy with the
-   [label contract](docs/label-contract.md)'s labels;
-4. records the version, digest and image as current, and the one before as previous, in
-   `~/.egress/state/installed`.
+4. runs `~/.egress/start.sh` and waits up to 120 s for the proxy to be healthy with the
+   [label contract](docs/label-contract.md)'s labels. If the start command fails or the
+   proxy is not healthy in time, it prints the proxy's last 20 log lines and rolls back:
+   the previous version's own `egress-install` (kept in its runtime set) reinstalls that
+   version from its image, with its runtime files and its `start.sh`, and the install
+   exits 11 naming the version that failed. With no previous version (a first install,
+   or a reinstall of the current one) the new version is left as it is (exit 6 or 7).
+   Callers' connections drop once more for the rollback;
+5. records the version, digest and image as current, and the one before as previous, in
+   `~/.egress/state/installed`;
+6. removes the other `ghcr.io/windroc/egress-proxy` images, so only the current and the
+   previous one stay (`docker images ghcr.io/windroc/egress-proxy`). An image a container
+   still uses stays too. A rollback leaves this to the next install.
 
 | Exit code | Meaning |
 | --- | --- |
-| 0 | installed |
+| 0 | installed, or a newer, healthy running proxy kept instead of downgrading |
 | 1 | another failure, e.g. the image's files could not be copied out, or `state/installed` has a newer format |
 | 2 | usage, or Docker is not running or not reachable |
 | 3 | no access to the image: the message names the GitHub login and scope needed |
 | 4 | the pull failed: the message names the image, digest and registry; the running proxy keeps running |
-| 5 | the image is not that version, or has no installer |
-| 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`) |
-| 7 | the start command failed |
+| 5 | the image is not that version, has no contract label, or has no installer |
+| 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`), with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
+| 7 | the start command failed, with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
 | 8 | the installer does not know the `--interface` this `egress-install` speaks |
+| 9 | the version being installed did not start or was not healthy, and the rollback to the previous version failed too |
+| 10 | the running proxy serves another label contract: nothing was changed; the message names both versions and contracts |
+| 11 | the version being installed did not start or was not healthy; rolled back to the previous version, which is healthy |
 
-Codes 2–5 leave `~/.egress` and the running proxy as they were.
+Codes 2–5 and 10 leave `~/.egress` and the running proxy as they were.
 
 `~/.egress` then holds only:
 

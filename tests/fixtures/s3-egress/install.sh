@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# The egress proxy's installer, shipped in the image as /egress/install.sh. Only
+# egress-install runs it, from the files it copied out of the image (README.md, Setup):
+#
+#   install.sh --interface 1 --version X.Y.Z --digest sha256:<64 hex> --dir <dir>
+#              --image <repo>@<digest> --files <dir of the image's /egress>
+#
+# It writes the image's runtime files to <dir> as one runtime set, writes the default
+# config when there is none, runs the start command, waits for the proxy to be healthy and
+# records the installed version. Layout of <dir>:
+#
+#   config.local.yaml          the user's config; written once, never replaced
+#   README.md, start.sh, verify-egress, config.example.yaml
+#                              symlinks into state/runtime
+#   state/runtime              symlink to the active runtime set, runtime.<suffix>
+#   state/runtime.<suffix>/    one version's files; `links` lists the top-level names,
+#                              `image`, `version` and `digest` (written last: the set is
+#                              complete) name its image. These four have the generated-file
+#                              header too: their values are their lines not starting with #
+#   state/installed            the last healthy install: current and previous version,
+#                              digest, image and runtime set (format 1)
+#   state/compose.networks.yaml   start.sh's rendered override
+#
+# One rename of state/runtime switches every top-level runtime file at once, so a killed
+# install leaves either the old set or the new one active, never a mix.
+#
+# Handoff contract, interface 1 (egress-install of any version drives this): every
+# option takes exactly one value; later interfaces add only optional options; unknown
+# options are ignored with a warning. Exit codes, shared with egress-install: 0
+# installed; 1 other failure; 2 usage; 5 the image is not that version; 6 not healthy
+# within 120 s; 7 start.sh failed; 8 unsupported interface. (3 and 4 are egress-install's.)
+#
+# Runs on macOS's bash 3.2 and on Linux.
+set -euo pipefail
+# Bash 5.2 would expand & in ${x//pattern/replacement}; a path may hold one.
+shopt -u patsub_replacement 2>/dev/null || true
+
+usage() {
+  echo "usage: install.sh --interface 1 --version X.Y.Z --digest sha256:<64 hex> --dir <path> --image <repo>@<digest> --files <dir>" >&2
+  exit 2
+}
+die() {
+  local code=$1
+  shift
+  echo "install.sh: $*" >&2
+  exit "$code"
+}
+
+interface="" version="" digest="" dir="" image="" files=""
+while (($# > 0)); do
+  (($# >= 2)) || usage
+  case $1 in
+    --interface) interface=$2 ;;
+    --version) version=$2 ;;
+    --digest) digest=$2 ;;
+    --dir) dir=$2 ;;
+    --image) image=$2 ;;
+    --files) files=$2 ;;
+    --*) echo "install.sh: ignoring unknown option $1" >&2 ;;
+    *) usage ;;
+  esac
+  shift 2
+done
+[[ -n $interface ]] || usage
+[[ $interface == 1 ]] ||
+  die 8 "interface $interface is not supported (supported: 1); use the egress-install of version ${version:-this image}"
+[[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
+[[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || usage
+[[ -n $dir && $image == *"@$digest" && -n $files ]] || usage
+
+# The runtime set's files (each copied with a header) and its top-level links.
+FILES="start.sh verify-egress config.example.yaml compose.yaml config.default.yaml egress-install install.sh"
+LINKS="README.md start.sh verify-egress config.example.yaml"
+for f in $FILES; do
+  [[ -f $files/$f ]] || die 1 "$files/$f is missing"
+done
+
+# -------- Checks before any change --------
+label=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image" 2>/dev/null) ||
+  label=""
+[[ $label == "<no value>" ]] && label=""
+[[ $label == "$version" ]] || die 5 "$image is version ${label:-none}, not $version"
+
+state=$dir/state
+record=$state/installed
+# record_get <key>: the value of <key> in the state record, or empty.
+record_get() {
+  [[ -f $record ]] || return 0
+  sed -n "s/^$1=//p" "$record" | head -n 1
+}
+format=$(record_get format)
+if [[ -n $format ]] && ! [[ $format =~ ^[0-9]+$ && $format -le 1 ]]; then
+  die 1 "$record has format $format; this installer knows format 1; nothing was changed"
+fi
+
+# -------- The new runtime set --------
+mkdir -p "$state"
+dir=$(CDPATH='' cd -- "$dir" && pwd)
+state=$dir/state
+record=$state/installed
+
+# Leftovers of a killed install: temp links, and incomplete sets other than the active one.
+active=""
+[[ -L $state/runtime ]] && active=$(readlink "$state/runtime")
+rm -f "$state"/.runtime.tmp.* "$state"/.installed.tmp.* "$dir/.config.local.yaml.tmp."*
+for f in $LINKS; do rm -f "$dir/.$f.tmp."*; done
+for d in "$state"/runtime.*; do
+  [[ -d $d && ! -L $d ]] || continue
+  [[ ${d##*/} == "$active" || -f $d/digest ]] || rm -rf "$d"
+done
+
+new=$(mktemp -d "$state/runtime.XXXXXX")
+chmod 0755 "$new"
+base=${new##*/}
+
+# header <comment prefix> <file name> <what it is>: the generated-file header.
+header() {
+  printf '%s %s/%s: %s\n' "$1" "$dir" "$2" "$3"
+  printf '%s Generated by the egress-proxy installer for version %s (%s);\n' "$1" "$version" "$digest"
+  printf '%s do not edit it: the next install replaces it. To change the policy, edit\n' "$1"
+  printf '%s %s/config.local.yaml, then run %s/start.sh.\n' "$1" "$dir" "$dir"
+}
+
+# put <name> <what it is> [<path shown in the header>]: copies <name> from the image's
+# files into the new set with a header, after its `#!` line if it has one.
+put() {
+  local src=$files/$1 dst=$new/$1 shown=${3:-$1} first=""
+  IFS= read -r first <"$src" || true
+  {
+    if [[ $first == '#!'* ]]; then
+      printf '%s\n' "$first"
+      header '#' "$shown" "$2"
+      tail -n +2 "$src"
+    else
+      header '#' "$shown" "$2"
+      cat "$src"
+    fi
+  } >"$dst"
+  chmod "$([[ -x $src ]] && echo 0755 || echo 0644)" "$dst"
+}
+put start.sh "the egress proxy's start command: starts the proxy, or applies a change of config.local.yaml"
+put verify-egress "checks a caller network's allows and denies: verify-egress <network>"
+put config.example.yaml "an example of config.local.yaml, with every option"
+put compose.yaml "the proxy's compose file; start.sh runs it with the caller networks it renders" \
+  state/runtime/compose.yaml
+put config.default.yaml "the default config, copied to config.local.yaml when there is none" \
+  state/runtime/config.default.yaml
+put egress-install "the install entry of this version: reinstall or install another version with it" \
+  state/runtime/egress-install
+put install.sh "the installer of this version, run by egress-install" state/runtime/install.sh
+
+# read -d '', not $(cat <<EOF): bash 3.2 misparses quotes in a here-document inside $(...).
+IFS= read -r -d '' readme <<'EOF' || true
+# @DIR@: the egress proxy
+
+Installed: egress-proxy @VERSION@, image `@IMAGE@`.
+
+The proxy runs as the container `egress-proxy` from that image, pinned by its digest; it
+needs no network, GitHub login or registry to start or restart.
+
+## Files
+
+| File | What it is |
+| --- | --- |
+| `config.local.yaml` | The proxy's config, one section per caller network: the only file to edit. Run `start.sh` after a change. |
+| `config.example.yaml` | Every config option, with examples. |
+| `start.sh` | The start command: starts the proxy, or applies a change of `config.local.yaml`. |
+| `verify-egress` | Checks a caller network's allows and denies from a probe container on it. |
+| `effective-policy.txt` | The rules in effect per network, written by `start.sh` (in the versions that print them; absent before). |
+| `README.md` | This file, rewritten at every install. |
+| `state/` | The active runtime set (`state/runtime`), the compose files, the rendered network file and the installed versions and digests (`state/installed`). Never edit it. |
+
+## Commands
+
+| Task | Command |
+| --- | --- |
+| Start, or apply a config change | `@DIR@/start.sh` |
+| Check a caller network | `@DIR@/verify-egress <network>` |
+| Health | `docker inspect --format '{{.State.Health.Status}}' egress-proxy` |
+| Logs (config errors name the network and key) | `docker logs egress-proxy` |
+| Stop | `docker stop egress-proxy` |
+| Reinstall, or install another version | `@DIR@/state/runtime/egress-install --version X.Y.Z --digest sha256:<digest> --dir @DIR@` |
+
+Install only a version and digest from the GitHub Release of its tag (or one a caller's
+installer pins).
+EOF
+readme=${readme%$'\n'}
+readme=${readme//@DIR@/$dir}
+readme=${readme//@VERSION@/$version}
+readme=${readme//@IMAGE@/$image}
+{
+  header '' README.md "what each file here is, the commands, and the installed version" |
+    sed -e '1s/^ /<!-- /' -e '2,$s/^ /     /' -e '$s/$/ -->/'
+  echo
+  printf '%s\n' "$readme"
+} >"$new/README.md"
+chmod 0644 "$new/README.md"
+
+{
+  header '#' state/runtime/links "the top-level files that link into this runtime set, one per line"
+  for f in $LINKS; do echo "$f"; done
+} >"$new/links"
+{
+  header '#' state/runtime/image "the image this runtime set runs, pinned by its digest; start.sh runs it"
+  printf '%s\n' "$image"
+} >"$new/image"
+{
+  header '#' state/runtime/version "the egress-proxy version of this runtime set"
+  printf '%s\n' "$version"
+} >"$new/version"
+# Last: a set with a digest file is complete.
+{
+  header '#' state/runtime/digest "the image digest of this runtime set; written last, it marks the set complete"
+  printf '%s\n' "$digest"
+} >"$new/digest"
+
+# -------- Switch --------
+# values <file>: a runtime set data file's values, its lines not starting with #.
+values() { sed '/^#/d' "$1"; }
+# replace <src> <dst>: renames <src> over <dst> in one rename(2), also when <dst> is a
+# symlink to a directory (GNU mv -T, BSD mv -h).
+replace() {
+  if mv --version >/dev/null 2>&1; then
+    mv -Tf "$1" "$2"
+  else
+    mv -hf "$1" "$2"
+  fi
+}
+# link_top <name>: <dir>/<name> becomes the symlink state/runtime/<name>.
+link_top() {
+  local want=state/runtime/$1
+  [[ -L $dir/$1 && $(readlink "$dir/$1") == "$want" ]] && return 0
+  ln -s "$want" "$dir/.$1.tmp.$$"
+  replace "$dir/.$1.tmp.$$" "$dir/$1"
+}
+old_links=""
+[[ -n $active && -f $state/runtime/links ]] && old_links=$(values "$state/runtime/links")
+new_links=$(values "$new/links")
+# Names the active set also has resolve into whichever set is active: link them first.
+for f in $LINKS; do
+  if grep -qxF "$f" <<<"$old_links"; then link_top "$f"; fi
+done
+ln -s "$base" "$state/.runtime.tmp.$$"
+replace "$state/.runtime.tmp.$$" "$state/runtime"
+for f in $LINKS; do link_top "$f"; done
+# A name only the old set had would now dangle.
+for f in $old_links; do
+  grep -qxF "$f" <<<"$new_links" && continue
+  if [[ -L $dir/$f && $(readlink "$dir/$f") == state/runtime/* ]]; then rm -f "$dir/$f"; fi
+done
+
+# -------- Config, start, health --------
+if [[ ! -e $dir/config.local.yaml && ! -L $dir/config.local.yaml ]]; then
+  # The image's own copy: the one in the runtime set has the generated-file header.
+  cp "$files/config.default.yaml" "$dir/.config.local.yaml.tmp.$$"
+  # The proxy reads it as another user (UID 65532) through the read-only mount.
+  chmod 0644 "$dir/.config.local.yaml.tmp.$$"
+  mv "$dir/.config.local.yaml.tmp.$$" "$dir/config.local.yaml"
+  echo "install.sh: wrote the default config $dir/config.local.yaml"
+fi
+
+rc=0
+"$dir/start.sh" || rc=$?
+((rc == 0)) || die 7 "the start command failed (exit $rc) for egress-proxy $version ($digest)"
+
+# healthy: the proxy runs this image, is healthy, and has every label of the contract.
+healthy() {
+  local out health img labels nets k
+  out=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}
+{{.Config.Image}}
+{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}
+{{end}}' egress-proxy 2>/dev/null) || return 1
+  health=$(sed -n 1p <<<"$out")
+  img=$(sed -n 2p <<<"$out")
+  labels=$(sed -n '3,$p' <<<"$out")
+  [[ $health == healthy && $img == "$image" ]] || return 1
+  grep -q '^windroc\.egress\.contract=.' <<<"$labels" || return 1
+  nets=$(sed -n 's/^windroc\.egress\.networks=//p' <<<"$labels")
+  [[ -n $nets ]] || return 1
+  for k in ${nets//,/ }; do
+    grep -qF "windroc.egress.network.$k.name=egress-" <<<"$labels" || return 1
+    grep -qF "windroc.egress.network.$k.proxy=http" <<<"$labels" || return 1
+  done
+}
+up=""
+for ((i = 0; i < 60; i++)); do
+  if healthy; then
+    up=yes
+    break
+  fi
+  sleep 2
+done
+[[ -n $up ]] ||
+  die 6 "egress-proxy $version ($digest) did not become healthy within 120 s; see docker logs egress-proxy"
+
+# -------- Record --------
+old_digest=$(record_get current_digest)
+if [[ -n $old_digest && $old_digest != "$digest" ]]; then
+  prev=current
+else
+  prev=previous
+fi
+p_version=$(record_get "${prev}_version")
+p_digest=$(record_get "${prev}_digest")
+p_image=$(record_get "${prev}_image")
+p_runtime=$(record_get "${prev}_runtime")
+{
+  header '#' state/installed "the installed egress-proxy versions: the current one (the last healthy install) and the previous one"
+  echo "format=1"
+  echo "current_version=$version"
+  echo "current_digest=$digest"
+  echo "current_image=$image"
+  echo "current_runtime=$base"
+  echo "previous_version=$p_version"
+  echo "previous_digest=$p_digest"
+  echo "previous_image=$p_image"
+  echo "previous_runtime=$p_runtime"
+} >"$state/.installed.tmp.$$"
+mv -f "$state/.installed.tmp.$$" "$record"
+
+for d in "$state"/runtime.*; do
+  [[ -d $d && ! -L $d ]] || continue
+  [[ ${d##*/} == "$base" || ${d##*/} == "$p_runtime" ]] || rm -rf "$d"
+done
+
+echo "egress-proxy $version ($digest) installed in $dir; start command: $dir/start.sh"

@@ -34,8 +34,22 @@ export REAL_CP REAL_CHMOD REAL_MV
 # The fake docker. State and scenario live in $FAKE:
 #   calls          every call, with the EGRESS_IMAGE it saw
 #   label          the image's org.opencontainers.image.version label (none: <no value>)
+#   contract       the image's io.windroc.egress-proxy.contract label (default 1)
+#   label.<digest>, health.<digest>, up_fails.<digest>, egress.<digest>/
+#                  label, health, up_fails and egress/ for the image of that digest only
 #   running        the image `compose up` last started (what inspect reports)
 #   health         the container's health (default healthy)
+#   created        the image of the last `docker create`
+#   images         the image IDs `docker images` lists, one per line (an image's ID is
+#                  sha256:id-<its reference>); `image rm` removes one from it
+#   rm_fails       image IDs `image rm` refuses (in use by a container)
+#   logs           what `docker logs` prints
+#   run_state, run_health, run_contract
+#                  what the running-proxy check sees of the container: running (default
+#                  true), health (default: health's), windroc.egress.contract (default 1)
+#   run_label, run_repodigests
+#                  the running container image's version label (default <no value>) and
+#                  its RepoDigests, space-separated (default none)
 #   up_fails       `compose up` fails
 #   block_start    start.sh's first docker call blocks on the hold fifo
 #   image_missing  `image inspect` of the image fails, until a pull succeeds
@@ -57,18 +71,39 @@ block() {
   read -r _ <"$FAKE/hold" || true
   exit 1
 }
+# or <name> <default>: the scenario file $FAKE/<name>, else <default>.
+or() { cat "$FAKE/$1" 2>/dev/null || echo "$2"; }
+# of <name> <image>: the scenario file name for <image>: <name>.<digest> if it exists.
+of() { if [[ -e $FAKE/$1.${2##*@} ]]; then echo "$1.${2##*@}"; else echo "$1"; fi; }
 case $1 in
+  images) or images "" ;;
   image)
     [[ ! -f $FAKE/image_missing ]] || exit 1
-    if [[ $3 == --format ]]; then
-      cat "$FAKE/label" 2>/dev/null || echo "<no value>"
+    if [[ $2 == rm ]]; then
+      ! grep -qxF "$3" "$FAKE/rm_fails" 2>/dev/null || exit 1
+      grep -vxF "$3" "$FAKE/images" >"$FAKE/images.new" || true
+      "$REAL_MV" "$FAKE/images.new" "$FAKE/images"
+    elif [[ $3 == --format ]]; then
+      case $4 in
+        '{{.Id}}') echo "sha256:id-$5" ;;
+        # The running proxy's image (`inspect`'s ID below).
+        *RepoDigests*) printf '%s|%s\n' "$(or run_label "<no value>")" "$(or run_repodigests "")" ;;
+        *egress-proxy.contract*) printf '%s|%s\n' "$(or "$(of label "$5")" "<no value>")" "$(or contract 1)" ;;
+        *) or "$(of label "$5")" "<no value>" ;;
+      esac
     elif [[ -f $FAKE/block_start ]]; then
       block
     fi
     ;;
   inspect)
     [[ -f $FAKE/running ]] || exit 1
-    printf '%s\n%s\n' "$(cat "$FAKE/health" 2>/dev/null || echo healthy)" "$(cat "$FAKE/running")"
+    if [[ $3 == '{{.Image}}'* ]]; then
+      # The running-proxy check: its image ID, state, health and contract label.
+      printf 'sha256:id-%s|%s|%s|%s\n' "$(cat "$FAKE/running")" "$(or run_state true)" \
+        "$(or run_health "$(or health healthy)")" "$(or run_contract 1)"
+      exit 0
+    fi
+    printf '%s\n%s\n' "$(or "$(of health "$(cat "$FAKE/running")")" healthy)" "$(cat "$FAKE/running")"
     printf '%s\n' windroc.egress.contract=1 windroc.egress.networks=workers \
       windroc.egress.network.workers.name=egress-workers \
       windroc.egress.network.workers.proxy=http://egress-proxy-workers:4750
@@ -96,18 +131,22 @@ case $1 in
     echo "$3"
     ;;
   version) [[ ! -f $FAKE/daemon_down ]] || exit 1 ;;
-  create) echo cid1 ;;
+  create)
+    echo "$4" >"$FAKE/created"
+    echo cid1
+    ;;
+  logs) or logs "" ;;
   cp)
     if [[ -f $FAKE/cp_fails ]]; then
       echo "Error response from daemon: write $3/install.sh: no space left on device" >&2
       exit 1
     fi
-    "$REAL_CP" -R "$FAKE/egress/." "$3"
+    "$REAL_CP" -R "$FAKE/$(of egress "$(cat "$FAKE/created")")/." "$3"
     ;;
   context) echo my-context ;;
   compose)
     if [[ " $* " == *" up "* ]]; then
-      [[ ! -f $FAKE/up_fails ]] || exit 1
+      [[ ! -f $FAKE/$(of up_fails "$EGRESS_IMAGE") ]] || exit 1
       echo "$EGRESS_IMAGE" >"$FAKE/running"
     elif [[ " $* " == *" /proxy rules "* ]]; then
       [[ ! -f $FAKE/rules_block ]] || block
@@ -213,7 +252,9 @@ install_killed() {
 }
 fresh() {
   dir=$work/egress-$1
-  rm -f "$FAKE/running" "$FAKE/health" "$FAKE/up_fails" "$FAKE/calls"
+  rm -f "$FAKE/running" "$FAKE/health" "$FAKE/up_fails" "$FAKE/calls" "$FAKE/contract" "$FAKE"/run_* \
+    "$FAKE"/label.* "$FAKE"/health.* "$FAKE"/up_fails.* "$FAKE/logs" "$FAKE/images" "$FAKE/rm_fails"
+  rm -rf "$FAKE"/egress.*
 }
 out() { cat "$work/out"; }
 tree() { (cd "$dir" && find . -exec ls -ld {} + | sort) 2>/dev/null || true; }
@@ -237,6 +278,41 @@ st() {
 is() { [[ $1 == "$2" ]]; }
 like() { [[ $1 == *"$2"* ]]; }
 gone() { [[ ! -e $1 ]]; }
+
+# -------- Exit codes --------
+# install.sh's header and README.md's Setup table list the same codes in the same words.
+# header_codes: the header's list, one `<code> <text>` line per code, continuations joined.
+header_codes() {
+  awk '/^# Exit codes/ { on = 1; next }
+    !on { next }
+    /^#   [0-9]/ {
+      if (n++) print line
+      sub(/^# +/, "")
+      code = $1
+      sub(/^[0-9]+ +/, "")
+      line = code " " $0
+      next
+    }
+    n && /^#       / { sub(/^# +/, ""); line = line " " $0; next }
+    n { exit }
+    END { if (n) print line }' "$repo/install.sh"
+}
+# readme_codes: README.md's exit-code table, one `<code> <text>` line per row.
+readme_codes() {
+  awk '/^\| Exit code \| Meaning \|$/ { on = 1; next }
+    on && !/^\|/ { exit }
+    on && /^\| [0-9]/ {
+      sub(/^\| /, "")
+      sub(/ \|$/, "")
+      code = $1
+      sub(/^[0-9]+ \| /, "")
+      print code " " $0
+    }' "$repo/README.md"
+}
+h=$(header_codes) r=$(readme_codes)
+got="$(cut -d' ' -f1 <<<"$h" | xargs) | $(cut -d' ' -f1 <<<"$r" | xargs)"
+check exit_codes_match "codes: $got; diff: $(diff <(echo "$h") <(echo "$r") || true)" \
+  "$(st is "$got:$h" "0 1 2 3 4 5 6 7 8 9 10 11 | 0 1 2 3 4 5 6 7 8 9 10 11:$r")"
 
 # -------- Arguments --------
 fresh usage
@@ -310,6 +386,11 @@ is "$got" "$LINKS | $(image a) 1.0.0 $(digest a)" || bad+="data file values: $go
 check headers "$bad" "$(st is "$bad" "")"
 check readme_version "$(head -5 "$dir/README.md")" \
   "$(st grep -qF "egress-proxy 1.0.0, image \`$(image a)\`" "$dir/README.md")"
+# The reinstall row names the outcomes besides an install: keep-newer (FR-12), rollback (FR-9).
+row=$(grep -F '| Reinstall, or install another version' "$dir/README.md" || true)
+want="exit 0 also when it keeps a newer, healthy running proxy instead of downgrading;"
+want+=" exit 11 when the new version did not start or was not healthy and it rolled back to the previous one"
+check readme_outcomes "$row" "$(st like "$row" "$want")"
 
 # -------- The rules in effect (FR-17, FR-18) --------
 rules=$dir/effective-policy.txt
@@ -426,24 +507,180 @@ is "$rc $(record previous_version) $(sets)" "0 1.1.0 2" || bad+="exit $rc, sets 
 [[ -d $dir/state/$(record previous_runtime) && -d $dir/state/$(record current_runtime) ]] || bad+="a recorded set is gone"
 check old_sets_pruned "$bad" "$(st is "$bad" "")"
 
-# -------- Failures --------
-cp "$dir/state/installed" "$work/record.before"
-echo starting >"$FAKE/health"
-install 1.3.0 d
-# Its last line: start.sh's output (the rules) comes first.
-check not_healthy "exit $rc: $(out)" "$(st like "$rc $(tail -n 1 "$work/out")" \
-  "6 install.sh: egress-proxy 1.3.0 ($(digest d)) did not become healthy within 120 s; see docker logs egress-proxy")"
-cmp -s "$dir/state/installed" "$work/record.before" || fail not_healthy "the state record changed"
-# Until S5's rollback, the new set stays active.
-is "$(val "$dir/state/runtime/version")" 1.3.0 || fail not_healthy "the active set is $(val "$dir/state/runtime/version")"
-rm -f "$FAKE/health"
+# -------- Old images (FR-10) --------
+# images_left: the fake's image IDs, as the references they stand for.
+images_left() { sed 's/^sha256:id-//' "$FAKE/images" | sort -u | xargs; }
+fresh cleanup
+install 1.0.0 a
+install 1.1.0 b
+# A third version, a local build tagged into the repo, and the new one.
+printf 'sha256:id-%s\n' "$(image a)" "$(image b)" "$REPO:9.9.9" "$(image b)" "$(image c)" >"$FAKE/images"
+: >"$FAKE/calls"
+install 1.2.0 c
+bad=""
+is "$rc" 0 || bad+="exit $rc; "
+is "$(images_left)" "$(image b) $(image c)" || bad+="left: $(images_left); "
+like "$(out)" "install.sh: removed 2 old egress-proxy image(s)" || bad+="no removed line; "
+grep -qF " images --no-trunc --format {{.ID}} $REPO" "$FAKE/calls" || bad+="docker images not by repo: $(grep ' images ' "$FAKE/calls" || true); "
+grep -q ' image rm -f' "$FAKE/calls" && bad+="forced removal; "
+for d in versions current; do [[ -e $dir/$d || -L $dir/$d ]] && bad+="$dir/$d exists; "; done
+check cleanup "$bad: $(out)" "$(st is "$bad" "")"
 
-touch "$FAKE/up_fails"
+# An image a container uses (or another repo references) stays; the install succeeds.
+fresh cleanup_rm_fails
+install 1.0.0 a
+install 1.1.0 b
+printf 'sha256:id-%s\n' "$(image a)" "$(image b)" "$(image c)" >"$FAKE/images"
+echo "sha256:id-$(image a)" >"$FAKE/rm_fails"
+install 1.2.0 c
+check cleanup_rm_fails "exit $rc, left $(images_left): $(out)" \
+  "$(st is "$rc $(images_left) $(grep -c 'old egress-proxy image' "$work/out" || true)" "0 $(image a) $(image b) $(image c) 0")"
+
+# -------- Failures and the rollback (FR-9, NFR-6) --------
+# old_image <digest char> <version> [<files dir>]: the image of that digest is version
+# <version>, and ships <files dir> (default: this repo's) as its /egress.
+old_image() {
+  echo "$2" >"$FAKE/label.$(digest "$1")"
+  mkdir -p "$FAKE/egress.$(digest "$1")"
+  "$REAL_CP" -R "${3:-$files}/." "$FAKE/egress.$(digest "$1")"
+}
+LOGS_HEAD="install.sh: the last 20 lines of docker logs egress-proxy:"
+# rolled_back <case> <code> <failed version> <its digest char> <cause line> <previous version> <its digest char>
+# With no $FAKE/logs the proxy printed nothing (it never started): no log lines either.
+rolled_back() {
+  local bad=""
+  is "$rc" "$2" || bad+="exit $rc; "
+  grep -qxF "$5" "$work/out" || bad+="no cause line; "
+  if [[ -e $FAKE/logs ]]; then
+    like "$(out)" "$LOGS_HEAD"$'\nproxy: no route' || bad+="no log lines; "
+  else
+    like "$(out)" "$LOGS_HEAD" && bad+="log lines of a proxy that never started; "
+  fi
+  is "$(tail -n 1 "$work/out")" "install.sh: rolled back to egress-proxy $6 ($(digest "$7")), which is healthy; egress-proxy $3 was not installed; see docker logs egress-proxy" ||
+    bad+="last line: $(tail -n 1 "$work/out"); "
+  is "$(cat "$FAKE/running") $(record current_version) $(record current_digest) $(val "$dir/state/runtime/version")" \
+    "$(image "$7") $6 $(digest "$7") $6" || bad+="running $(cat "$FAKE/running"), active $(val "$dir/state/runtime/version"): $(cat "$dir/state/installed"); "
+  # The previous version's installer pruned the failed version's runtime set.
+  is "$(grep -lx "$3" "$dir"/state/runtime.*/version || true)" "" || bad+="the $3 runtime set is left; "
+  check "$1" "$bad: $(out)" "$(st is "$bad" "")"
+}
+
+# The install above: 1.2.0 (digest c) current, 1.1.0 previous.
+old_image c 1.2.0
+echo "proxy: no route" >"$FAKE/logs"
+echo starting >"$FAKE/health.$(digest d)"
+printf 'sha256:id-%s\n' "$(image a)" "$(image b)" "$(image c)" "$(image d)" >"$FAKE/images"
+: >"$FAKE/calls"
 install 1.3.0 d
-check start_fails "exit $rc: $(out)" \
-  "$(st like "$rc $(out)" "7 install.sh: the start command failed (exit 1) for egress-proxy 1.3.0")"
-cmp -s "$dir/state/installed" "$work/record.before" || fail start_fails "the state record changed"
-rm -f "$FAKE/up_fails"
+grep -E ' images | image rm ' "$FAKE/calls" && fail rollback_no_cleanup "a rollback removed images"
+rolled_back rollback 11 1.3.0 d \
+  "install.sh: egress-proxy 1.3.0 ($(digest d)) did not become healthy within 120 s; see docker logs egress-proxy" 1.2.0 c
+is "$(record previous_version)" 1.1.0 || fail rollback "previous: $(record previous_version)"
+grep -qF "for egress-proxy 1.2.0 (image $(image c));" "$dir/effective-policy.txt" ||
+  fail rollback "the rules file is not 1.2.0's: $(sed -n 2p "$dir/effective-policy.txt")"
+rm -f "$FAKE/health.$(digest d)"
+
+touch "$FAKE/up_fails.$(digest d)"
+install 1.3.0 d
+rolled_back rollback_start_fails 11 1.3.0 d \
+  "install.sh: the start command failed (exit 1) for egress-proxy 1.3.0 ($(digest d)); see docker logs egress-proxy" 1.2.0 c
+rm -f "$FAKE/logs"
+install 1.3.0 d
+rolled_back rollback_never_started 11 1.3.0 d \
+  "install.sh: the start command failed (exit 1) for egress-proxy 1.3.0 ($(digest d)); see docker logs egress-proxy" 1.2.0 c
+echo "proxy: no route" >"$FAKE/logs"
+rm -f "$FAKE/up_fails.$(digest d)"
+
+# no_rollback <case> <code> <message>: exit <code> with <message>, no rollback.
+no_rollback() {
+  local bad=""
+  is "$rc" "$2" || bad+="exit $rc; "
+  like "$(out)" "$3" || bad+="no '$3'; "
+  like "$(out)" "rolling back" && bad+="it rolled back; "
+  check "$1" "$bad: $(out)" "$(st is "$bad" "")"
+}
+fresh not_healthy_first_install
+echo starting >"$FAKE/health"
+install 1.0.0 a
+no_rollback not_healthy_first_install 6 \
+  "install.sh: egress-proxy 1.0.0 ($(digest a)) did not become healthy within 120 s; see docker logs egress-proxy"
+
+fresh start_fails_first_install
+touch "$FAKE/up_fails"
+install 1.0.0 a
+no_rollback start_fails_first_install 7 \
+  "install.sh: the start command failed (exit 1) for egress-proxy 1.0.0 ($(digest a)); see docker logs egress-proxy"
+like "$(out)" "$LOGS_HEAD" && fail start_fails_first_install "log lines of a proxy that never started: $(out)"
+
+fresh not_healthy_reinstall
+install 1.0.0 a
+old_image a 1.0.0
+echo starting >"$FAKE/health"
+install 1.0.0 a
+no_rollback not_healthy_reinstall 6 "did not become healthy within 120 s"
+
+fresh rollback_mode
+install 1.0.0 a
+old_image a 1.0.0
+echo starting >"$FAKE/health.$(digest b)"
+EGRESS_INSTALL_ROLLBACK=1 install 1.1.0 b
+no_rollback rollback_mode 6 "did not become healthy within 120 s"
+
+fresh rollback_fails
+install 1.0.0 a
+old_image a 1.0.0
+echo starting >"$FAKE/health"
+install 1.1.0 b
+check rollback_fails "exit $rc: $(out)" "$(st is "$rc $(tail -n 1 "$work/out")" \
+  "9 install.sh: rolling back to egress-proxy 1.0.0 ($(digest a)) failed (exit 6); see docker logs egress-proxy")"
+
+# NFR-6: version 1.0.0 shipped the S3 installer, interface 1, with no rollback and no
+# rules file (S4). A newer installer rolls back through that version's own install entry,
+# and leaves no rules file behind that 1.0.0's start.sh would not rewrite.
+s3=$work/s3-files
+mkdir -p "$s3"
+"$REAL_CP" -p "$files"/* "$s3/"
+"$REAL_CP" -p "$repo/tests/fixtures/s3-egress/install.sh" "$repo/tests/fixtures/s3-egress/egress-install" \
+  "$repo/tests/fixtures/s3-egress/start.sh" "$s3/"
+fresh rollback_s3_entry
+echo 1.0.0 >"$FAKE/label"
+rc=0
+PATH="$work/fast:$work/bin:$PATH" bash "$s3/install.sh" --interface 1 --version 1.0.0 --digest "$(digest a)" \
+  --dir "$dir" --image "$(image a)" --files "$s3" >"$work/out" 2>&1 || rc=$?
+is "$rc" 0 || fail rollback_s3_entry "the S3 install: exit $rc: $(out)"
+old_image a 1.0.0 "$s3"
+echo "proxy: no route" >"$FAKE/logs"
+echo starting >"$FAKE/health.$(digest b)"
+install 1.1.0 b
+rolled_back rollback_s3_entry 11 1.1.0 b \
+  "install.sh: egress-proxy 1.1.0 ($(digest b)) did not become healthy within 120 s; see docker logs egress-proxy" 1.0.0 a
+gone "$dir/effective-policy.txt" || fail rollback_s3_entry "1.1.0's rules file is left: $(sed -n 2p "$dir/effective-policy.txt")"
+grep -qF "egress-proxy 1.0.0, image" "$dir/README.md" || fail rollback_s3_entry "README.md is not 1.0.0's"
+
+# The previous version's runtime set has no egress-install: the rollback runs this image's
+# own, handing it the repo of the recorded image, the previous version, digest and dir.
+fb=$work/fallback-files
+mkdir -p "$fb"
+"$REAL_CP" -p "$files"/* "$fb/"
+cat >"$fb/egress-install" <<'ENTRY'
+#!/usr/bin/env bash
+echo "EGRESS_IMAGE_REPO=$EGRESS_IMAGE_REPO EGRESS_INSTALL_ROLLBACK=$EGRESS_INSTALL_ROLLBACK $*" >"$FAKE/entry_call"
+ENTRY
+fresh rollback_entry_fallback
+rm -f "$FAKE/entry_call"
+echo 1.0.0 >"$FAKE/label"
+rc=0
+PATH="$work/fast:$work/bin:$PATH" bash "$files/install.sh" --interface 1 --version 1.0.0 --digest "$(digest a)" \
+  --dir "$dir" --image "localhost:5000/egress-proxy@$(digest a)" --files "$files" >"$work/out" 2>&1 || rc=$?
+is "$rc" 0 || fail rollback_entry_fallback "the 1.0.0 install: exit $rc: $(out)"
+rm "$dir/state/$(record current_runtime)/egress-install"
+echo 1.1.0 >"$FAKE/label"
+echo starting >"$FAKE/health.$(digest b)"
+rc=0
+PATH="$work/fast:$work/bin:$PATH" bash "$fb/install.sh" --interface 1 --version 1.1.0 --digest "$(digest b)" \
+  --dir "$dir" --image "$(image b)" --files "$fb" >"$work/out" 2>&1 || rc=$?
+check rollback_entry_fallback "exit $rc: $(cat "$FAKE/entry_call" 2>/dev/null): $(out)" "$(st is "$rc $(cat "$FAKE/entry_call" 2>/dev/null)" \
+  "11 EGRESS_IMAGE_REPO=localhost:5000/egress-proxy EGRESS_INSTALL_ROLLBACK=1 --version 1.0.0 --digest $(digest a) --dir $dir")"
 
 fresh format
 install 1.0.0 a
@@ -454,6 +691,114 @@ install 1.1.0 b
 check format_higher "exit $rc: $(out)" \
   "$(st like "$rc $(out)" "1 install.sh: $dir/state/installed has format 2; this installer knows format 1; nothing was changed")"
 is "$(tree)" "$before" || fail format_higher "$dir changed"
+
+fresh no_contract_label_image
+echo "<no value>" >"$FAKE/contract"
+install 1.0.0 a
+check no_contract_label_image "exit $rc: $(out)" \
+  "$(st is "$rc $(out)" "5 install.sh: $(image a) has no label contract version (io.windroc.egress-proxy.contract)")"
+gone "$dir" || fail no_contract_label_image "$dir was created"
+
+# -------- A running proxy (FR-12) --------
+# running_newer <case>: version 1.2.0 (digest c) installed and running, healthy, published:
+# its image has the RepoDigest the record names. Then the scenario's tweaks, and an
+# install of 1.1.0 (digest b).
+running_newer() {
+  fresh "$1"
+  install 1.2.0 c
+  is "$rc" 0 || fail "$1" "the first install: $(out)"
+  echo 1.2.0 >"$FAKE/run_label"
+  echo "$REPO@$(digest c)" >"$FAKE/run_repodigests"
+}
+# only_inspected: since $FAKE/calls was emptied, install.sh only inspected.
+only_inspected() { is "$(grep -vE '^EGRESS_IMAGE=[^ ]* (image inspect|inspect) ' "$FAKE/calls" || true)" ""; }
+# replaced <case>: the install of 1.1.0 replaced the running 1.2.0.
+replaced() {
+  check "$1" "exit $rc, running $(cat "$FAKE/running"): $(out)" \
+    "$(st is "$rc $(cat "$FAKE/running") $(record current_version)" "0 $(image b) 1.1.0")"
+}
+
+running_newer keep_newer
+before=$(tree)
+: >"$FAKE/calls"
+install 1.1.0 b
+bad=""
+is "$rc $(out)" "0 install.sh: kept the running egress-proxy 1.2.0 ($(digest c)), newer than 1.1.0; nothing was changed" ||
+  bad+="exit $rc: $(out); "
+is "$(tree)" "$before" || bad+="$dir changed; "
+is "$(cat "$FAKE/running")" "$(image c)" || bad+="running $(cat "$FAKE/running"); "
+only_inspected || bad+="calls: $(cat "$FAKE/calls"); "
+check keep_newer "$bad" "$(st is "$bad" "")"
+
+for health in unhealthy starting none; do
+  running_newer "newer_unhealthy_$health"
+  if [[ $health == none ]]; then : >"$FAKE/run_health"; else echo "$health" >"$FAKE/run_health"; fi
+  install 1.1.0 b
+  replaced "newer_unhealthy_$health"
+done
+running_newer newer_stopped
+echo false >"$FAKE/run_state"
+install 1.1.0 b
+replaced newer_stopped
+
+# A local build tagged into the repo: no RepoDigest (classic image store), or one the
+# record does not name (containerd image store, or installed from another directory).
+running_newer newer_local_build
+: >"$FAKE/run_repodigests"
+install 1.1.0 b
+replaced newer_local_build
+running_newer newer_repodigest_not_recorded
+echo "$REPO@$(digest f)" >"$FAKE/run_repodigests"
+install 1.1.0 b
+replaced newer_repodigest_not_recorded
+running_newer newer_other_repo
+echo "localhost:5000/egress-proxy@$(digest c)" >"$FAKE/run_repodigests"
+install 1.1.0 b
+replaced newer_other_repo
+
+n=0
+for label in "<no value>" 1.2 1.1.0 1.0.9 0.9.9 01.2.0; do
+  n=$((n + 1))
+  running_newer "newer_label_$n"
+  echo "$label" >"$FAKE/run_label"
+  install 1.1.0 b
+  replaced "newer_label_$n ($label)"
+done
+# Numeric, not text, order: 1.10.0 is newer than 1.9.0.
+running_newer newer_numeric
+echo 1.10.0 >"$FAKE/run_label"
+install 1.9.0 b
+check newer_numeric "exit $rc: $(out)" "$(st like "$rc $(out)" "0 install.sh: kept the running egress-proxy 1.10.0")"
+
+running_newer contract_differs
+echo 2 >"$FAKE/run_contract"
+before=$(tree)
+: >"$FAKE/calls"
+install 1.1.0 b
+bad=""
+is "$rc $(out)" "10 install.sh: the running egress-proxy 1.2.0 serves label contract 2, and egress-proxy 1.1.0 serves contract 1; nothing was changed (to replace it: docker rm -f egress-proxy, then install again)" ||
+  bad+="exit $rc: $(out); "
+is "$(tree)" "$before" || bad+="$dir changed; "
+only_inspected || bad+="calls: $(cat "$FAKE/calls"); "
+check contract_differs "$bad" "$(st is "$bad" "")"
+# Whatever its health or version.
+running_newer contract_differs_unhealthy
+echo 2 >"$FAKE/run_contract"
+echo unhealthy >"$FAKE/run_health"
+echo "<no value>" >"$FAKE/run_label"
+install 1.1.0 b
+check contract_differs_unhealthy "exit $rc: $(out)" \
+  "$(st like "$rc $(out)" "10 install.sh: the running egress-proxy unknown version serves label contract 2")"
+
+running_newer no_contract_label
+echo "<no value>" >"$FAKE/run_contract"
+install 1.1.0 b
+replaced no_contract_label
+
+# A rollback (EGRESS_INSTALL_ROLLBACK=1) installs what it is told, newer proxy or not.
+running_newer rollback_mode_no_keep
+EGRESS_INSTALL_ROLLBACK=1 install 1.1.0 b
+replaced rollback_mode_no_keep
 
 # -------- Killed installs (FR-8) --------
 # complete_set <case> <versions...>: every top-level runtime file resolves into the one
