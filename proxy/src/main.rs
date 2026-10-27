@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
 use proxy::cli::{self, Mode};
-use proxy::{drift, health, plan, render, supervise};
+use proxy::{drift, health, plan, render, rules, supervise};
 
 fn main() -> ExitCode {
     let opts = match cli::parse_args(
@@ -20,6 +20,7 @@ fn main() -> ExitCode {
         Mode::Compose => render::run(&opts),
         Mode::Plan => plan::run(&opts),
         Mode::Drift => drift::run(&opts),
+        Mode::Rules => rules::run(&opts),
     };
     ExitCode::from(code)
 }
