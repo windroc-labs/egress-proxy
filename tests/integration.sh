@@ -184,11 +184,29 @@ start_no_project_warning() {
 
 # -------- Stage A: compose.yaml, workers only --------
 use_config workers.yaml
-start
+start | tee "$work/start-a.out"
 wait_health healthy || fail healthy "the proxy did not become healthy"
 [[ $(docker ps --filter "name=^$PX\$" --format '{{.Status}}') == *"(healthy)"* ]] ||
   fail healthy "docker ps does not show (healthy)"
 ok healthy
+
+# FR-17, FR-18: start.sh prints each network's rules in effect and writes them to
+# effective-policy.txt; with the default config, every floor range of README.md › Policy.
+RULES_FILE=$EGRESS_CONFIG_DIR/effective-policy.txt
+floor=$(sed -n '/denied are the floor/,/`, the addresses/p' "$repo/README.md" | tr '\n' ' ' |
+  sed -e 's/.*the floor *`//' -e 's/`.*//' | tr -d ' ' | tr ',' ' ')
+[[ -n $floor ]] || fail rules_default "no floor list in README.md › Policy"
+[[ -f $RULES_FILE ]] || fail rules_default "start.sh did not write $RULES_FILE"
+for range in $floor; do
+  grep -qxF "    $range" "$work/start-a.out" || fail rules_default "start.sh did not print $range"
+  grep -qxF "    $range" "$RULES_FILE" || fail rules_default "$RULES_FILE lacks $range"
+done
+grep -qx '  mode: denylist: every destination is allowed except the denied ones below' "$RULES_FILE" ||
+  fail rules_default "no denylist mode line: $(cat "$RULES_FILE")"
+grep -qF 'for egress-proxy development build (image egress-proxy);' "$RULES_FILE" ||
+  fail rules_default "no version line: $(sed -n 2p "$RULES_FILE")"
+ok rules_default
+rules_time_a=$(sed -n 2p "$RULES_FILE")
 
 # The built image is egress-proxy, not compose's default <project>-<service>.
 [[ $(compose config --images) == egress-proxy ]] || fail image_named "compose names the image $(compose config --images)"
@@ -433,7 +451,7 @@ legacy() {
 legacy_before=$(legacy)
 
 two_networks_config
-start
+start | tee "$work/start-b.out"
 wait_health healthy || fail two_networks_healthy "the two-network proxy did not become healthy"
 ok two_networks_healthy
 # AC1: one proxy on both networks, advertised one to one with the config's sections.
@@ -450,6 +468,18 @@ tunneled mini_op_exception egress-mini-op "$MPROXY" "http://$lan_ip:2222/"
 denied workers_no_mini_op_allow egress-workers "$PROXY" "https://$lan_ip:2222/"
 # The proxy resolves host.docker.internal to the default bridge's gateway (host-gateway).
 hdi_ip=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+
+# FR-17: the exception and the address the proxy resolved for it at this start.
+want="    host.docker.internal:11434 -> $hdi_ip:11434"
+grep -qxF "$want" "$work/start-b.out" || fail rules_exception "start.sh did not print '$want'"
+grep -qxF "  denied, host.docker.internal: $hdi_ip" "$work/start-b.out" ||
+  fail rules_exception "start.sh did not print host.docker.internal's address $hdi_ip"
+ok rules_exception
+# FR-18: the config change and the start rewrote the rules file.
+[[ $(sed -n 2p "$RULES_FILE") != "$rules_time_a" ]] || fail rules_updated "the time did not change: $rules_time_a"
+grep -qxF "$want" "$RULES_FILE" || fail rules_updated "$RULES_FILE lacks '$want'"
+grep -q '^network mini-op ' "$RULES_FILE" || fail rules_updated "$RULES_FILE lacks network mini-op"
+ok rules_updated
 denied mini_op_no_workers_exception egress-mini-op "$MPROXY" "https://$hdi_ip:11434/"
 
 # A named allowlist exception opens only its start-time address at its port: the ACL lists
