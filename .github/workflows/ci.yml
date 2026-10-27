@@ -66,6 +66,24 @@ jobs:
           EGRESS_IMAGE: egress-proxy
         run: docker compose -f compose.yaml config -q
 
+  # The install entry and installer run on the user's Mac: macOS's own bash 3.2 and BSD
+  # tools, not Homebrew's.
+  macos:
+    name: macos
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Parse every script and run the install self-test with /bin/bash 3.2
+        shell: /bin/bash -e {0}
+        run: |
+          export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+          bash --version | head -n 1
+          for f in egress-install install.sh start.sh verify-egress tests/*.sh; do bash -n "$f"; done
+          bash tests/install-selftest.sh
+
   integration:
     name: integration
     runs-on: ubuntu-24.04
@@ -112,7 +130,7 @@ jobs:
 
   ci:
     name: CI
-    needs: [rust, lint, integration, image]
+    needs: [rust, lint, macos, integration, image]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

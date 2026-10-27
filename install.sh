@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The egress proxy's installer, shipped in the image as /egress/install.sh. Only
-# egress-install runs it, from the files it copied out of the image (README.md, Install):
+# egress-install runs it, from the files it copied out of the image (README.md, Setup):
 #
 #   install.sh --interface 1 --version X.Y.Z --digest sha256:<64 hex> --dir <dir>
 #              --image <repo>@<digest> --files <dir of the image's /egress>
@@ -67,11 +67,10 @@ done
 [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || usage
 [[ -n $dir && $image == *"@$digest" && -n $files ]] || usage
 
-# The runtime set's files: copied with a header, copied verbatim, and its top-level links.
-WITH_HEADER="start.sh verify-egress config.example.yaml compose.yaml"
-VERBATIM="config.default.yaml egress-install install.sh"
+# The runtime set's files (each copied with a header) and its top-level links.
+FILES="start.sh verify-egress config.example.yaml compose.yaml config.default.yaml egress-install install.sh"
 LINKS="README.md start.sh verify-egress config.example.yaml"
-for f in $WITH_HEADER $VERBATIM; do
+for f in $FILES; do
   [[ -f $files/$f ]] || die 1 "$files/$f is missing"
 done
 
@@ -143,12 +142,14 @@ put verify-egress "checks a caller network's allows and denies: verify-egress <n
 put config.example.yaml "an example of config.local.yaml, with every option"
 put compose.yaml "the proxy's compose file; start.sh runs it with the caller networks it renders" \
   state/runtime/compose.yaml
-for f in $VERBATIM; do
-  cp "$files/$f" "$new/$f"
-done
+put config.default.yaml "the default config, copied to config.local.yaml when there is none" \
+  state/runtime/config.default.yaml
+put egress-install "the install entry of this version: reinstall or install another version with it" \
+  state/runtime/egress-install
+put install.sh "the installer of this version, run by egress-install" state/runtime/install.sh
 
-readme=$(
-  cat <<'EOF'
+# read -d '', not $(cat <<EOF): bash 3.2 misparses quotes in a here-document inside $(...).
+IFS= read -r -d '' readme <<'EOF' || true
 # @DIR@: the egress proxy
 
 Installed: egress-proxy @VERSION@, image `@IMAGE@`.
@@ -182,7 +183,7 @@ needs no network, GitHub login or registry to start or restart.
 Install only a version and digest from the GitHub Release of its tag (or one a caller's
 installer pins).
 EOF
-)
+readme=${readme%$'\n'}
 readme=${readme//@DIR@/$dir}
 readme=${readme//@VERSION@/$version}
 readme=${readme//@IMAGE@/$image}
@@ -234,7 +235,8 @@ done
 
 # -------- Config, start, health --------
 if [[ ! -e $dir/config.local.yaml && ! -L $dir/config.local.yaml ]]; then
-  cp "$state/runtime/config.default.yaml" "$dir/.config.local.yaml.tmp.$$"
+  # The image's own copy: the one in the runtime set has the generated-file header.
+  cp "$files/config.default.yaml" "$dir/.config.local.yaml.tmp.$$"
   # The proxy reads it as another user (UID 65532) through the read-only mount.
   chmod 0644 "$dir/.config.local.yaml.tmp.$$"
   mv "$dir/.config.local.yaml.tmp.$$" "$dir/config.local.yaml"

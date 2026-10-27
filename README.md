@@ -80,6 +80,7 @@ Codes 0–5 leave `~/.egress` and the running proxy as they were.
 | `start.sh` | the installer | the start command |
 | `verify-egress` | the installer | checks a caller network's allows and denies ([Verify](#verify)) |
 | `config.example.yaml` | the installer | every config option, with examples |
+| `effective-policy.txt` | `start.sh`, in the versions that print the rules in effect | each network's rules in effect; absent before |
 | `state/` | the installer and `start.sh` | the runtime set, the compose file, the rendered networks file, the installed versions; never edit |
 
 Every generated file starts with a comment saying so. `start.sh` runs the installed image
@@ -249,7 +250,8 @@ egress-proxy-proxy`, and in a checkout where you built the entrypoint, `rm -rf g
 - CI (`.github/workflows/ci.yml`) runs on every pull request and push to `main`, and as
   the first job of every release.
   Set `CI` as the only required status check in the `main` branch ruleset. It aggregates
-  `rust`, `lint`, `integration` and `image`, and fails if any dependency fails, is cancelled
+  `rust`, `lint`, `macos` (every script parsed, and the install self-test run, with
+  macOS's own bash 3.2 and BSD tools), `integration` and `image`, and fails if any dependency fails, is cancelled
   or is skipped. `image` runs the release path against a local registry: it builds both
   platforms (`.github/actions/build-image`, arm64 under QEMU), checks the layout and
   publishes it as version `0.0.0`, then installs it from there. When adding a job, add it to `ci.needs`; the `lint` job
