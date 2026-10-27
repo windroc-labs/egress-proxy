@@ -5,8 +5,9 @@
 # its local registry): egress-install installs that image by digest into a temp directory,
 # with real Docker, a throwaway Docker client config and no gh login. A docker shim logs
 # every call and refuses any build. <registry container> is the registry's container,
-# stopped to take the registry offline. Linux CI only: it starts the proxy and its
-# networks. Prints `ok <check>` per check and stops at the first `FAIL <check>: <detail>`.
+# stopped to take the registry offline, then started again for the upgrades: images built
+# FROM the installed one with other version labels, one never healthy, pushed there.
+# Linux CI only: it starts the proxy and its networks. Prints `ok <check>` per check and stops at the first `FAIL <check>: <detail>`.
 set -euo pipefail
 
 if [[ $(uname -s) != Linux ]]; then
@@ -168,5 +169,76 @@ err=$("$repo/egress-install" --version "$version" --digest "$absent" --dir "$dir
 [[ $(inspect '{{.State.Health.Status}}') == healthy ]] || fail pull_fails_unchanged "the proxy is not healthy"
 [[ -z $(find "$TMPDIR" -mindepth 1 -print) ]] || fail pull_fails_unchanged "temp files left: $(find "$TMPDIR" -mindepth 1)"
 ok pull_fails_unchanged
+
+# -------- Upgrades: old images, no downgrade, rollback (FR-9, FR-10, FR-12) --------
+docker start "$registry" >/dev/null
+for ((i = 0; i < 30; i++)); do
+  curl -sf "http://${image_repo%%/*}/v2/" >/dev/null && break
+  sleep 1
+done
+# derive <version> [unhealthy]: pushes an image built FROM the installed one, with version
+# label <version> (unhealthy: and a health check that always fails), then removes it here,
+# so an install pulls it by digest. Prints its digest. Built with the real docker (the
+# shim refuses builds) on the docker-driver builder `default`: the job's buildx builder
+# runs in a container, where localhost:5000 is not the registry, and keeps no images.
+derive() {
+  local ctx=$work/derive-$1 ref=$image_repo:$1 pushed
+  mkdir -p "$ctx"
+  {
+    echo "FROM $image"
+    echo "LABEL org.opencontainers.image.version=$1"
+    if [[ ${2:-} == unhealthy ]]; then
+      echo 'HEALTHCHECK --interval=2s --timeout=2s --start-period=0s --retries=1 CMD ["/proxy", "no-such-command"]'
+    fi
+  } >"$ctx/Dockerfile"
+  "$real_docker" buildx build --builder default --load -q -t "$ref" "$ctx" >/dev/null
+  "$real_docker" push -q "$ref" >/dev/null
+  pushed=$("$real_docker" image inspect --format '{{index .RepoDigests 0}}' "$ref")
+  "$real_docker" image rm "$ref" >/dev/null
+  echo "${pushed#*@}"
+}
+d1=$(derive 0.0.1)
+d2=$(derive 0.0.2)
+d3=$(derive 0.0.3)
+d4=$(derive 0.0.4 unhealthy)
+
+# FR-10: three upgrades leave the current and the previous image.
+for vd in "0.0.1 $d1" "0.0.2 $d2" "0.0.3 $d3"; do
+  read -r v d <<<"$vd"
+  rc=0
+  "$repo/egress-install" --version "$v" --digest "$d" --dir "$dir" || rc=$?
+  ((rc == 0)) || fail cleanup "the install of $v exited $rc"
+done
+[[ $(inspect '{{.Config.Image}}') == "$image_repo@$d3" ]] || fail cleanup "$PX runs $(inspect '{{.Config.Image}}')"
+got=$(docker images --no-trunc --format '{{.ID}}' "$image_repo")
+want=$(for d in "$d2" "$d3"; do docker image inspect --format '{{.Id}}' "$image_repo@$d"; done | sort | xargs)
+[[ $(sort <<<"$got" | xargs) == "$want" ]] || fail cleanup "docker images $image_repo: $(docker images --digests "$image_repo")"
+for d in versions current; do
+  [[ ! -e $dir/$d && ! -L $dir/$d ]] || fail cleanup "$dir/$d exists"
+done
+ok cleanup
+
+# FR-12: the running, healthy, published 0.0.3 is kept over 0.0.2.
+running=$(inspect '{{.Id}} {{.State.StartedAt}}')
+rc=0
+out=$("$repo/egress-install" --version 0.0.2 --digest "$d2" --dir "$dir" 2>&1) || rc=$?
+((rc == 0)) || fail keep_newer "egress-install exited $rc: $out"
+[[ $out == *"kept the running egress-proxy 0.0.3 ($d3), newer than 0.0.2"* ]] || fail keep_newer "$out"
+[[ $(inspect '{{.Id}} {{.State.StartedAt}}') == "$running" ]] || fail keep_newer "the proxy changed"
+grep -qxF "current_digest=$d3" "$dir/state/installed" || fail keep_newer "$(cat "$dir/state/installed")"
+ok keep_newer
+
+# FR-9: 0.0.4 never becomes healthy: back to 0.0.3, healthy, and exit 11.
+rc=0
+out=$("$repo/egress-install" --version 0.0.4 --digest "$d4" --dir "$dir" 2>&1) || rc=$?
+((rc == 11)) || fail rollback "egress-install exited $rc: $out"
+[[ $out == *"egress-proxy 0.0.4 ($d4) did not become healthy within 120 s"* ]] || fail rollback "$out"
+[[ $out == *"rolled back to egress-proxy 0.0.3 ($d3), which is healthy"* ]] || fail rollback "$out"
+[[ $(inspect '{{.Config.Image}}') == "$image_repo@$d3" ]] || fail rollback "$PX runs $(inspect '{{.Config.Image}}')"
+[[ $(inspect '{{.State.Health.Status}}') == healthy ]] || fail rollback "$PX is $(inspect '{{.State.Health.Status}}')"
+grep -qxF "current_digest=$d3" "$dir/state/installed" || fail rollback "$(cat "$dir/state/installed")"
+grep -qF "for egress-proxy 0.0.3 (image $image_repo@$d3);" "$dir/effective-policy.txt" ||
+  fail rollback "$(sed -n 2p "$dir/effective-policy.txt")"
+ok rollback
 
 echo "all checks passed"
