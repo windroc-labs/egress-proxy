@@ -177,11 +177,51 @@ run `./verify-egress workers`, `./verify-egress mini-op` and `./verify-egress --
   daemon).
 - Docker end-to-end: `tests/integration.sh` runs in CI only (Linux; it restarts the
   Docker daemon and uses a throwaway Docker client config).
-- CI (`.github/workflows/ci.yml`) runs on every pull request and push to `main`.
+- Release steps (`.github/release_image.py`): `python3 -B -m unittest discover -s .github -p 'test_*.py'`
+  (requires `PyYAML==6.0.2`); no Docker or registry.
+- CI (`.github/workflows/ci.yml`) runs on every pull request and push to `main`, and as
+  the first job of every release.
   Set `CI` as the only required status check in the `main` branch ruleset. It aggregates
-  `rust`, `lint` and `integration`, and fails if any dependency fails, is cancelled or is
-  skipped. When adding a job, add it to `ci.needs`; the `lint` job checks completeness
-  with `.github/check_ci_needs.py` (requires `PyYAML==6.0.2`).
+  `rust`, `lint`, `integration` and `image`, and fails if any dependency fails, is cancelled
+  or is skipped. `image` runs the release path against a local registry: it builds both
+  platforms (`.github/actions/build-image`, arm64 under QEMU), checks the layout and
+  publishes it as version `0.0.0`. When adding a job, add it to `ci.needs`; the `lint` job
+  checks completeness with `.github/check_ci_needs.py` (requires `PyYAML==6.0.2`).
+
+## Release
+
+A release is the image `ghcr.io/windroc/egress-proxy:X.Y.Z` for `linux/amd64` and
+`linux/arm64`, plus the GitHub Release `vX.Y.Z` that gives its index digest. Install and pin
+it by that digest, never by the tag.
+
+1. Merge the change to `main`.
+2. Tag that `main` commit and push the tag: `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`.
+
+The version is semver for the image (`vX.Y.Z` only; no pre-release suffix) and is
+independent of the label contract version, which changes only per
+[docs/label-contract.md](docs/label-contract.md#versioning); the Release notes give both.
+
+`.github/workflows/release.yml` then runs, each job only if the previous one passed:
+
+| Job | Permissions | Does |
+| --- | --- | --- |
+| `checks` | read | all of CI (`ci.yml`) |
+| `prepare` | read | fails unless the tag is `vX.Y.Z` on a commit in `main`, the Release does not exist and the version is not in GHCR yet |
+| `build` | read | builds both platforms into an OCI layout with the [image labels](docs/label-contract.md#image-labels), and checks every layer and the image history: no source, tests, `.git`, build output or credential |
+| `publish` | write | checks the layout again, copies exactly those bytes to GHCR (`skopeo copy --preserve-digests`), verifies the registry's digest and labels, and creates the Release |
+
+A published version never changes: a tag pushed again for an existing version fails in
+`prepare` and leaves GHCR as it was; ship a fix as a new version. If `publish` fails after
+the push but before the Release exists, use "Re-run failed jobs" within a day (while the
+`build` job's layout artifact is kept): `publish` checks the same layout again, accepts the
+tag because it already holds exactly that digest, and creates the Release. "Re-run all
+jobs" fails in `prepare`, since the version is then in GHCR; after that day, create the
+Release by hand from the digest GHCR shows.
+
+Who may publish is set by a tag ruleset, which the repo's owner keeps: target `v*` tags,
+restrict creation, updates and deletion, with only the owner on the bypass list. Without
+it, anyone with write access could tag a commit; the `main` check in `prepare` catches a
+wrong commit but is not a control, since the tagged commit's own `release.yml` runs.
 
 ## Manual checks (Mac)
 
