@@ -211,10 +211,12 @@ independent of the label contract version, which changes only per
 | `publish` | write | checks the layout again, copies exactly those bytes to GHCR (`skopeo copy --preserve-digests`), verifies the registry's digest and labels, and creates the Release |
 
 A published version never changes: a tag pushed again for an existing version fails in
-`prepare` and leaves GHCR as it was; ship a fix as a new version. If a run fails after the
-image was pushed but before the Release exists, re-run it: `prepare` finds the version
-published from the same commit, and `publish` creates the Release from the registry's
-digest without pushing again.
+`prepare` and leaves GHCR as it was; ship a fix as a new version. If `publish` fails after
+the push but before the Release exists, use "Re-run failed jobs" within a day (while the
+`build` job's layout artifact is kept): `publish` checks the same layout again, accepts the
+tag because it already holds exactly that digest, and creates the Release. "Re-run all
+jobs" fails in `prepare`, since the version is then in GHCR; after that day, create the
+Release by hand from the digest GHCR shows.
 
 Who may publish is set by a tag ruleset, which the repo's owner keeps: target `v*` tags,
 restrict creation, updates and deletion, with only the owner on the bypass list. Without

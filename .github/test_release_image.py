@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -244,7 +245,8 @@ class CheckTests(unittest.TestCase):
 
     def test_forbidden_paths(self):
         for path in ("src/main.rs", "app/lib.rs", "Cargo.toml", "x/Cargo.lock", "rust-toolchain.toml",
-                     "Dockerfile", ".git/config", "a/.github/ci.yml", "tests/run.sh", "target/x",
+                     "Dockerfile", ".git/config", "a/.git/HEAD", "a/.github/ci.yml", "tests/run.sh",
+                     "./target/x", "/src/x",
                      "root/.docker/config.json", "run/auth.json", "root/.git-credentials", "root/.netrc"):
             with self.subTest(path=path):
                 err = self.assert_fails(self.check(self.layout(per_platform={"linux/arm64": {path: b"x"}})),
@@ -252,8 +254,10 @@ class CheckTests(unittest.TestCase):
                 self.assertNotIn("linux/amd64", err)
 
     def test_allowed_runtime_paths(self):
+        # usr/src: distroless ships it (empty); src, tests and target count only at the root.
         files = dict(GOOD_FILES, **{"opt/egress/compose.yaml": b"x", "opt/egress/start.sh": b"x",
-                                    "usr/share/doc/srcpkg/copyright": b"x"})
+                                    "usr/share/doc/srcpkg/copyright": b"x", "usr/src/": b"",
+                                    "usr/lib/python3/tests/x": b"x", "usr/lib/target/x": b"x"})
         self.assertEqual(self.check(self.layout(files=files))[0], 0)
 
     def test_token_in_layer_content(self):
@@ -399,54 +403,33 @@ class BuildTests(unittest.TestCase):
         self.assertIn("FAIL build: docker buildx build exited 1", err)
 
 
-class ExistingTests(unittest.TestCase):
-    def existing(self, tools, revision=REVISION):
-        return with_tools(tools, "existing", "--repo", REPO, "--version", VERSION, "--revision", revision,
-                          "--contract", CONTRACT, "--authfile", "/tmp/auth.json")
+class RegistryAbsentTests(unittest.TestCase):
+    def absent(self, tools):
+        return with_tools(tools, "registry-absent", "--repo", REPO, "--version", VERSION,
+                          "--authfile", "/tmp/auth.json")
 
     def test_absent(self):
         tools = FakeTools()
-        self.assertEqual(self.existing(tools)[:2], (0, "absent\n"))
-        (args,) = tools.calls
-        self.assertEqual(args, ["skopeo", "inspect", "--raw", "--authfile", "/tmp/auth.json",
-                                f"docker://{REPO}:{VERSION}"])
+        code, out, err = self.absent(tools)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"ok registry {REPO}:{VERSION} does not exist yet", out)
+        self.assertEqual(tools.calls, [["skopeo", "inspect", "--raw", "--authfile", "/tmp/auth.json",
+                                        f"docker://{REPO}:{VERSION}"]])
 
     def test_not_found_wordings(self):
         for stderr in (b"manifest unknown", b"name unknown: repository name not known", b"404 Not Found"):
             with self.subTest(stderr=stderr):
-                tools = FakeTools(inspect_error=stderr)
-                self.assertEqual(self.existing(tools)[:2], (0, "absent\n"))
+                self.assertEqual(self.absent(FakeTools(inspect_error=stderr))[0], 0)
 
-    def test_resume_same_revision(self):
-        tools = FakeTools(registry={f"{REPO}:{VERSION}": INDEX_RAW})
-        code, out, err = self.existing(tools)
-        self.assertEqual((code, out), (0, f"resume {INDEX_DIGEST}\n"), err)
-        configs = tools.ran("skopeo", "inspect", "--config")
-        self.assertEqual(sorted(c[c.index("--override-arch") + 1] for c in configs), ["amd64", "arm64"])
-        for c in configs:
-            self.assertEqual(c[-1], f"docker://{REPO}@{INDEX_DIGEST}")
-
-    def test_other_revision(self):
-        tools = FakeTools(registry={f"{REPO}:{VERSION}": INDEX_RAW},
-                          configs={"amd64": labels(**{"org.opencontainers.image.revision": "f" * 40}),
-                                   "arm64": labels()})
-        code, out, err = self.existing(tools)
-        self.assertEqual((code, out), (1, ""))
-        self.assertIn(f"FAIL existing: {REPO}:{VERSION} already published from {'f' * 40}", err)
-
-    def test_resume_bad_platform_labels(self):
-        tools = FakeTools(registry={f"{REPO}:{VERSION}": INDEX_RAW},
-                          configs={"amd64": labels(), "arm64": labels(**{"io.windroc.egress-proxy.contract": None})})
-        code, _, err = self.existing(tools)
+    def test_exists(self):
+        code, _, err = self.absent(FakeTools(registry={f"{REPO}:{VERSION}": INDEX_RAW}))
         self.assertEqual(code, 1)
-        self.assertIn("FAIL existing:", err)
-        self.assertIn("linux/arm64", err)
+        self.assertIn(f"FAIL registry: {REPO}:{VERSION} already exists ({INDEX_DIGEST})", err)
 
     def test_registry_error(self):
-        tools = FakeTools(inspect_error=b"denied: permission_denied: read_package")
-        code, out, err = self.existing(tools)
-        self.assertEqual((code, out), (1, ""))
-        self.assertIn("FAIL existing: skopeo inspect exited 1: denied: permission_denied: read_package", err)
+        code, _, err = self.absent(FakeTools(inspect_error=b"denied: permission_denied: read_package"))
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL registry: skopeo inspect exited 1: denied: permission_denied: read_package", err)
 
 
 class PublishTests(unittest.TestCase):
@@ -481,12 +464,21 @@ class PublishTests(unittest.TestCase):
         for c in tools.ran("skopeo", "inspect"):
             self.assertIn("--tls-verify=false", c)
 
-    def test_exists(self):
+    def test_exists_with_other_content(self):
         tools = FakeTools(registry={f"{REPO}:{VERSION}": INDEX_RAW})
         code, _, err = self.publish(tools)
         self.assertEqual(code, 1)
-        self.assertIn(f"FAIL publish: {REPO}:{VERSION} already exists", err)
+        self.assertIn(f"FAIL publish: {REPO}:{VERSION} already exists ({INDEX_DIGEST})", err)
         self.assertEqual(tools.ran("skopeo", "copy"), [])
+        self.assertEqual(tools.ran("skopeo", "inspect", "--config"), [])
+
+    def test_rerun_with_same_content(self):
+        tools = FakeTools(registry={f"{REPO}:{VERSION}": self.raw})
+        code, out, err = self.publish(tools)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"ok publish {REPO}:{VERSION} already holds {self.digest}", out)
+        self.assertEqual(tools.ran("skopeo", "copy"), [])
+        self.assertEqual(len(tools.ran("skopeo", "inspect", "--config")), 2)
 
     def test_registry_error_before_copy(self):
         tools = FakeTools(inspect_error=b"unauthorized: authentication required")
@@ -626,7 +618,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(self.jobs["prepare"]["needs"], "checks")
         self.assertEqual(self.jobs["build"]["needs"], "prepare")
         self.assertEqual(sorted(self.jobs["publish"]["needs"]), ["build", "prepare"])
-        self.assertIn("needs.prepare.result == 'success'", self.jobs["publish"]["if"])
+        # No `if`: each job runs only when every job it needs succeeded.
+        for name in ("prepare", "build", "publish"):
+            self.assertNotIn("if", self.jobs[name], name)
         self.assertEqual(set(self.jobs), {"checks", "prepare", "build", "publish"})
 
     def test_prepare_guards(self):
@@ -635,21 +629,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(prepare["steps"][0]["with"]["fetch-depth"], 0)
         script = "\n".join(runs(prepare))
         for command in ("release_image.py version", "release_image.py on-main", "release_image.py contract",
-                        "release_image.py release-absent", "release_image.py existing"):
+                        "release_image.py release-absent", "release_image.py registry-absent"):
             self.assertIn(command, script)
         self.assertEqual({s["uses"].split("@")[0] for s in prepare["steps"] if "uses" in s}, {"actions/checkout"})
 
-    def test_resume_path(self):
-        self.assertIn("needs.prepare.outputs.state == 'absent'", self.jobs["build"]["if"])
-        self.assertIn("needs.build.result == 'skipped' && needs.prepare.outputs.state == 'resume'",
-                      " ".join(self.jobs["publish"]["if"].split()))
-        for step in self.jobs["publish"]["steps"]:
-            text = step.get("uses", "") + step.get("run", "")
-            if any(k in text for k in ("download-artifact", "release_image.py check", "release_image.py publish")):
-                self.assertEqual(step.get("if"), "needs.prepare.outputs.state == 'absent'", text)
-        create = [s for s in self.jobs["publish"]["steps"] if "release-create" in s.get("run", "")]
-        self.assertEqual(len(create), 1)
-        self.assertNotIn("if", create[0])
+    def test_publish_steps_unconditional(self):
+        for step in self.jobs["publish"]["steps"][:-1]:
+            self.assertNotIn("if", step, step)
+        names = [s["uses"].split("@")[0] if "uses" in s else re.search(r"release_image\.py (\S+)", s["run"]).group(1)
+                 for s in self.jobs["publish"]["steps"][1:-1]]
+        self.assertEqual(names, ["actions/download-artifact", "check", "publish", "release-create"])
 
     def test_write_job_trust(self):
         publish = self.jobs["publish"]
