@@ -75,18 +75,18 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
 
 | Exit code | Meaning |
 | --- | --- |
-| 0 | installed, or a newer running version kept |
+| 0 | installed, or a newer, healthy running proxy kept instead of downgrading |
 | 1 | another failure, e.g. the image's files could not be copied out, or `state/installed` has a newer format |
 | 2 | usage, or Docker is not running or not reachable |
 | 3 | no access to the image: the message names the GitHub login and scope needed |
 | 4 | the pull failed: the message names the image, digest and registry; the running proxy keeps running |
 | 5 | the image is not that version, has no contract label, or has no installer |
-| 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`), and there was no previous version to roll back to: it is left as it is |
-| 7 | the start command failed, and there was no previous version to roll back to |
+| 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`), with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
+| 7 | the start command failed, with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
 | 8 | the installer does not know the `--interface` this `egress-install` speaks |
-| 9 | the proxy was not healthy or the start command failed, and the rollback to the previous version failed too |
-| 10 | the running proxy serves another label contract: the message names both versions and contracts |
-| 11 | the proxy was not healthy or the start command failed; rolled back to the previous version, which is healthy |
+| 9 | the version being installed did not start or was not healthy, and the rollback to the previous version failed too |
+| 10 | the running proxy serves another label contract: nothing was changed; the message names both versions and contracts |
+| 11 | the version being installed did not start or was not healthy; rolled back to the previous version, which is healthy |
 
 Codes 2–5 and 10 leave `~/.egress` and the running proxy as they were.
 

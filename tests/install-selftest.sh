@@ -279,6 +279,41 @@ is() { [[ $1 == "$2" ]]; }
 like() { [[ $1 == *"$2"* ]]; }
 gone() { [[ ! -e $1 ]]; }
 
+# -------- Exit codes --------
+# install.sh's header and README.md's Setup table list the same codes in the same words.
+# header_codes: the header's list, one `<code> <text>` line per code, continuations joined.
+header_codes() {
+  awk '/^# Exit codes/ { on = 1; next }
+    !on { next }
+    /^#   [0-9]/ {
+      if (n++) print line
+      sub(/^# +/, "")
+      code = $1
+      sub(/^[0-9]+ +/, "")
+      line = code " " $0
+      next
+    }
+    n && /^#       / { sub(/^# +/, ""); line = line " " $0; next }
+    n { exit }
+    END { if (n) print line }' "$repo/install.sh"
+}
+# readme_codes: README.md's exit-code table, one `<code> <text>` line per row.
+readme_codes() {
+  awk '/^\| Exit code \| Meaning \|$/ { on = 1; next }
+    on && !/^\|/ { exit }
+    on && /^\| [0-9]/ {
+      sub(/^\| /, "")
+      sub(/ \|$/, "")
+      code = $1
+      sub(/^[0-9]+ \| /, "")
+      print code " " $0
+    }' "$repo/README.md"
+}
+h=$(header_codes) r=$(readme_codes)
+got="$(cut -d' ' -f1 <<<"$h" | xargs) | $(cut -d' ' -f1 <<<"$r" | xargs)"
+check exit_codes_match "codes: $got; diff: $(diff <(echo "$h") <(echo "$r") || true)" \
+  "$(st is "$got:$h" "0 1 2 3 4 5 6 7 8 9 10 11 | 0 1 2 3 4 5 6 7 8 9 10 11:$r")"
+
 # -------- Arguments --------
 fresh usage
 rc=0

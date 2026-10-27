@@ -36,20 +36,28 @@
 # egress-install passes on) marks a rollback: install the given version, newer running
 # proxy or not; older installers ignore it.
 #
-# Exit codes, shared with egress-install (3 and 4 are egress-install's):
-#   0   installed, or a newer running proxy kept
-#   1   other failure
-#   2   usage
-#   5   the image is not that version, or has no contract label
-#   6   not healthy within 120 s, with no previous version to roll back to (or in a
-#       rollback): this one is left as it is
-#   7   start.sh failed, with no previous version to roll back to (or in a rollback):
-#       this one is left as it is
-#   8   unsupported interface
-#   9   did not start or was not healthy, and the rollback failed too
-#   10  the running proxy serves another label contract, nothing changed
-#   11  did not start or was not healthy, rolled back to the previous version, which is
-#       healthy
+# Exit codes, shared with egress-install; README.md's Setup lists the same codes in the
+# same words (tests/install-selftest.sh compares them):
+#   0   installed, or a newer, healthy running proxy kept instead of downgrading
+#   1   another failure, e.g. the image's files could not be copied out, or
+#       `state/installed` has a newer format
+#   2   usage, or Docker is not running or not reachable
+#   3   no access to the image: the message names the GitHub login and scope needed
+#   4   the pull failed: the message names the image, digest and registry; the running
+#       proxy keeps running
+#   5   the image is not that version, has no contract label, or has no installer
+#   6   the proxy was not healthy within 120 s (`docker logs egress-proxy`), with no
+#       previous version to roll back to (or in a rollback): the version being installed
+#       is left as it is
+#   7   the start command failed, with no previous version to roll back to (or in a
+#       rollback): the version being installed is left as it is
+#   8   the installer does not know the `--interface` this `egress-install` speaks
+#   9   the version being installed did not start or was not healthy, and the rollback to
+#       the previous version failed too
+#   10  the running proxy serves another label contract: nothing was changed; the message
+#       names both versions and contracts
+#   11  the version being installed did not start or was not healthy; rolled back to the
+#       previous version, which is healthy
 #
 # Runs on macOS's bash 3.2 and on Linux.
 set -euo pipefail
