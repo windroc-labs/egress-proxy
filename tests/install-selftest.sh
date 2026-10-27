@@ -62,6 +62,11 @@ export REAL_CP REAL_CHMOD REAL_MV
 #   rules          what `proxy rules` prints (default: RULES below)
 #   rules_fail     `proxy rules` fails as a proxy that has not started does
 #   rules_block    `proxy rules` blocks on the hold fifo
+#   legacy.<name>  what `docker images <name>` lists for a locally built image name
+#                  (egress-proxy, egress-proxy-proxy, egress-gateway): `<repo:tag> <id>`
+#                  lines; `image rm` of either removes the line
+#   in_use         image references a container uses: `ps --filter ancestor=` lists one
+#                  (`rm -f`, the container's removal, removes running)
 cat >"$work/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -76,13 +81,27 @@ or() { cat "$FAKE/$1" 2>/dev/null || echo "$2"; }
 # of <name> <image>: the scenario file name for <image>: <name>.<digest> if it exists.
 of() { if [[ -e $FAKE/$1.${2##*@} ]]; then echo "$1.${2##*@}"; else echo "$1"; fi; }
 case $1 in
-  images) or images "" ;;
+  images)
+    case ${!#} in
+      egress-proxy | egress-proxy-proxy | egress-gateway) or "legacy.${!#}" "" ;;
+      *) or images "" ;;
+    esac
+    ;;
+  rm) rm -f "$FAKE/running" ;;
+  ps)
+    if grep -qxF "${!##ancestor=}" "$FAKE/in_use" 2>/dev/null; then echo cid; fi
+    ;;
   image)
     [[ ! -f $FAKE/image_missing ]] || exit 1
     if [[ $2 == rm ]]; then
       ! grep -qxF "$3" "$FAKE/rm_fails" 2>/dev/null || exit 1
       grep -vxF "$3" "$FAKE/images" >"$FAKE/images.new" || true
       "$REAL_MV" "$FAKE/images.new" "$FAKE/images"
+      for f in "$FAKE"/legacy.*; do
+        [[ -f $f ]] || continue
+        awk -v r="$3" '$1 != r && $2 != r' "$f" >"$f.new"
+        "$REAL_MV" "$f.new" "$f"
+      done
     elif [[ $3 == --format ]]; then
       case $4 in
         '{{.Id}}') echo "sha256:id-$5" ;;
@@ -253,7 +272,8 @@ install_killed() {
 fresh() {
   dir=$work/egress-$1
   rm -f "$FAKE/running" "$FAKE/health" "$FAKE/up_fails" "$FAKE/calls" "$FAKE/contract" "$FAKE"/run_* \
-    "$FAKE"/label.* "$FAKE"/health.* "$FAKE"/up_fails.* "$FAKE/logs" "$FAKE/images" "$FAKE/rm_fails"
+    "$FAKE"/label.* "$FAKE"/health.* "$FAKE"/up_fails.* "$FAKE/logs" "$FAKE/images" "$FAKE/rm_fails" \
+    "$FAKE"/legacy.* "$FAKE/in_use" "$FAKE/old_start" "$FAKE/old_start_rc" "$FAKE/old_start_image"
   rm -rf "$FAKE"/egress.*
 }
 out() { cat "$work/out"; }
@@ -878,6 +898,299 @@ is "$rc" 0 || bad+="exit $rc: $(out); "
 is "$(top)" "$TOP" || bad+="top level: $(top); "
 bad+=$(complete_set 1.1.0)
 check links_header_upgrade "$bad" "$(st is "$bad" "")"
+
+# -------- A source-checkout install (FR-11) --------
+# checkout_install: makes $dir a source-checkout install, the layout callers' installers
+# made before the image (v0.5.0): commit $COMMIT checked out in versions/, current
+# linking to it by absolute path, a download left over, the old start.sh's output beside
+# a 0600 config. Its start.sh logs its run to $FAKE/old_start, then starts the old proxy
+# (image egress-proxy, or $FAKE/old_start_image), or exits $FAKE/old_start_rc.
+COMMIT=0123456789abcdef0123456789abcdef01234567
+OLD_CONFIG=$'version: 1\nnetworks:\n  workers:\n    mode: denylist'
+checkout_install() {
+  local v=$dir/versions/$COMMIT
+  mkdir -p "$v" "$dir/versions/.download.x"
+  echo "$COMMIT" >"$v/COMMIT"
+  cat >"$v/start.sh" <<'OLD'
+#!/usr/bin/env bash
+echo "EGRESS_CONFIG_DIR=${EGRESS_CONFIG_DIR:-} $0" >>"$FAKE/old_start"
+rc=$(cat "$FAKE/old_start_rc" 2>/dev/null || echo 0)
+if ((rc == 0)); then cat "$FAKE/old_start_image" 2>/dev/null >"$FAKE/running" || echo egress-proxy >"$FAKE/running"; fi
+exit "$rc"
+OLD
+  "$REAL_CHMOD" 0755 "$v/start.sh"
+  ln -s "$v" "$dir/current"
+  printf '%s\n' "$OLD_CONFIG" >"$dir/config.local.yaml"
+  "$REAL_CHMOD" 0600 "$dir/config.local.yaml"
+  echo "# the old start.sh's override" >"$dir/compose.networks.yaml"
+  echo "# a killed old start's temp file" >"$dir/.compose.networks.abc123"
+}
+# config_id: the config's checksum, and whether its mode is still 0600.
+config_id() { echo "$(sha "$dir/config.local.yaml") $(find "$dir/config.local.yaml" -perm 0600 | wc -l | tr -d ' ')"; }
+LAYOUT="README.md config.example.yaml config.local.yaml effective-policy.txt start.sh state verify-egress"
+# migrated_line [<shown dir>]: the line a migration prints, with <n> images removed.
+migrated_line() {
+  echo "install.sh: migrated the source-checkout install: removed $dir/versions and $dir/current and $1 locally built image(s); the start command is now ${2:-$dir}/start.sh, not current/start.sh"
+}
+# checkout_kept: versions/, current and the config are as checkout_install made them.
+checkout_kept() {
+  [[ -L $dir/current && $(readlink "$dir/current") == "$dir/versions/$COMMIT" && -f $dir/versions/$COMMIT/start.sh &&
+    -d $dir/versions/.download.x && $(config_id) == "$conf" ]]
+}
+
+fresh migrate
+mkdir -p "$dir"
+checkout_install
+conf=$(config_id)
+install 1.0.0 a
+bad=""
+is "$rc" 0 || bad+="exit $rc; "
+is "$(config_id)" "$conf" || bad+="config: $(config_id), was $conf; "
+is "$(top)" "$LAYOUT" || bad+="top: $(top); "
+is "$(cat "$FAKE/running") $(record current_version) $(record current_digest) $(record previous_digest)" \
+  "$(image a) 1.0.0 $(digest a) " || bad+="running $(cat "$FAKE/running"): $(cat "$dir/state/installed"); "
+grep -qxF "$(migrated_line 0)" "$work/out" || bad+="no migrated line; "
+[[ ! -e $FAKE/old_start ]] || bad+="the old start.sh ran; "
+check migrate "$bad: $(out)" "$(st is "$bad" "")"
+
+# Old images: every named row no container uses, by name, or by ID when untagged; never forced.
+fresh migrate_images
+mkdir -p "$dir"
+checkout_install
+printf '%s\n' "egress-proxy:latest sha256:id-old1" "egress-proxy:<none> sha256:id-old2" >"$FAKE/legacy.egress-proxy"
+echo "egress-proxy-proxy:latest sha256:id-old3" >"$FAKE/legacy.egress-proxy-proxy"
+echo "egress-gateway:latest sha256:id-old4" >"$FAKE/legacy.egress-gateway"
+echo egress-gateway:latest >"$FAKE/in_use"
+echo "sha256:id-$(image a)" >"$FAKE/images"
+: >"$FAKE/calls"
+install 1.0.0 a
+bad=""
+is "$rc" 0 || bad+="exit $rc; "
+is "$(cat "$FAKE"/legacy.* | xargs)" "egress-gateway:latest sha256:id-old4" || bad+="left: $(cat "$FAKE"/legacy.* | xargs); "
+grep -qF " image rm sha256:id-old2" "$FAKE/calls" || bad+="the untagged one not by ID; "
+grep -q ' image rm -f' "$FAKE/calls" && bad+="forced removal; "
+is "$(images_left)" "$(image a)" || bad+="images: $(images_left); "
+grep -qxF "$(migrated_line 3)" "$work/out" || bad+="no migrated line; "
+check migrate_images "$bad: $(out)" "$(st is "$bad" "")"
+fresh migrate_images_rm_fails
+mkdir -p "$dir"
+checkout_install
+echo "egress-proxy:latest sha256:id-old1" >"$FAKE/legacy.egress-proxy"
+echo egress-proxy:latest >"$FAKE/rm_fails"
+install 1.0.0 a
+check migrate_images_rm_fails "exit $rc: $(out)" \
+  "$(st is "$rc $(grep -cxF "$(migrated_line 0)" "$work/out" || true) $(gone "$dir/versions" && echo gone)" "0 1 gone")"
+
+# The start command as the user types it, ~/.egress/start.sh, once, on stdout.
+fresh migrate_message
+home=$work/home-migrate tilde='~'
+dir=$home/.egress
+mkdir -p "$dir"
+checkout_install
+echo 1.0.0 >"$FAKE/label"
+rc=0
+HOME=$home PATH="$work/fast:$work/bin:$PATH" bash "$files/install.sh" --interface 1 --version 1.0.0 \
+  --digest "$(digest a)" --dir "$dir" --image "$(image a)" --files "$files" >"$work/out" 2>"$work/stderr" || rc=$?
+check migrate_message "exit $rc: $(out)" \
+  "$(st is "$rc $(grep -cxF "$(migrated_line 0 "$tilde/.egress")" "$work/out" || true)" "0 1")"
+
+# A migration killed after its record: the next install finishes it, the old start.sh untouched.
+fresh migrate_resumed
+install 1.0.0 a
+checkout_install
+conf=$(config_id)
+echo "egress-proxy:latest sha256:id-old1" >"$FAKE/legacy.egress-proxy"
+install 1.1.0 b
+bad=""
+is "$rc" 0 || bad+="exit $rc; "
+is "$(top)" "$LAYOUT" || bad+="top: $(top); "
+is "$(config_id)" "$conf" || bad+="config changed; "
+is "$(cat "$FAKE/legacy.egress-proxy")" "" || bad+="old image left; "
+is "$(grep -cxF "$(migrated_line 1)" "$work/out" || true)" 1 || bad+="no migrated line; "
+check migrate_resumed "$bad: $(out)" "$(st is "$bad" "")"
+
+# Entries named current or versions without the source-checkout shape are left alone.
+# checkout_tree: every path under current and versions, with link targets and checksums.
+checkout_tree() {
+  (cd "$dir" && { find current versions 2>/dev/null || true; } | sort | while read -r p; do
+    if [[ -L $p ]]; then echo "$p -> $(readlink "$p")"; elif [[ -f $p ]]; then echo "$p $(cksum <"$p")"; else echo "$p/"; fi
+  done)
+}
+# foreign <case> <entries named in the message>: the install succeeded, left them as
+# $before holds them and said so.
+foreign() {
+  local bad=""
+  is "$rc" 0 || bad+="exit $rc; "
+  grep -qxF "install.sh: left $2 as found: not a source-checkout install" "$work/out" || bad+="no left line; "
+  like "$(out)" "migrated the source-checkout install" && bad+="it migrated; "
+  [[ ! -e $FAKE/old_start ]] || bad+="the old start.sh ran; "
+  is "$(checkout_tree)" "$before" || bad+="changed: $(checkout_tree | xargs); "
+  check "$1" "$bad: $(out)" "$(st is "$bad" "")"
+}
+fresh migrate_foreign_current
+mkdir -p "$dir/current"
+echo mine >"$dir/current/notes.txt"
+before=$(checkout_tree)
+install 1.0.0 a
+foreign migrate_foreign_current "$dir/current"
+fresh migrate_foreign_current_elsewhere
+mkdir -p "$dir" "$work/elsewhere/$COMMIT"
+ln -s "$work/elsewhere/$COMMIT" "$dir/current"
+before=$(checkout_tree)
+install 1.0.0 a
+foreign migrate_foreign_current_elsewhere "$dir/current"
+n=0
+for extra in notes.txt symlink ..x; do
+  n=$((n + 1))
+  fresh "migrate_foreign_versions_$n"
+  mkdir -p "$dir"
+  checkout_install
+  case $extra in
+    notes.txt | ..x) echo mine >"$dir/versions/$extra" ;;
+    symlink) ln -s "$work/elsewhere/$COMMIT" "$dir/versions/fedcba9876543210fedcba9876543210fedcba98" ;;
+  esac
+  before=$(checkout_tree)
+  install 1.0.0 a
+  foreign "migrate_foreign_versions_$n ($extra)" "$dir/current and $dir/versions"
+done
+
+# A rollback install, and an install refused for another contract, leave it all.
+fresh migrate_rollback_mode
+mkdir -p "$dir"
+checkout_install
+conf=$(config_id)
+EGRESS_INSTALL_ROLLBACK=1 install 1.0.0 a
+check migrate_rollback_mode "exit $rc: $(out)" \
+  "$(st is "$rc $(checkout_kept && echo kept) $(grep -c 'migrated the source-checkout' "$work/out" || true)" "0 kept 0")"
+fresh migrate_contract_differs
+mkdir -p "$dir"
+checkout_install
+conf=$(config_id)
+before=$(tree)
+echo egress-proxy >"$FAKE/running"
+echo 2 >"$FAKE/run_contract"
+install 1.0.0 a
+check migrate_contract_differs "exit $rc: $(out)" "$(st is "$rc $(is "$(tree)" "$before" && echo same)" "10 same")"
+fresh migrate_refused_image
+mkdir -p "$dir"
+checkout_install
+before=$(tree)
+echo "<no value>" >"$FAKE/contract"
+install 1.0.0 a
+rm -f "$FAKE/contract"
+check migrate_refused_image "exit $rc: $(out)" "$(st is "$rc $(is "$(tree)" "$before" && echo same)" "5 same")"
+# A newer, published proxy kept: nothing changes, the checkout included.
+fresh migrate_keep_newer
+install 1.2.0 c
+checkout_install
+conf=$(config_id)
+echo 1.2.0 >"$FAKE/run_label"
+echo "$REPO@$(digest c)" >"$FAKE/run_repodigests"
+install 1.1.0 b
+check migrate_keep_newer "exit $rc: $(out)" \
+  "$(st is "$rc $(checkout_kept && echo kept) $(grep -c 'migrated the source-checkout' "$work/out" || true)" "0 kept 0")"
+
+# -------- A failed migration: back to the source checkout (FR-11) --------
+OLD_START=""
+# migrate_failed <case> <code> <cause line> <last line>: exit <code> after <cause line>, the
+# checkout kept as it was, the image layout's files gone and no image removed.
+migrate_failed() {
+  local bad="" old
+  is "$rc" "$2" || bad+="exit $rc; "
+  grep -qxF "$3" "$work/out" || bad+="no cause line; "
+  grep -qxF "install.sh: rolling back to the source-checkout install: $OLD_START" "$work/out" || bad+="no rolling-back line; "
+  is "$(tail -n 1 "$work/out")" "$4" || bad+="last line: $(tail -n 1 "$work/out"); "
+  old=$(cat "$FAKE/old_start" 2>/dev/null || true)
+  is "$old" "EGRESS_CONFIG_DIR=$dir $OLD_START" || bad+="old start: $old; "
+  checkout_kept || bad+="the checkout changed; "
+  is "$(top)" ".compose.networks.abc123 compose.networks.yaml config.local.yaml current versions" || bad+="top: $(top); "
+  grep -qE ' rm -f egress-proxy$' "$FAKE/calls" || bad+="the failed container was not removed; "
+  grep -qE ' image rm ' "$FAKE/calls" && bad+="an image was removed; "
+  check "$1" "$bad: $(out)" "$(st is "$bad" "")"
+}
+# failed_migration <case>: a source-checkout install, and its old proxy's last log line.
+failed_migration() {
+  fresh "$1"
+  mkdir -p "$dir"
+  checkout_install
+  conf=$(config_id)
+  OLD_START=$dir/versions/$COMMIT/start.sh
+  echo "proxy: no route" >"$FAKE/logs"
+  echo "egress-proxy:latest sha256:id-old1" >"$FAKE/legacy.egress-proxy"
+  : >"$FAKE/calls"
+}
+NOT_HEALTHY="install.sh: egress-proxy 1.0.0 ($(digest a)) did not become healthy within 120 s; see docker logs egress-proxy"
+failed_migration migrate_rollback
+echo starting >"$FAKE/health.$(digest a)"
+install 1.0.0 a
+migrate_failed migrate_rollback 11 "$NOT_HEALTHY" \
+  "install.sh: rolled back to the source-checkout install ($OLD_START), which is healthy; egress-proxy 1.0.0 was not installed; see docker logs egress-proxy"
+is "$(cat "$FAKE/running")" egress-proxy || fail migrate_rollback "running $(cat "$FAKE/running")"
+
+failed_migration migrate_rollback_start_fails
+touch "$FAKE/up_fails.$(digest a)"
+install 1.0.0 a
+migrate_failed migrate_rollback_start_fails 11 \
+  "install.sh: the start command failed (exit 1) for egress-proxy 1.0.0 ($(digest a)); see docker logs egress-proxy" \
+  "install.sh: rolled back to the source-checkout install ($OLD_START), which is healthy; egress-proxy 1.0.0 was not installed; see docker logs egress-proxy"
+
+failed_migration migrate_rollback_fails
+echo starting >"$FAKE/health.$(digest a)"
+echo 3 >"$FAKE/old_start_rc"
+install 1.0.0 a
+migrate_failed migrate_rollback_fails 9 "$NOT_HEALTHY" \
+  "install.sh: rolling back to the source-checkout install ($OLD_START) failed (exit 3); see docker logs egress-proxy"
+
+failed_migration migrate_rollback_not_healthy
+echo starting >"$FAKE/health.$(digest a)"
+echo starting >"$FAKE/health.egress-proxy"
+install 1.0.0 a
+migrate_failed migrate_rollback_not_healthy 9 "$NOT_HEALTHY" \
+  "install.sh: rolling back to the source-checkout install ($OLD_START) failed (not healthy within 120 s); see docker logs egress-proxy"
+
+# The old start.sh left this version running: not the old proxy, so not healthy.
+failed_migration migrate_rollback_same_image
+touch "$FAKE/up_fails.$(digest a)"
+image a >"$FAKE/old_start_image"
+install 1.0.0 a
+migrate_failed migrate_rollback_same_image 9 \
+  "install.sh: the start command failed (exit 1) for egress-proxy 1.0.0 ($(digest a)); see docker logs egress-proxy" \
+  "install.sh: rolling back to the source-checkout install ($OLD_START) failed (not healthy within 120 s); see docker logs egress-proxy"
+
+# No start.sh to go back to: as a first install, the new version is left as it is.
+failed_migration migrate_no_old_start
+rm "$dir/versions/$COMMIT/start.sh"
+echo starting >"$FAKE/health.$(digest a)"
+install 1.0.0 a
+no_rollback migrate_no_old_start 6 "$NOT_HEALTHY"
+[[ -L $dir/current && -d $dir/versions/$COMMIT && -L $dir/start.sh ]] || fail migrate_no_old_start "top: $(top)"
+
+# Foreign entries: never run, as a first install.
+fresh migrate_foreign_rollback
+mkdir -p "$dir/current"
+cat >"$dir/current/start.sh" <<'FOREIGN'
+#!/usr/bin/env bash
+touch "$FAKE/old_start"
+FOREIGN
+echo starting >"$FAKE/health.$(digest a)"
+install 1.0.0 a
+no_rollback migrate_foreign_rollback 6 "$NOT_HEALTHY"
+[[ ! -e $FAKE/old_start && -f $dir/current/start.sh ]] || fail migrate_foreign_rollback "the foreign start.sh ran, or is gone"
+
+# Once an image install is recorded, a failure rolls back to it, not to the checkout.
+fresh migrate_resumed_rollback
+install 1.0.0 a
+old_image a 1.0.0
+checkout_install
+conf=$(config_id)
+echo starting >"$FAKE/health.$(digest b)"
+install 1.1.0 b
+bad=""
+is "$rc $(tail -n 1 "$work/out")" "11 install.sh: rolled back to egress-proxy 1.0.0 ($(digest a)), which is healthy; egress-proxy 1.1.0 was not installed; see docker logs egress-proxy" ||
+  bad+="exit $rc; "
+[[ ! -e $FAKE/old_start ]] || bad+="the old start.sh ran; "
+checkout_kept || bad+="the rollback install removed the checkout; "
+check migrate_resumed_rollback "$bad: $(out)" "$(st is "$bad" "")"
 
 # -------- egress-install --------
 # The image's installer, for these cases: records its arguments, exits install_rc.

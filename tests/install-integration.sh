@@ -6,7 +6,8 @@
 # with real Docker, a throwaway Docker client config and no gh login. A docker shim logs
 # every call and refuses any build. <registry container> is the registry's container,
 # stopped to take the registry offline, then started again for the upgrades: images built
-# FROM the installed one with other version labels, one never healthy, pushed there.
+# FROM the installed one with other version labels, one never healthy, pushed there. Last,
+# a source-checkout install (the v0.5.0 layout) migrates, once rolled back, once for good.
 # Linux CI only: it starts the proxy and its networks. Prints `ok <check>` per check and
 # stops at the first `FAIL <check>: <detail>`.
 set -euo pipefail
@@ -32,11 +33,13 @@ mkdir -p "$TMPDIR" "$work/bin" "$work/docker"
 export DOCKER_CONFIG=$work/docker
 echo '{}' >"$DOCKER_CONFIG/config.json"
 real_docker=$(command -v docker)
-# The shim: logs every call; any build fails the run.
+# The shim: logs every call; any build fails the run, but the source checkout's own (its
+# start.sh builds from its directory under $work/legacy).
 cat >"$work/bin/docker" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >>"$work/docker.log"
 case " \$* " in
+  *" --project-directory $work/legacy/current "* | *" --project-directory $work/legacy/versions/"*) ;;
   *" build "* | *" buildx "*)
     echo "install-integration.sh: a build ran: docker \$*" >&2
     exit 99
@@ -58,7 +61,7 @@ cleanup() {
     echo "--- docker logs $PX (last 50 lines)"
     "$real_docker" logs --tail 50 "$PX" 2>&1 || true
   fi
-  "$real_docker" rm -f "$PX" >/dev/null 2>&1 || true
+  "$real_docker" rm -f "$PX" egress-test-caller egress-test-gateway >/dev/null 2>&1 || true
   "$real_docker" network rm egress-workers egress-uplink >/dev/null 2>&1 || true
   "$real_docker" start "$registry" >/dev/null 2>&1 || true
   rm -rf "$work"
@@ -242,5 +245,89 @@ grep -qxF "current_digest=$d3" "$dir/state/installed" || fail rollback "$(cat "$
 grep -qF "for egress-proxy 0.0.3 (image $image_repo@$d3);" "$dir/effective-policy.txt" ||
   fail rollback "$(sed -n 2p "$dir/effective-policy.txt")"
 ok rollback
+
+# -------- A source-checkout install: the migration (FR-11) --------
+# The layout callers' installers made before the image (v0.5.0): the checkout of commit
+# 122d7454 in versions/<commit>/, current linking to it, the config beside them, and the
+# proxy built from the checkout by its start.sh. The stand-in checkout is
+# tests/fixtures/v050-egress (that commit's start.sh and compose.yaml) with a Dockerfile
+# FROM 0.0.3 in place of the Rust build, adding a layer of its own as a source build does:
+# without one the build is 0.0.3's image, which the migrated proxy uses, and stays. Its
+# builds run on the docker-driver builder, as derive's do.
+export BUILDX_BUILDER=default
+legacy=$work/legacy
+commit=122d7454d738db4a9b7e0c4a89d2cfa5ff564339
+checkout=$legacy/versions/$commit
+mkdir -p "$checkout"
+cp "$repo/tests/fixtures/v050-egress/start.sh" "$repo/tests/fixtures/v050-egress/compose.yaml" "$checkout/"
+echo "$commit" >"$checkout/COMMIT"
+printf 'FROM %s\nCOPY COMMIT /v050-commit\n' "$image_repo@$d3" >"$checkout/Dockerfile"
+ln -s "$checkout" "$legacy/current"
+# Readable by the proxy's user: Docker Desktop maps a 0600 file, Linux does not.
+printf 'version: 1\nnetworks:\n  workers:\n    mode: denylist\n' >"$legacy/config.local.yaml"
+chmod 0644 "$legacy/config.local.yaml"
+conf=$(sha256sum "$legacy/config.local.yaml")
+rc=0
+EGRESS_CONFIG_DIR=$legacy bash "$legacy/current/start.sh" || rc=$?
+((rc == 0)) || fail migrate "the source checkout's start.sh exited $rc"
+wait_health || fail migrate "the source checkout's proxy is not healthy"
+[[ $(inspect '{{.Config.Image}}') == egress-proxy ]] || fail migrate "$PX runs $(inspect '{{.Config.Image}}')"
+# An older build's name for the same image, and an image of the old name egress-gateway
+# that a (stopped) container uses.
+docker tag egress-proxy egress-proxy-proxy
+printf 'FROM %s\nCOPY gateway.Dockerfile /gateway\n' "$image_repo@$d3" >"$work/gateway.Dockerfile"
+"$real_docker" buildx build --builder default --load -q -t egress-gateway -f "$work/gateway.Dockerfile" "$work" >/dev/null
+docker create --name egress-test-gateway egress-gateway >/dev/null
+# A caller on the workers network, attached before the migration, from the probe image
+# verify-egress pins.
+PROBE_IMAGE=$(sed -n 's/^PROBE_IMAGE=//p' "$repo/verify-egress")
+[[ -n $PROBE_IMAGE ]] || fail migrate_callers "no PROBE_IMAGE line in verify-egress"
+docker run -d --name egress-test-caller --network egress-workers --entrypoint sleep "$PROBE_IMAGE" 3600 >/dev/null
+nets() { docker network inspect --format '{{.Id}}' egress-workers egress-uplink; }
+nets_before=$(nets)
+# caller_ok: the caller still runs, on egress-workers, which has the same ID.
+caller_ok() {
+  [[ $(docker inspect --format '{{.State.Running}} {{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' egress-test-caller) == "true egress-workers " &&
+    $(nets) == "$nets_before" ]]
+}
+caller_ok || fail migrate_callers "the caller is not on egress-workers"
+
+# 0.0.4 never becomes healthy: back to the checkout's start.sh, the old files kept.
+rc=0
+out=$("$repo/egress-install" --version 0.0.4 --digest "$d4" --dir "$legacy" 2>&1) || rc=$?
+((rc == 11)) || fail migrate_rollback "egress-install exited $rc: $out"
+[[ $out == *"install.sh: rolled back to the source-checkout install ($checkout/start.sh), which is healthy; egress-proxy 0.0.4 was not installed; see docker logs egress-proxy" ]] ||
+  fail migrate_rollback "$out"
+[[ $(inspect '{{.Config.Image}}') == egress-proxy && $(inspect '{{.State.Health.Status}}') == healthy ]] ||
+  fail migrate_rollback "$PX runs $(inspect '{{.Config.Image}}'), $(inspect '{{.State.Health.Status}}')"
+[[ $(readlink "$legacy/current") == "$checkout" && -f $checkout/start.sh && $(sha256sum "$legacy/config.local.yaml") == "$conf" ]] ||
+  fail migrate_rollback "the source checkout changed: $(ls -la "$legacy")"
+got=$(cd "$legacy" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | sort | xargs)
+[[ $got == "compose.networks.yaml config.local.yaml current versions" ]] || fail migrate_rollback "$got"
+caller_ok || fail migrate_rollback "the caller lost egress-workers"
+ok migrate_rollback
+
+# 0.0.3: the migration.
+rc=0
+out=$("$repo/egress-install" --version 0.0.3 --digest "$d3" --dir "$legacy" 2>&1) || rc=$?
+((rc == 0)) || fail migrate "egress-install exited $rc: $out"
+[[ $(inspect '{{.Config.Image}}') == "$image_repo@$d3" && $(inspect '{{.State.Health.Status}}') == healthy ]] ||
+  fail migrate "$PX runs $(inspect '{{.Config.Image}}'), $(inspect '{{.State.Health.Status}}')"
+[[ $(sha256sum "$legacy/config.local.yaml") == "$conf" ]] || fail migrate "the config changed"
+got=$(cd "$legacy" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | sort | xargs)
+[[ $got == "README.md config.example.yaml config.local.yaml effective-policy.txt start.sh state verify-egress" ]] ||
+  fail migrate "$got"
+[[ $out == *"install.sh: migrated the source-checkout install: removed $legacy/versions and $legacy/current and "*" locally built image(s); the start command is now $legacy/start.sh, not current/start.sh"* ]] ||
+  fail migrate "$out"
+ok migrate
+[[ -z $(docker images -q egress-proxy) && -z $(docker images -q egress-proxy-proxy) ]] ||
+  fail migrate_images "left: $(docker images egress-proxy) $(docker images egress-proxy-proxy)"
+[[ -n $(docker images -q egress-gateway) ]] || fail migrate_images "egress-gateway, which a container uses, is gone"
+ok migrate_images
+caller_ok || fail migrate_callers "the caller lost egress-workers"
+rc=0
+"$legacy/verify-egress" workers || rc=$?
+((rc == 0)) || fail migrate_callers "verify-egress workers exited $rc"
+ok migrate_callers
 
 echo "all checks passed"

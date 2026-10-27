@@ -73,6 +73,18 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
    previous one stay (`docker images ghcr.io/windroc/egress-proxy`). An image a container
    still uses stays too. A rollback leaves this to the next install.
 
+An install from source checkouts, as callers' installers made it before the image (e.g.
+ensemble v0.5.0: `~/.egress/versions/<commit>/`, `~/.egress/current` linking to it), is
+migrated by the same command. `config.local.yaml` is kept byte for byte, and the caller
+networks and the callers on them stay. Once the new version is healthy, the install removes
+`versions/`, `current`, the old `compose.networks.yaml` and the locally built images
+`egress-proxy`, `egress-proxy-proxy` and `egress-gateway` that no container uses, and prints
+the new start command, `~/.egress/start.sh` (`current/start.sh` is gone). If the new version
+does not start or is not healthy, the install removes the new files, runs the checkout's own
+`start.sh` to bring the old proxy back, keeps the old files, and exits 11 (9 if the old
+proxy does not come back either). Only that exact layout is migrated: a `current` or
+`versions` of another shape is left as found and never run.
+
 | Exit code | Meaning |
 | --- | --- |
 | 0 | installed, or a newer, healthy running proxy kept instead of downgrading |
@@ -84,9 +96,9 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
 | 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`), with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
 | 7 | the start command failed, with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
 | 8 | the installer does not know the `--interface` this `egress-install` speaks |
-| 9 | the version being installed did not start or was not healthy, and the rollback to the previous version failed too |
+| 9 | the version being installed did not start or was not healthy, and the rollback to the previous version (migrating a source-checkout install: to it, with its start.sh) failed too |
 | 10 | the running proxy serves another label contract: nothing was changed; the message names both versions and contracts |
-| 11 | the version being installed did not start or was not healthy; rolled back to the previous version, which is healthy |
+| 11 | the version being installed did not start or was not healthy; rolled back to the previous version (migrating a source-checkout install: to it, with its start.sh), which is healthy |
 
 Codes 2–5 and 10 leave `~/.egress` and the running proxy as they were.
 
