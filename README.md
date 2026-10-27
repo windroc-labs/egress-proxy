@@ -60,8 +60,8 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
 | Exit code | Meaning |
 | --- | --- |
 | 0 | installed |
-| 1 | another failure, e.g. a newer `state/installed` format |
-| 2 | usage, or no Docker context |
+| 1 | another failure, e.g. the image's files could not be copied out, or `state/installed` has a newer format |
+| 2 | usage, or Docker is not running or not reachable |
 | 3 | no access to the image: the message names the GitHub login and scope needed |
 | 4 | the pull failed: the message names the image, digest and registry; the running proxy keeps running |
 | 5 | the image is not that version, or has no installer |
@@ -69,7 +69,7 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
 | 7 | the start command failed |
 | 8 | the installer does not know the `--interface` this `egress-install` speaks |
 
-Codes 0–5 leave `~/.egress` and the running proxy as they were.
+Codes 2–5 leave `~/.egress` and the running proxy as they were.
 
 `~/.egress` then holds only:
 

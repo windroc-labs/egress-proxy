@@ -15,9 +15,9 @@ uses nothing else and never probes the proxy itself.
 
 The network keys are the sections of the proxy's local config (`~/.egress/config.local.yaml`);
 the start command (`~/.egress/start.sh`) renders the networks and per-network labels from
-them, so they always match the networks the proxy is attached to. Every key in `windroc.egress.networks` has both `.name`
-and `.proxy` labels. The proxy URL uses the proxy's alias on that network, so it stays the
-same when the proxy restarts.
+them, so they always match the networks the proxy is attached to. Every key in
+`windroc.egress.networks` has both `.name` and `.proxy` labels. The proxy URL uses the
+proxy's alias on that network, so it stays the same when the proxy restarts.
 
 ## Consumer rules
 

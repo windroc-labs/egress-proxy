@@ -49,7 +49,9 @@ repo=${EGRESS_IMAGE_REPO:-ghcr.io/windroc/egress-proxy}
 image=$repo@$digest
 registry=${repo%%/*}
 
-tmp=$(mktemp -d)
+# Named under TMPDIR explicitly: macOS's mktemp -d alone ignores it.
+tmp=${TMPDIR:-/tmp}
+tmp=$(mktemp -d "${tmp%/}/egress-install.XXXXXX")
 cid=""
 cleanup() {
   if [[ -n $cid ]]; then docker rm -f "$cid" >/dev/null 2>&1 || true; fi

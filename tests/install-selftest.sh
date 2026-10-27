@@ -6,6 +6,8 @@
 # DOCKER_HOST points at a socket that does not exist.
 # Prints `ok <case>` or `FAIL <case>: <detail>`; exits 1 if any case fails.
 set -euo pipefail
+# Byte order for sort, on macOS too.
+export LC_ALL=C
 repo=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
