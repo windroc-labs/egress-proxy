@@ -7,7 +7,10 @@
 #
 # It writes the image's runtime files to <dir> as one runtime set, writes the default
 # config when there is none, runs the start command, waits for the proxy to be healthy and
-# records the installed version. Layout of <dir>:
+# records the installed version. First it checks the running proxy (FR-12): one of
+# another label contract stops the install; a healthy one of a higher version, published
+# (pulled by the digest <dir>'s record names) and of the same contract is kept, not
+# downgraded. Layout of <dir>:
 #
 #   config.local.yaml          the user's config; written once, never replaced
 #   README.md, start.sh, verify-egress, config.example.yaml
@@ -26,9 +29,13 @@
 #
 # Handoff contract, interface 1 (egress-install of any version drives this): every
 # option takes exactly one value; later interfaces add only optional options; unknown
-# options are ignored with a warning. Exit codes, shared with egress-install: 0
-# installed; 1 other failure; 2 usage; 5 the image is not that version; 6 not healthy
-# within 120 s; 7 start.sh failed; 8 unsupported interface. (3 and 4 are egress-install's.)
+# options are ignored with a warning. EGRESS_INSTALL_ROLLBACK=1 in the environment (which
+# egress-install passes on) marks a rollback: install the given version, newer running
+# proxy or not; older installers ignore it. Exit codes, shared with egress-install: 0
+# installed, or a newer running proxy kept; 1 other failure; 2 usage; 5 the image is not
+# that version, or has no contract label; 6 not healthy within 120 s; 7 start.sh failed;
+# 8 unsupported interface; 10 the running proxy serves another label contract, nothing
+# changed. (3 and 4 are egress-install's.)
 #
 # Runs on macOS's bash 3.2 and on Linux.
 set -euo pipefail
@@ -76,10 +83,14 @@ for f in $FILES; do
 done
 
 # -------- Checks before any change --------
-label=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image" 2>/dev/null) ||
-  label=""
+labels=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "io.windroc.egress-proxy.contract"}}' "$image" 2>/dev/null) ||
+  labels=""
+label=${labels%%|*} contract=""
+[[ $labels == *'|'* ]] && contract=${labels#*|}
 [[ $label == "<no value>" ]] && label=""
+[[ $contract == "<no value>" ]] && contract=""
 [[ $label == "$version" ]] || die 5 "$image is version ${label:-none}, not $version"
+[[ -n $contract ]] || die 5 "$image has no label contract version (io.windroc.egress-proxy.contract)"
 
 state=$dir/state
 record=$state/installed
@@ -91,6 +102,39 @@ record_get() {
 format=$(record_get format)
 if [[ -n $format ]] && ! [[ $format =~ ^[0-9]+$ && $format -le 1 ]]; then
   die 1 "$record has format $format; this installer knows format 1; nothing was changed"
+fi
+
+# -------- The running proxy (FR-12) --------
+# A rollback installs the version it is given, so it skips this check: the newer version
+# it replaces may have turned healthy late.
+semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+# newer <a> <b>: version <a> is higher than version <b> (both X.Y.Z).
+newer() {
+  local a1 a2 a3 b1 b2 b3
+  IFS=. read -r a1 a2 a3 <<<"$1"
+  IFS=. read -r b1 b2 b3 <<<"$2"
+  ((a1 > b1 || (a1 == b1 && (a2 > b2 || (a2 == b2 && a3 > b3)))))
+}
+if [[ ${EGRESS_INSTALL_ROLLBACK:-} != 1 ]] &&
+  running=$(docker inspect --format '{{.Image}}|{{.State.Running}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{index .Config.Labels "windroc.egress.contract"}}' egress-proxy 2>/dev/null); then
+  IFS='|' read -r r_id r_running r_health r_contract <<<"$running"
+  [[ $r_contract == "<no value>" ]] && r_contract=""
+  r_image=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}|{{range .RepoDigests}}{{.}} {{end}}' "$r_id" 2>/dev/null) ||
+    r_image=""
+  r_version=${r_image%%|*} r_digests=""
+  [[ $r_image == *'|'* ]] && r_digests=${r_image#*|}
+  [[ $r_version == "<no value>" ]] && r_version=""
+  if [[ -n $r_contract && $r_contract != "$contract" ]]; then
+    die 10 "the running egress-proxy ${r_version:-unknown version} serves label contract $r_contract, and egress-proxy $version serves contract $contract; nothing was changed (to replace it: docker rm -f egress-proxy, then install again)"
+  fi
+  # Published: pulled by the digest this directory's record names. A RepoDigest alone is
+  # not enough: Docker's containerd image store gives a retagged local build one too.
+  r_digest=$(record_get current_digest)
+  if [[ $r_running == true && $r_health == healthy && $r_contract == "$contract" && -n $r_digest && " $r_digests " == *" ${image%@*}@$r_digest "* &&
+    $r_version =~ $semver ]] && newer "$r_version" "$version"; then
+    echo "install.sh: kept the running egress-proxy $r_version ($r_digest), newer than $version; nothing was changed"
+    exit 0
+  fi
 fi
 
 # -------- The new runtime set --------

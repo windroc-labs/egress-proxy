@@ -47,29 +47,37 @@ a caller that pins it, never from a tag lookup.
 
 It then copies the image's `/egress` out and runs its `install.sh`, which:
 
-1. writes the runtime files as one set under `~/.egress/state/` and switches the
+1. checks the running proxy, `egress-proxy`, and changes nothing when it serves another
+   [label contract](docs/label-contract.md) (exit 10) or when it is a newer version to
+   keep: healthy, of the same contract, with a higher version label, and published, i.e.
+   pulled by the digest `~/.egress/state/installed` names as current (a local build, even
+   tagged `ghcr.io/windroc/egress-proxy:<higher>`, is replaced). Keeping it, it says so
+   and exits 0. A newer version is never downgraded, so callers pinning an older one
+   share the newest;
+2. writes the runtime files as one set under `~/.egress/state/` and switches the
    top-level files to it with one rename, so a killed install leaves the old set or the
    new one, never a mix;
-2. writes the default config (`config.default.yaml`) when `config.local.yaml` does not
+3. writes the default config (`config.default.yaml`) when `config.local.yaml` does not
    exist, and never changes an existing one;
-3. runs `~/.egress/start.sh` and waits up to 120 s for the proxy to be healthy with the
+4. runs `~/.egress/start.sh` and waits up to 120 s for the proxy to be healthy with the
    [label contract](docs/label-contract.md)'s labels;
-4. records the version, digest and image as current, and the one before as previous, in
+5. records the version, digest and image as current, and the one before as previous, in
    `~/.egress/state/installed`.
 
 | Exit code | Meaning |
 | --- | --- |
-| 0 | installed |
+| 0 | installed, or a newer running version kept |
 | 1 | another failure, e.g. the image's files could not be copied out, or `state/installed` has a newer format |
 | 2 | usage, or Docker is not running or not reachable |
 | 3 | no access to the image: the message names the GitHub login and scope needed |
 | 4 | the pull failed: the message names the image, digest and registry; the running proxy keeps running |
-| 5 | the image is not that version, or has no installer |
+| 5 | the image is not that version, has no contract label, or has no installer |
 | 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`) |
 | 7 | the start command failed |
 | 8 | the installer does not know the `--interface` this `egress-install` speaks |
+| 10 | the running proxy serves another label contract: the message names both versions and contracts |
 
-Codes 2–5 leave `~/.egress` and the running proxy as they were.
+Codes 2–5 and 10 leave `~/.egress` and the running proxy as they were.
 
 `~/.egress` then holds only:
 
