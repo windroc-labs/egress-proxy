@@ -1,6 +1,7 @@
 # The egress proxy image: one smokescreen per caller network, started and supervised by
 # the Rust entrypoint /proxy, which generates each network's policy at start from the
-# mounted local config. compose builds it locally; no prebuilt image is pulled.
+# mounted local config. compose builds it locally; no prebuilt image is pulled. CI
+# publishes it for both architectures on a version tag (README.md › Release).
 ARG TARGETARCH
 
 # smokescreen v0.1.0 (github.com/stripe/smokescreen, tag commit 609eb8931420453daf5893509be0b25b21bd9edb):

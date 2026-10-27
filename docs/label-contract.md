@@ -39,6 +39,24 @@ attach the caller only to that network and point its proxy settings (`HTTP_PROXY
 Never mount `~/.egress`, the egress checkout or the Docker socket into a caller container:
 a caller that can edit them controls the proxy's next policy or build.
 
+## Image labels
+
+Images published by CI ([README › Release](../README.md#release)) carry these labels on
+every platform's image config; a locally built image has none of them:
+
+| Label | Value |
+| --- | --- |
+| `org.opencontainers.image.version` | the release version `X.Y.Z` (tag `vX.Y.Z`) |
+| `org.opencontainers.image.revision` | the commit the image was built from |
+| `org.opencontainers.image.source` | `https://github.com/windroc/egress-proxy` |
+| `io.windroc.egress-proxy.contract` | this contract's version, copied from compose.yaml's `windroc.egress.contract` at build |
+
+They describe the image, for comparing versions; they are not part of the discovery rules
+above. Consumers find the proxy only by the container label `windroc.egress.contract`. The
+image's contract label is outside `windroc.egress.*` because every container inherits its
+image's labels: a `windroc.egress.*` image label would also mark one-off containers run from
+the image, and appear among the proxy container's contract labels.
+
 ## Versioning
 
 A change that breaks a rule or a label's meaning bumps `windroc.egress.contract`; a
