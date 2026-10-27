@@ -40,6 +40,9 @@ export REAL_CP REAL_CHMOD REAL_MV
 #   running        the image `compose up` last started (what inspect reports)
 #   health         the container's health (default healthy)
 #   created        the image of the last `docker create`
+#   images         the image IDs `docker images` lists, one per line (an image's ID is
+#                  sha256:id-<its reference>); `image rm` removes one from it
+#   rm_fails       image IDs `image rm` refuses (in use by a container)
 #   logs           what `docker logs` prints
 #   run_state, run_health, run_contract
 #                  what the running-proxy check sees of the container: running (default
@@ -73,10 +76,16 @@ or() { cat "$FAKE/$1" 2>/dev/null || echo "$2"; }
 # of <name> <image>: the scenario file name for <image>: <name>.<digest> if it exists.
 of() { if [[ -e $FAKE/$1.${2##*@} ]]; then echo "$1.${2##*@}"; else echo "$1"; fi; }
 case $1 in
+  images) or images "" ;;
   image)
     [[ ! -f $FAKE/image_missing ]] || exit 1
-    if [[ $3 == --format ]]; then
+    if [[ $2 == rm ]]; then
+      ! grep -qxF "$3" "$FAKE/rm_fails" 2>/dev/null || exit 1
+      grep -vxF "$3" "$FAKE/images" >"$FAKE/images.new" || true
+      "$REAL_MV" "$FAKE/images.new" "$FAKE/images"
+    elif [[ $3 == --format ]]; then
       case $4 in
+        '{{.Id}}') echo "sha256:id-$5" ;;
         # The running proxy's image (`inspect`'s ID below).
         *RepoDigests*) printf '%s|%s\n' "$(or run_label "<no value>")" "$(or run_repodigests "")" ;;
         *egress-proxy.contract*) printf '%s|%s\n' "$(or "$(of label "$5")" "<no value>")" "$(or contract 1)" ;;
@@ -244,7 +253,7 @@ install_killed() {
 fresh() {
   dir=$work/egress-$1
   rm -f "$FAKE/running" "$FAKE/health" "$FAKE/up_fails" "$FAKE/calls" "$FAKE/contract" "$FAKE"/run_* \
-    "$FAKE"/label.* "$FAKE"/health.* "$FAKE"/up_fails.* "$FAKE/logs"
+    "$FAKE"/label.* "$FAKE"/health.* "$FAKE"/up_fails.* "$FAKE/logs" "$FAKE/images" "$FAKE/rm_fails"
   rm -rf "$FAKE"/egress.*
 }
 out() { cat "$work/out"; }
@@ -458,6 +467,35 @@ is "$rc $(record previous_version) $(sets)" "0 1.1.0 2" || bad+="exit $rc, sets 
 [[ -d $dir/state/$(record previous_runtime) && -d $dir/state/$(record current_runtime) ]] || bad+="a recorded set is gone"
 check old_sets_pruned "$bad" "$(st is "$bad" "")"
 
+# -------- Old images (FR-10) --------
+# images_left: the fake's image IDs, as the references they stand for.
+images_left() { sed 's/^sha256:id-//' "$FAKE/images" | sort -u | xargs; }
+fresh cleanup
+install 1.0.0 a
+install 1.1.0 b
+# A third version, a local build tagged into the repo, and the new one.
+printf 'sha256:id-%s\n' "$(image a)" "$(image b)" "$REPO:9.9.9" "$(image b)" "$(image c)" >"$FAKE/images"
+: >"$FAKE/calls"
+install 1.2.0 c
+bad=""
+is "$rc" 0 || bad+="exit $rc; "
+is "$(images_left)" "$(image b) $(image c)" || bad+="left: $(images_left); "
+like "$(out)" "install.sh: removed 2 old egress-proxy image(s)" || bad+="no removed line; "
+grep -qF " images --no-trunc --format {{.ID}} $REPO" "$FAKE/calls" || bad+="docker images not by repo: $(grep ' images ' "$FAKE/calls" || true); "
+grep -q ' image rm -f' "$FAKE/calls" && bad+="forced removal; "
+for d in versions current; do [[ -e $dir/$d || -L $dir/$d ]] && bad+="$dir/$d exists; "; done
+check cleanup "$bad: $(out)" "$(st is "$bad" "")"
+
+# An image a container uses (or another repo references) stays; the install succeeds.
+fresh cleanup_rm_fails
+install 1.0.0 a
+install 1.1.0 b
+printf 'sha256:id-%s\n' "$(image a)" "$(image b)" "$(image c)" >"$FAKE/images"
+echo "sha256:id-$(image a)" >"$FAKE/rm_fails"
+install 1.2.0 c
+check cleanup_rm_fails "exit $rc, left $(images_left): $(out)" \
+  "$(st is "$rc $(images_left) $(grep -c 'old egress-proxy image' "$work/out" || true)" "0 $(image a) $(image b) $(image c) 0")"
+
 # -------- Failures and the rollback (FR-9, NFR-6) --------
 # old_image <digest char> <version> [<files dir>]: the image of that digest is version
 # <version>, and ships <files dir> (default: this repo's) as its /egress.
@@ -486,7 +524,10 @@ rolled_back() {
 old_image c 1.2.0
 echo "proxy: no route" >"$FAKE/logs"
 echo starting >"$FAKE/health.$(digest d)"
+printf 'sha256:id-%s\n' "$(image a)" "$(image b)" "$(image c)" "$(image d)" >"$FAKE/images"
+: >"$FAKE/calls"
 install 1.3.0 d
+grep -E ' images | image rm ' "$FAKE/calls" && fail rollback_no_cleanup "a rollback removed images"
 rolled_back rollback 11 1.3.0 d \
   "install.sh: egress-proxy 1.3.0 ($(digest d)) did not become healthy within 120 s; see docker logs egress-proxy" 1.2.0 c
 is "$(record previous_version)" 1.1.0 || fail rollback "previous: $(record previous_version)"

@@ -68,7 +68,10 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
    or a reinstall of the current one) the new version is left as it is (exit 6 or 7).
    Callers' connections drop once more for the rollback;
 5. records the version, digest and image as current, and the one before as previous, in
-   `~/.egress/state/installed`.
+   `~/.egress/state/installed`;
+6. removes the other `ghcr.io/windroc/egress-proxy` images, so only the current and the
+   previous one stay (`docker images ghcr.io/windroc/egress-proxy`). An image a container
+   still uses stays too. A rollback leaves this to the next install.
 
 | Exit code | Meaning |
 | --- | --- |

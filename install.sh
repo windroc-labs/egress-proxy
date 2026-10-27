@@ -12,7 +12,8 @@
 # (pulled by the digest <dir>'s record names) and of the same contract is kept, not
 # downgraded. A version that does not become healthy is rolled back (FR-9): the previous
 # version's own install entry, state/<its runtime set>/egress-install, reinstalls it.
-# Layout of <dir>:
+# After a successful install it removes the repo's images other than the current and the
+# previous one (FR-10). Layout of <dir>:
 #
 #   config.local.yaml          the user's config; written once, never replaced
 #   README.md, start.sh, verify-egress, config.example.yaml
@@ -403,5 +404,21 @@ for d in "$state"/runtime.*; do
   [[ -d $d && ! -L $d ]] || continue
   [[ ${d##*/} == "$base" || ${d##*/} == "$p_runtime" ]] || rm -rf "$d"
 done
+
+# -------- Old images (FR-10) --------
+# Only the current and previous images stay. Without -f, docker keeps an image a container
+# uses or another repo references. A rollback leaves cleaning up to the next install.
+if [[ ${EGRESS_INSTALL_ROLLBACK:-} != 1 ]]; then
+  keep=" "
+  for ref in "$image" "$p_image"; do
+    [[ -z $ref ]] || keep+="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true) "
+  done
+  removed=0
+  for id in $(docker images --no-trunc --format '{{.ID}}' "${image%@*}" 2>/dev/null | sort -u); do
+    [[ $keep != *" $id "* ]] || continue
+    if docker image rm "$id" >/dev/null 2>&1; then removed=$((removed + 1)); fi
+  done
+  ((removed == 0)) || echo "install.sh: removed $removed old egress-proxy image(s)"
+fi
 
 echo "egress-proxy $version ($digest) installed in $dir; start command: $dir/start.sh"
