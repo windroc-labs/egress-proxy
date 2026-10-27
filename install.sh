@@ -236,7 +236,7 @@ needs no network, GitHub login or registry to start or restart.
 | Health | `docker inspect --format '{{.State.Health.Status}}' egress-proxy` |
 | Logs (config errors name the network and key) | `docker logs egress-proxy` |
 | Stop | `docker stop egress-proxy` |
-| Reinstall, or install another version (exit 0 also when it keeps a newer, healthy running proxy instead of downgrading; exit 11 when the new version was not healthy and it rolled back to the previous one) | `@DIR@/state/runtime/egress-install --version X.Y.Z --digest sha256:<digest> --dir @DIR@` |
+| Reinstall, or install another version (exit 0 also when it keeps a newer, healthy running proxy instead of downgrading; exit 11 when the new version did not start or was not healthy and it rolled back to the previous one) | `@DIR@/state/runtime/egress-install --version X.Y.Z --digest sha256:<digest> --dir @DIR@` |
 
 Install only a version and digest from the GitHub Release of its tag (or one a caller's
 installer pins).
