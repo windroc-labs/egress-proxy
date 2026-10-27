@@ -28,7 +28,8 @@ here=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 
 if [[ -f $here/state/runtime/image ]]; then
   config_dir=$here
-  image=$(cat "$here/state/runtime/image")
+  # Its values follow the generated-file header (an older version's set has none).
+  image=$(sed '/^#/d' "$here/state/runtime/image")
   project=$here/state
   compose_file=$here/state/runtime/compose.yaml
   build=""

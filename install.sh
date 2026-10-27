@@ -15,7 +15,8 @@
 #   state/runtime              symlink to the active runtime set, runtime.<suffix>
 #   state/runtime.<suffix>/    one version's files; `links` lists the top-level names,
 #                              `image`, `version` and `digest` (written last: the set is
-#                              complete) name its image
+#                              complete) name its image. These four have the generated-file
+#                              header too: their values are their lines not starting with #
 #   state/installed            the last healthy install: current and previous version,
 #                              digest, image and runtime set (format 1)
 #   state/compose.networks.yaml   start.sh's rendered override
@@ -195,13 +196,28 @@ readme=${readme//@IMAGE@/$image}
 } >"$new/README.md"
 chmod 0644 "$new/README.md"
 
-for f in $LINKS; do echo "$f"; done >"$new/links"
-printf '%s\n' "$image" >"$new/image"
-printf '%s\n' "$version" >"$new/version"
+{
+  header '#' state/runtime/links "the top-level files that link into this runtime set, one per line"
+  for f in $LINKS; do echo "$f"; done
+} >"$new/links"
+{
+  header '#' state/runtime/image "the image this runtime set runs, pinned by its digest; start.sh runs it"
+  printf '%s\n' "$image"
+} >"$new/image"
+{
+  header '#' state/runtime/version "the egress-proxy version of this runtime set"
+  printf '%s\n' "$version"
+} >"$new/version"
 # Last: a set with a digest file is complete.
-printf '%s\n' "$digest" >"$new/digest"
+{
+  header '#' state/runtime/digest "the image digest of this runtime set; written last, it marks the set complete"
+  printf '%s\n' "$digest"
+} >"$new/digest"
 
 # -------- Switch --------
+# values <file>: a runtime set data file's values, its lines not starting with # (an older
+# version's set has no header).
+values() { sed '/^#/d' "$1"; }
 # replace <src> <dst>: renames <src> over <dst> in one rename(2), also when <dst> is a
 # symlink to a directory (GNU mv -T, BSD mv -h).
 replace() {
@@ -219,7 +235,7 @@ link_top() {
   replace "$dir/.$1.tmp.$$" "$dir/$1"
 }
 old_links=""
-[[ -n $active && -f $state/runtime/links ]] && old_links=$(cat "$state/runtime/links")
+[[ -n $active && -f $state/runtime/links ]] && old_links=$(values "$state/runtime/links")
 # Names the active set also has resolve into whichever set is active: link them first.
 for f in $LINKS; do
   if grep -qxF "$f" <<<"$old_links"; then link_top "$f"; fi
@@ -229,7 +245,7 @@ replace "$state/.runtime.tmp.$$" "$state/runtime"
 for f in $LINKS; do link_top "$f"; done
 # A name only the old set had would now dangle.
 for f in $old_links; do
-  grep -qxF "$f" "$new/links" && continue
+  grep -qxF "$f" <<<"$(values "$new/links")" && continue
   if [[ -L $dir/$f && $(readlink "$dir/$f") == state/runtime/* ]]; then rm -f "$dir/$f"; fi
 done
 

@@ -206,6 +206,8 @@ fresh() {
 out() { cat "$work/out"; }
 tree() { (cd "$dir" && find . -exec ls -ld {} + | sort) 2>/dev/null || true; }
 record() { sed -n "s/^$1=//p" "$dir/state/installed"; }
+# val <file>: a runtime set data file's values, its lines not starting with #.
+val() { sed '/^#/d' "$1"; }
 sets() { find "$dir/state" -maxdepth 1 -type d -name 'runtime.*' | wc -l | tr -d ' '; }
 sha() { cksum <"$1"; }
 LINKS="README.md start.sh verify-egress config.example.yaml"
@@ -267,7 +269,7 @@ got="$(record format) $(record current_version) $(record current_digest) $(recor
 check state_record "$(cat "$dir/state/installed")" \
   "$(st is "$got" "1 1.0.0 $(digest a) $(image a) $(readlink "$dir/state/runtime") []")"
 check runs_pinned_image "running $(cat "$FAKE/running")" \
-  "$(st is "$(cat "$dir/state/runtime/image") $(cat "$FAKE/running")" "$(image a) $(image a)")"
+  "$(st is "$(val "$dir/state/runtime/image") $(cat "$FAKE/running")" "$(image a) $(image a)")"
 check no_build "$(grep -E ' (build|buildx)( |$)| compose .*build' "$FAKE/calls" || true)" \
   "$(st is "$(grep -cE ' (build|buildx)( |$)| compose .*build' "$FAKE/calls" || true)" 0)"
 
@@ -280,7 +282,8 @@ check default_config "$bad" "$(st is "$bad" "")"
 # Headers: what it is, who generated it, do not edit, edit config.local.yaml instead.
 bad=""
 for f in README.md start.sh verify-egress config.example.yaml state/runtime/compose.yaml state/runtime/config.default.yaml \
-  state/runtime/egress-install state/runtime/install.sh state/installed state/compose.networks.yaml; do
+  state/runtime/egress-install state/runtime/install.sh state/installed state/compose.networks.yaml \
+  state/runtime/links state/runtime/image state/runtime/version state/runtime/digest; do
   head=$(sed -n '1,8p' "$dir/$f")
   for want in "$dir/$f: " "enerated by" "do not edit" "config.local.yaml"; do
     like "$head" "$want" || bad+="$f lacks '$want'; "
@@ -289,7 +292,9 @@ done
 for f in start.sh verify-egress state/runtime/egress-install state/runtime/install.sh; do
   is "$(sed -n 1p "$dir/$f")" '#!/usr/bin/env bash' || bad+="$f: the #! line is not first; "
 done
-like "$(sed -n 1p "$dir/README.md")" "<!-- " || bad+="README.md does not start with an HTML comment"
+like "$(sed -n 1p "$dir/README.md")" "<!-- " || bad+="README.md does not start with an HTML comment; "
+got="$(val "$dir/state/runtime/links" | xargs) | $(val "$dir/state/runtime/image") $(val "$dir/state/runtime/version") $(val "$dir/state/runtime/digest")"
+is "$got" "$LINKS | $(image a) 1.0.0 $(digest a)" || bad+="data file values: $got"
 check headers "$bad" "$(st is "$bad" "")"
 check readme_version "$(head -5 "$dir/README.md")" \
   "$(st grep -qF "egress-proxy 1.0.0, image \`$(image a)\`" "$dir/README.md")"
@@ -330,7 +335,7 @@ check not_healthy "exit $rc: $(out)" "$(st like "$rc $(out)" \
   "6 install.sh: egress-proxy 1.3.0 ($(digest d)) did not become healthy within 120 s; see docker logs egress-proxy")"
 cmp -s "$dir/state/installed" "$work/record.before" || fail not_healthy "the state record changed"
 # Until S5's rollback, the new set stays active.
-is "$(cat "$dir/state/runtime/version")" 1.3.0 || fail not_healthy "the active set is $(cat "$dir/state/runtime/version")"
+is "$(val "$dir/state/runtime/version")" 1.3.0 || fail not_healthy "the active set is $(val "$dir/state/runtime/version")"
 rm -f "$FAKE/health"
 
 touch "$FAKE/up_fails"
@@ -360,7 +365,7 @@ complete_set() {
     echo "the active set is incomplete"
     return
   fi
-  v=$(cat "$dir/state/runtime/version")
+  v=$(val "$dir/state/runtime/version")
   like " $* " " $v " || echo "active version $v"
   for f in $LINKS; do
     [[ -f $dir/$f && $(readlink "$dir/$f") == "state/runtime/$f" ]] || echo "$f does not resolve into state/runtime"
@@ -370,7 +375,7 @@ complete_set() {
   rm -f "$FAKE/running"
   if ! PATH="$work/bin:$PATH" "$dir/start.sh" >"$work/start.out" 2>&1; then
     echo "start.sh failed: $(cat "$work/start.out")"
-  elif ! is "$(cat "$FAKE/running")" "$(cat "$dir/state/runtime/image")"; then
+  elif ! is "$(cat "$FAKE/running")" "$(val "$dir/state/runtime/image")"; then
     echo "start.sh ran $(cat "$FAKE/running")"
   fi
 }
@@ -386,7 +391,7 @@ killed() {
   is "$rc" 0 || bad+="the install never reached the block; "
   bad+=$(complete_set 1.0.0 1.1.0)
   install 1.1.0 b
-  is "$rc $(cat "$dir/state/runtime/version") $(record current_version)" "0 1.1.0 1.1.0" ||
+  is "$rc $(val "$dir/state/runtime/version") $(record current_version)" "0 1.1.0 1.1.0" ||
     bad+="the next install: exit $rc: $(out); "
   is "$(find "$dir" -name '*.tmp.*')" "" || bad+="temp files left: $(find "$dir" -name '*.tmp.*'); "
   bad+=$(complete_set 1.1.0)
@@ -406,6 +411,47 @@ install 1.0.0 a
 is "$rc" 0 || bad+="the next install: exit $rc: $(out); "
 bad+=$(complete_set 1.0.0)
 check killed_first_install "$bad" "$(st is "$bad" "")"
+
+# -------- Runtime set data files --------
+# top: the top-level names of $dir.
+top() { (cd "$dir" && find . -mindepth 1 -maxdepth 1 | sed 's|^\./||' | sort | xargs); }
+TOP="README.md config.example.yaml config.local.yaml start.sh state verify-egress"
+# stale_link: the active set gains a top-level name, extra.txt, that the next set lacks.
+stale_link() {
+  echo extra.txt >>"$dir/state/runtime/links"
+  : >"$dir/state/runtime/extra.txt"
+  ln -s state/runtime/extra.txt "$dir/extra.txt"
+}
+
+# An upgrade reads the active set's links past its header.
+fresh links_header_upgrade
+install 1.0.0 a
+stale_link
+install 1.1.0 b
+bad=""
+is "$rc" 0 || bad+="exit $rc: $(out); "
+is "$(top)" "$TOP" || bad+="top level: $(top); "
+bad+=$(complete_set 1.1.0)
+check links_header_upgrade "$bad" "$(st is "$bad" "")"
+
+# An older version's set, written without headers, still starts and is upgraded from.
+fresh headerless_set
+install 1.0.0 a
+for f in links image version digest; do
+  val "$dir/state/runtime/$f" >"$work/$f"
+  cp "$work/$f" "$dir/state/runtime/$f"
+done
+stale_link
+bad=""
+grep -q '^#' "$dir/state/runtime/image" && bad+="the image file still has a header; "
+rm -f "$FAKE/running"
+PATH="$work/bin:$PATH" "$dir/start.sh" >"$work/start.out" 2>&1 || bad+="start.sh failed: $(cat "$work/start.out"); "
+is "$(cat "$FAKE/running" 2>/dev/null)" "$(image a)" || bad+="start.sh ran $(cat "$FAKE/running" 2>/dev/null); "
+install 1.1.0 b
+is "$rc" 0 || bad+="exit $rc: $(out); "
+is "$(top)" "$TOP" || bad+="top level: $(top); "
+bad+=$(complete_set 1.1.0)
+check headerless_set "$bad" "$(st is "$bad" "")"
 
 # -------- egress-install --------
 # The image's installer, for these cases: records its arguments, exits install_rc.
