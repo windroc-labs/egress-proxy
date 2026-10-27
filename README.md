@@ -84,9 +84,9 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
 | 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`), with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
 | 7 | the start command failed, with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
 | 8 | the installer does not know the `--interface` this `egress-install` speaks |
-| 9 | the version being installed did not start or was not healthy, and the rollback to the previous version failed too |
+| 9 | the version being installed did not start or was not healthy, and the rollback to the previous version (migrating a source-checkout install: to it, with its start.sh) failed too |
 | 10 | the running proxy serves another label contract: nothing was changed; the message names both versions and contracts |
-| 11 | the version being installed did not start or was not healthy; rolled back to the previous version, which is healthy |
+| 11 | the version being installed did not start or was not healthy; rolled back to the previous version (migrating a source-checkout install: to it, with its start.sh), which is healthy |
 
 Codes 2–5 and 10 leave `~/.egress` and the running proxy as they were.
 

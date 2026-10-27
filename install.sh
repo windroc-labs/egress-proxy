@@ -53,11 +53,13 @@
 #       rollback): the version being installed is left as it is
 #   8   the installer does not know the `--interface` this `egress-install` speaks
 #   9   the version being installed did not start or was not healthy, and the rollback to
-#       the previous version failed too
+#       the previous version (migrating a source-checkout install: to it, with its
+#       start.sh) failed too
 #   10  the running proxy serves another label contract: nothing was changed; the message
 #       names both versions and contracts
 #   11  the version being installed did not start or was not healthy; rolled back to the
-#       previous version, which is healthy
+#       previous version (migrating a source-checkout install: to it, with its start.sh),
+#       which is healthy
 #
 # Runs on macOS's bash 3.2 and on Linux.
 set -euo pipefail
@@ -144,9 +146,10 @@ rb_runtime=$(record_get current_runtime)
 # anything else named current or versions is never deleted, followed or run.
 hex40='^[0-9a-f]{40}$'
 # checkout_signature: <dir>'s current and versions, whichever exist, are a source-checkout
-# install's.
+# install's. Sets old_commit to current's commit when its checkout has a start.sh.
 checkout_signature() {
   local e target commit real
+  old_commit=""
   if [[ -e $dir/versions || -L $dir/versions ]]; then
     [[ -d $dir/versions && ! -L $dir/versions ]] || return 1
     for e in "$dir"/versions/* "$dir"/versions/.[!.]* "$dir"/versions/..?*; do
@@ -165,16 +168,23 @@ checkout_signature() {
       "$dir/versions/$commit" | "$real/versions/$commit" | "versions/$commit") ;;
       *) [[ -e $dir/current && $dir/current -ef $dir/versions/$commit ]] || return 1 ;;
     esac
+    if [[ -d $dir/versions/$commit && ! -L $dir/versions/$commit &&
+      -f $dir/versions/$commit/start.sh && ! -L $dir/versions/$commit/start.sh ]]; then
+      old_commit=$commit
+    fi
   fi
   return 0
 }
-# checkout: a source-checkout install is here.
-checkout=""
+# checkout: a source-checkout install is here; migrating: this install replaces it, with no
+# image install recorded yet (a failure goes back to it); old_start: its start.sh, set
+# once <dir> is absolute.
+checkout="" migrating="" old_commit="" old_start=""
 if [[ -e $dir/current || -L $dir/current || -e $dir/versions || -L $dir/versions ]]; then
   if checkout_signature; then
     checkout=yes
+    if [[ -z $cur_digest && ${EGRESS_INSTALL_ROLLBACK:-} != 1 ]]; then migrating=yes; fi
   else
-    found=""
+    old_commit="" found=""
     for e in current versions; do
       if [[ -e $dir/$e || -L $dir/$e ]]; then found+="${found:+ and }$dir/$e"; fi
     done
@@ -219,6 +229,7 @@ mkdir -p "$state"
 dir=$(CDPATH='' cd -- "$dir" && pwd)
 state=$dir/state
 record=$state/installed
+[[ -z $old_commit ]] || old_start=$dir/versions/$old_commit/start.sh
 
 # Leftovers of a killed install: temp links, and incomplete sets other than the active one.
 active=""
@@ -380,11 +391,69 @@ if [[ ! -e $dir/config.local.yaml && ! -L $dir/config.local.yaml ]]; then
   echo "install.sh: wrote the default config $dir/config.local.yaml"
 fi
 
+# proxy_up <image> <same|other>: the proxy is healthy, has every label of the contract, and
+# runs <image> (same) or any other image (other).
+proxy_up() {
+  local out health img labels nets k
+  out=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}
+{{.Config.Image}}
+{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}
+{{end}}' egress-proxy 2>/dev/null) || return 1
+  health=$(sed -n 1p <<<"$out")
+  img=$(sed -n 2p <<<"$out")
+  labels=$(sed -n '3,$p' <<<"$out")
+  [[ $health == healthy ]] || return 1
+  if [[ $2 == same ]]; then [[ $img == "$1" ]] || return 1; else [[ $img != "$1" ]] || return 1; fi
+  grep -q '^windroc\.egress\.contract=.' <<<"$labels" || return 1
+  nets=$(sed -n 's/^windroc\.egress\.networks=//p' <<<"$labels")
+  [[ -n $nets ]] || return 1
+  for k in ${nets//,/ }; do
+    grep -qF "windroc.egress.network.$k.name=egress-" <<<"$labels" || return 1
+    grep -qF "windroc.egress.network.$k.proxy=http" <<<"$labels" || return 1
+  done
+}
+# healthy <image>: the proxy is up and runs <image>.
+healthy() { proxy_up "$1" same; }
+# old_healthy: the proxy is up and runs another image than this version's: a source
+# checkout's local build.
+old_healthy() { proxy_up "$image" other; }
+# wait_healthy <check> [<args>...]: up to 120 s for the check to hold, polling every 2 s.
+wait_healthy() {
+  local i
+  for ((i = 0; i < 60; i++)); do
+    if "$@"; then return 0; fi
+    sleep 2
+  done
+  return 1
+}
+
+# rollback_checkout: back to the source-checkout install this one was migrating. Removes the
+# image layout's files first, so every outcome leaves the checkout layout, and the failed
+# container (the old compose project may name its own), then runs the checkout's start.sh
+# as its installer did: exit 11 once the old proxy is healthy, else 9.
+rollback_checkout() {
+  local f rc=0
+  echo "install.sh: rolling back to the source-checkout install: $old_start" >&2
+  for f in $LINKS; do
+    if [[ -L $dir/$f && $(readlink "$dir/$f") == state/runtime/* ]]; then rm -f "$dir/$f"; fi
+  done
+  rm -f "$dir/effective-policy.txt"
+  rm -rf "$state"
+  docker rm -f egress-proxy >/dev/null 2>&1 || true
+  EGRESS_CONFIG_DIR=$dir bash "$old_start" </dev/null >&2 || rc=$?
+  ((rc == 0)) ||
+    die 9 "rolling back to the source-checkout install ($old_start) failed (exit $rc); see docker logs egress-proxy"
+  wait_healthy old_healthy ||
+    die 9 "rolling back to the source-checkout install ($old_start) failed (not healthy within 120 s); see docker logs egress-proxy"
+  die 11 "rolled back to the source-checkout install ($old_start), which is healthy; egress-proxy $version was not installed; see docker logs egress-proxy"
+}
+
 # failed <code> <message>: this version did not come up. Says so with the proxy's last log
 # lines (a rollback replaces the container, and its logs with it), then rolls back to the
-# previous version through that version's own install entry (interface 1, NFR-6), unless
-# this is a rollback or there is no previous version: exit 11 when it is healthy again, 9
-# when the rollback failed too, else <code>.
+# previous version through that version's own install entry (interface 1, NFR-6), or, when
+# migrating, to the source-checkout install, unless this is a rollback or there is no
+# previous version: exit 11 when it is healthy again, 9 when the rollback failed too, else
+# <code>.
 failed() {
   local code=$1 logs entry rc=0
   echo "install.sh: $2" >&2
@@ -393,6 +462,7 @@ failed() {
     echo "install.sh: the last 20 lines of docker logs egress-proxy:" >&2
     printf '%s\n' "$logs" >&2
   fi
+  [[ -z $migrating || -z $old_start ]] || rollback_checkout
   [[ ${EGRESS_INSTALL_ROLLBACK:-} != 1 && -n $rb_digest ]] || exit "$code"
   entry=$state/$rb_runtime/egress-install
   # Safe: an entry only gets the image; that version's own install.sh runs, over interface 1.
@@ -411,34 +481,7 @@ rc=0
 "$dir/start.sh" || rc=$?
 ((rc == 0)) || failed 7 "the start command failed (exit $rc) for egress-proxy $version ($digest); see docker logs egress-proxy"
 
-# healthy: the proxy runs this image, is healthy, and has every label of the contract.
-healthy() {
-  local out health img labels nets k
-  out=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}
-{{.Config.Image}}
-{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}
-{{end}}' egress-proxy 2>/dev/null) || return 1
-  health=$(sed -n 1p <<<"$out")
-  img=$(sed -n 2p <<<"$out")
-  labels=$(sed -n '3,$p' <<<"$out")
-  [[ $health == healthy && $img == "$image" ]] || return 1
-  grep -q '^windroc\.egress\.contract=.' <<<"$labels" || return 1
-  nets=$(sed -n 's/^windroc\.egress\.networks=//p' <<<"$labels")
-  [[ -n $nets ]] || return 1
-  for k in ${nets//,/ }; do
-    grep -qF "windroc.egress.network.$k.name=egress-" <<<"$labels" || return 1
-    grep -qF "windroc.egress.network.$k.proxy=http" <<<"$labels" || return 1
-  done
-}
-up=""
-for ((i = 0; i < 60; i++)); do
-  if healthy; then
-    up=yes
-    break
-  fi
-  sleep 2
-done
-[[ -n $up ]] ||
+wait_healthy healthy "$image" ||
   failed 6 "egress-proxy $version ($digest) did not become healthy within 120 s; see docker logs egress-proxy"
 
 # -------- Record --------
