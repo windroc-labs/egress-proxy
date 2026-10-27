@@ -135,6 +135,53 @@ rb_image=$(record_get current_image)
 rb_runtime=$(record_get current_runtime)
 [[ $rb_digest != "$digest" ]] || rb_digest=""
 
+# -------- A source-checkout install (FR-11) --------
+# Callers' installers before the image (the v0.5.0 layout) kept source checkouts in
+# versions/<commit>/ (and downloads in versions/.download.*), linked current to
+# <dir>/versions/<commit>, and ran EGRESS_CONFIG_DIR=<dir> versions/<commit>/start.sh,
+# which builds the image egress-proxy (earlier checkouts: egress-proxy-proxy,
+# egress-gateway) and writes compose.networks.yaml here. Only that shape is migrated:
+# anything else named current or versions is never deleted, followed or run.
+hex40='^[0-9a-f]{40}$'
+# checkout_signature: <dir>'s current and versions, whichever exist, are a source-checkout
+# install's.
+checkout_signature() {
+  local e target commit real
+  if [[ -e $dir/versions || -L $dir/versions ]]; then
+    [[ -d $dir/versions && ! -L $dir/versions ]] || return 1
+    for e in "$dir"/versions/* "$dir"/versions/.[!.]* "$dir"/versions/..?*; do
+      [[ -e $e || -L $e ]] || continue
+      [[ ${e##*/} == .download.* ]] && continue
+      [[ ${e##*/} =~ $hex40 && -d $e && ! -L $e ]] || return 1
+    done
+  fi
+  if [[ -e $dir/current || -L $dir/current ]]; then
+    [[ -L $dir/current ]] || return 1
+    target=$(readlink "$dir/current")
+    commit=${target##*/}
+    [[ $commit =~ $hex40 ]] || return 1
+    real=$(CDPATH='' cd -P -- "$dir" && pwd)
+    case $target in
+      "$dir/versions/$commit" | "$real/versions/$commit" | "versions/$commit") ;;
+      *) [[ -e $dir/current && $dir/current -ef $dir/versions/$commit ]] || return 1 ;;
+    esac
+  fi
+  return 0
+}
+# checkout: a source-checkout install is here.
+checkout=""
+if [[ -e $dir/current || -L $dir/current || -e $dir/versions || -L $dir/versions ]]; then
+  if checkout_signature; then
+    checkout=yes
+  else
+    found=""
+    for e in current versions; do
+      if [[ -e $dir/$e || -L $dir/$e ]]; then found+="${found:+ and }$dir/$e"; fi
+    done
+    echo "install.sh: left $found as found: not a source-checkout install"
+  fi
+fi
+
 # -------- The running proxy (FR-12) --------
 # A rollback installs the version it is given, so it skips this check: the newer version
 # it replaces may have turned healthy late.
@@ -437,6 +484,30 @@ if [[ ${EGRESS_INSTALL_ROLLBACK:-} != 1 ]]; then
     if docker image rm "$id" >/dev/null 2>&1; then removed=$((removed + 1)); fi
   done
   ((removed == 0)) || echo "install.sh: removed $removed old egress-proxy image(s)"
+fi
+
+# -------- The source-checkout install (FR-11) --------
+# Once this version is healthy and recorded: the checkouts, the old start.sh's output here,
+# and the locally built images no container uses (by name; untagged ones by ID; never
+# forced). A kill in here leaves a recorded install, and the next one finishes this.
+if [[ -n $checkout && ${EGRESS_INSTALL_ROLLBACK:-} != 1 ]]; then
+  rm -f "$dir/current"
+  rm -rf "$dir/versions"
+  rm -f "$dir/compose.networks.yaml" "$dir"/.compose.networks.*
+  removed=0
+  for name in egress-proxy egress-proxy-proxy egress-gateway; do
+    while read -r ref id; do
+      [[ -n $ref ]] || continue
+      [[ $ref != *':<none>' ]] || ref=$id
+      users=$(docker ps -aq --filter "ancestor=$ref" 2>/dev/null) || continue
+      [[ -z $users ]] || continue
+      if docker image rm "$ref" >/dev/null 2>&1; then removed=$((removed + 1)); fi
+    done < <(docker images --no-trunc --format '{{.Repository}}:{{.Tag}} {{.ID}}' "$name" 2>/dev/null || true)
+  done
+  # As the user types it: ~/.egress/start.sh.
+  shown=$dir tilde='~'
+  if [[ -n ${HOME:-} && $HOME != / && $dir == "${HOME%/}"/* ]]; then shown=$tilde/${dir#"${HOME%/}"/}; fi
+  echo "install.sh: migrated the source-checkout install: removed $dir/versions and $dir/current and $removed locally built image(s); the start command is now $shown/start.sh, not current/start.sh"
 fi
 
 echo "egress-proxy $version ($digest) installed in $dir; start command: $dir/start.sh"
