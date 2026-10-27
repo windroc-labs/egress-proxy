@@ -1,6 +1,6 @@
 # Every pull request: build and test the entrypoint, lint the repo, build the image and
 # run the Docker end-to-end checks, and build, check and publish the multi-arch image to a
-# local registry (the release path, without GHCR). CI aggregates every job for branch
+# local registry (the release path, without GHCR) and install it from there by digest. CI aggregates every job for branch
 # protection; release.yml calls this workflow before it publishes.
 name: ci
 
@@ -103,6 +103,12 @@ jobs:
         run: >-
           python3 -B .github/release_image.py publish "$RUNNER_TEMP/layout"
           --repo localhost:5000/egress-proxy --version 0.0.0 --insecure
+      - name: Install it from the local registry by digest, end to end
+        env:
+          REGISTRY: ${{ job.services.registry.id }}
+        run: >-
+          tests/install-integration.sh localhost:5000/egress-proxy 0.0.0
+          "$(python3 -B .github/release_image.py digest "$RUNNER_TEMP/layout")" "$REGISTRY"
 
   ci:
     name: CI

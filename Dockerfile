@@ -1,7 +1,9 @@
 # The egress proxy image: one smokescreen per caller network, started and supervised by
 # the Rust entrypoint /proxy, which generates each network's policy at start from the
-# mounted local config. compose builds it locally; no prebuilt image is pulled. CI
-# publishes it for both architectures on a version tag (README.md › Release).
+# mounted local config. CI publishes it for both architectures on a version tag
+# (README.md › Release). It also carries its runtime files and installer in /egress:
+# egress-install copies them out and runs install.sh, which writes them to ~/.egress
+# (README.md › Setup). Only start.sh in a checkout builds it, for development.
 ARG TARGETARCH
 
 # smokescreen v0.1.0 (github.com/stripe/smokescreen, tag commit 609eb8931420453daf5893509be0b25b21bd9edb):
@@ -23,6 +25,8 @@ RUN cargo build --release --locked && install -m 0555 target/release/proxy /prox
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e
 COPY --from=fetch --chmod=0555 /tmp/smokescreen /smokescreen
 COPY --from=build /proxy /proxy
+COPY --chmod=0555 start.sh verify-egress egress-install install.sh /egress/
+COPY --chmod=0444 compose.yaml config.example.yaml config.default.yaml /egress/
 USER 65532:65532
 # The checks run per network in parallel and take at most about 8 s (proxy/src/health.rs).
 HEALTHCHECK --interval=15s --timeout=10s --start-period=20s --start-interval=2s --retries=2 CMD ["/proxy", "health"]
