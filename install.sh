@@ -4,6 +4,13 @@
 #
 #   install.sh --interface 1 --version X.Y.Z --digest sha256:<64 hex> --dir <dir>
 #              --image <repo>@<digest> --files <dir of the image's /egress>
+#              [--docker-host ssh://<host>]
+#
+# With --docker-host (a remote install, README.md › Remote Docker host) every docker call
+# goes to that target, which state/docker-host records for start.sh, and the image there is
+# the tag <repo>:sha256-<hex> egress-install loaded: a loaded image has no digest reference.
+# The record keeps <repo>@<digest>. A directory with state/docker-host is only installed
+# with --docker-host, so local and remote never mix in one directory.
 #
 # It writes the image's runtime files to <dir> as one runtime set, writes the default
 # config when there is none, runs the start command, waits for the proxy to be healthy and
@@ -30,6 +37,7 @@
 #   state/installed            the last healthy install: current and previous version,
 #                              digest, image and runtime set (format 1)
 #   state/compose.networks.yaml   start.sh's rendered override
+#   state/docker-host          a remote install's target
 #
 # One rename of state/runtime switches every top-level runtime file at once, so a killed
 # install leaves either the old set or the new one active, never a mix.
@@ -71,7 +79,7 @@ set -euo pipefail
 shopt -u patsub_replacement 2>/dev/null || true
 
 usage() {
-  echo "usage: install.sh --interface 1 --version X.Y.Z --digest sha256:<64 hex> --dir <path> --image <repo>@<digest> --files <dir>" >&2
+  echo "usage: install.sh --interface 1 --version X.Y.Z --digest sha256:<64 hex> --dir <path> --image <repo>@<digest> --files <dir> [--docker-host ssh://<host>]" >&2
   exit 2
 }
 die() {
@@ -81,7 +89,7 @@ die() {
   exit "$code"
 }
 
-interface="" version="" digest="" dir="" image="" files=""
+interface="" version="" digest="" dir="" image="" files="" docker_host=""
 while (($# > 0)); do
   (($# >= 2)) || usage
   case $1 in
@@ -91,6 +99,7 @@ while (($# > 0)); do
     --dir) dir=$2 ;;
     --image) image=$2 ;;
     --files) files=$2 ;;
+    --docker-host) docker_host=$2 ;;
     --*) echo "install.sh: ignoring unknown option $1" >&2 ;;
     *) usage ;;
   esac
@@ -102,16 +111,32 @@ done
 [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
 [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || usage
 [[ -n $dir && $image == *"@$digest" && -n $files ]] || usage
+if [[ -n $docker_host ]]; then
+  [[ $docker_host =~ ^ssh://([A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+(:[0-9]+)?$ ]] || usage
+  export DOCKER_HOST=$docker_host
+  unset DOCKER_CONTEXT
+elif [[ -f $dir/state/docker-host ]]; then
+  die 2 "$dir is a remote install (state/docker-host); install it with egress-install --docker-host or $dir/state/runtime/egress-install; nothing was changed"
+fi
+# ref_of <repo>@<digest>: the name the Docker daemon has that image by.
+ref_of() {
+  if [[ -n $docker_host && -n $1 ]]; then
+    printf '%s:sha256-%s\n' "${1%@*}" "${1##*@sha256:}"
+  else
+    printf '%s\n' "$1"
+  fi
+}
+ref=$(ref_of "$image")
 
 # The runtime set's files (each copied with a header) and its top-level links.
-FILES="start.sh verify-egress config.example.yaml compose.yaml config.default.yaml egress-install install.sh"
+FILES="start.sh verify-egress config.example.yaml compose.yaml compose.remote.yaml config.default.yaml egress-install install.sh"
 LINKS="README.md start.sh verify-egress config.example.yaml"
 for f in $FILES; do
   [[ -f $files/$f ]] || die 1 "$files/$f is missing"
 done
 
 # -------- Checks before any change --------
-labels=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "io.windroc.egress-proxy.contract"}}' "$image" 2>/dev/null) ||
+labels=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "io.windroc.egress-proxy.contract"}}' "$ref" 2>/dev/null) ||
   labels=""
 label=${labels%%|*} contract=""
 [[ $labels == *'|'* ]] && contract=${labels#*|}
@@ -221,7 +246,18 @@ if [[ ${EGRESS_INSTALL_ROLLBACK:-} != 1 ]] &&
   fi
   # Published: pulled by the digest this directory's record names. A RepoDigest alone is
   # not enough: Docker's containerd image store gives a retagged local build one too.
-  if [[ $r_running == true && $r_health == healthy && $r_contract == "$contract" && -n $cur_digest && " $r_digests " == *" ${image%@*}@$cur_digest "* &&
+  # Remote: the image egress-install loaded for that digest (a loaded image has no
+  # RepoDigests).
+  published=""
+  if [[ -n $cur_digest ]]; then
+    if [[ -n $docker_host ]]; then
+      cur_id=$(docker image inspect --format '{{.Id}}' "$(ref_of "${image%@*}@$cur_digest")" 2>/dev/null) || cur_id=""
+      [[ -z $cur_id || $cur_id != "$r_id" ]] || published=yes
+    elif [[ " $r_digests " == *" ${image%@*}@$cur_digest "* ]]; then
+      published=yes
+    fi
+  fi
+  if [[ $r_running == true && $r_health == healthy && $r_contract == "$contract" && -n $published &&
     $r_version =~ $semver ]] && newer "$r_version" "$version"; then
     echo "install.sh: kept the running egress-proxy $r_version ($cur_digest), newer than $version; nothing was changed"
     exit 0
@@ -238,7 +274,7 @@ record=$state/installed
 # Leftovers of a killed install: temp links, and incomplete sets other than the active one.
 active=""
 [[ -L $state/runtime ]] && active=$(readlink "$state/runtime")
-rm -f "$state"/.runtime.tmp.* "$state"/.installed.tmp.* "$dir/.config.local.yaml.tmp."*
+rm -f "$state"/.runtime.tmp.* "$state"/.installed.tmp.* "$state"/.docker-host.tmp.* "$dir/.config.local.yaml.tmp."*
 for f in $LINKS; do rm -f "$dir/.$f.tmp."*; done
 for d in "$state"/runtime.*; do
   [[ -d $d && ! -L $d ]] || continue
@@ -279,6 +315,8 @@ put verify-egress "checks a caller network's allows and denies: verify-egress <n
 put config.example.yaml "an example of config.local.yaml, with every option"
 put compose.yaml "the proxy's compose file; start.sh runs it with the caller networks it renders" \
   state/runtime/compose.yaml
+put compose.remote.yaml "a remote install's override of compose.yaml: the config from the volume egress-config" \
+  state/runtime/compose.remote.yaml
 put config.default.yaml "the default config, copied to config.local.yaml when there is none" \
   state/runtime/config.default.yaml
 put egress-install "the install entry of this version: reinstall or install another version with it" \
@@ -289,7 +327,7 @@ put install.sh "the installer of this version, run by egress-install" state/runt
 IFS= read -r -d '' readme <<'EOF' || true
 # @DIR@: the egress proxy
 
-Installed: egress-proxy @VERSION@, image `@IMAGE@`.
+Installed: egress-proxy @VERSION@, image `@IMAGE@`@TARGET@.
 
 The proxy runs as the container `egress-proxy` from that image, pinned by its digest; it
 needs no network, GitHub login or registry to start or restart.
@@ -312,9 +350,9 @@ needs no network, GitHub login or registry to start or restart.
 | --- | --- |
 | Start, or apply a config change | `@DIR@/start.sh` |
 | Check a caller network | `@DIR@/verify-egress <network>` |
-| Health | `docker inspect --format '{{.State.Health.Status}}' egress-proxy` |
-| Logs (config errors name the network and key) | `docker logs egress-proxy` |
-| Stop | `docker stop egress-proxy` |
+| Health | `@DOCKER@ inspect --format '{{.State.Health.Status}}' egress-proxy` |
+| Logs (config errors name the network and key) | `@DOCKER@ logs egress-proxy` |
+| Stop | `@DOCKER@ stop egress-proxy` |
 | Reinstall, or install another version (exit 0 also when it keeps a newer, healthy running proxy instead of downgrading; exit 11 when the new version did not start or was not healthy and it rolled back to the previous one) | `@DIR@/state/runtime/egress-install --version X.Y.Z --digest sha256:<digest> --dir @DIR@` |
 
 Install only a version and digest from the GitHub Release of its tag (or one a caller's
@@ -324,6 +362,13 @@ readme=${readme%$'\n'}
 readme=${readme//@DIR@/$dir}
 readme=${readme//@VERSION@/$version}
 readme=${readme//@IMAGE@/$image}
+if [[ -n $docker_host ]]; then
+  readme=${readme//@TARGET@/, on the Docker host $docker_host (config copied into its volume egress-config by start.sh)}
+  readme=${readme//@DOCKER@/docker --host $docker_host}
+else
+  readme=${readme//@TARGET@/}
+  readme=${readme//@DOCKER@/docker}
+fi
 {
   header '' README.md "what each file here is, the commands, and the installed version" |
     sed -e '1s/^ /<!-- /' -e '2,$s/^ /     /' -e '$s/$/ -->/'
@@ -338,7 +383,7 @@ chmod 0644 "$new/README.md"
 } >"$new/links"
 {
   header '#' state/runtime/image "the image this runtime set runs, pinned by its digest; start.sh runs it"
-  printf '%s\n' "$image"
+  printf '%s\n' "$ref"
 } >"$new/image"
 {
   header '#' state/runtime/version "the egress-proxy version of this runtime set"
@@ -386,6 +431,13 @@ for f in $old_links; do
 done
 
 # -------- Config, start, health --------
+if [[ -n $docker_host ]]; then
+  {
+    header '#' state/docker-host "the remote Docker host this install runs on; start.sh and verify-egress use it"
+    printf '%s\n' "$docker_host"
+  } >"$state/.docker-host.tmp.$$"
+  mv -f "$state/.docker-host.tmp.$$" "$state/docker-host"
+fi
 if [[ ! -e $dir/config.local.yaml && ! -L $dir/config.local.yaml ]]; then
   # The image's own copy: the one in the runtime set has the generated-file header.
   cp "$files/config.default.yaml" "$dir/.config.local.yaml.tmp.$$"
@@ -420,7 +472,7 @@ proxy_up() {
 healthy() { proxy_up "$1" same; }
 # old_healthy: the proxy is up and runs another image than this version's: a source
 # checkout's local build.
-old_healthy() { proxy_up "$image" other; }
+old_healthy() { proxy_up "$ref" other; }
 # wait_healthy <check> [<args>...]: up to 120 s for the check to hold, polling every 2 s.
 wait_healthy() {
   local i
@@ -485,7 +537,7 @@ rc=0
 "$dir/start.sh" || rc=$?
 ((rc == 0)) || failed 7 "the start command failed (exit $rc) for egress-proxy $version ($digest); see docker logs egress-proxy"
 
-wait_healthy healthy "$image" ||
+wait_healthy healthy "$ref" ||
   failed 6 "egress-proxy $version ($digest) did not become healthy within 120 s; see docker logs egress-proxy"
 
 # -------- Record --------
@@ -522,8 +574,8 @@ done
 # uses or another repo references. A rollback leaves cleaning up to the next install.
 if [[ ${EGRESS_INSTALL_ROLLBACK:-} != 1 ]]; then
   keep=" "
-  for ref in "$image" "$p_image"; do
-    [[ -z $ref ]] || keep+="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null || true) "
+  for r in "$ref" "$(ref_of "$p_image")"; do
+    [[ -z $r ]] || keep+="$(docker image inspect --format '{{.Id}}' "$r" 2>/dev/null || true) "
   done
   removed=0
   for id in $(docker images --no-trunc --format '{{.ID}}' "${image%@*}" 2>/dev/null | sort -u); do

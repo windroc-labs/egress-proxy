@@ -67,10 +67,15 @@ export REAL_CP REAL_CHMOD REAL_MV
 #                  lines; `image rm` of either removes the line
 #   in_use         image references a container uses: `ps --filter ancestor=` lists one
 #                  (`rm -f`, the container's removal, removes running)
+#   hosts          every call's DOCKER_HOST|DOCKER_CONTEXT
+#   render/        what start.sh copied into its render container (a remote install);
+#                  `start -a` of it prints the override, or fails when its config holds BAD
+#   volume/        the volume egress-config, as start.sh's helper container filled it
 cat >"$work/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
 echo "EGRESS_IMAGE=${EGRESS_IMAGE:-} $*" >>"$FAKE/calls"
+echo "${DOCKER_HOST:-}|${DOCKER_CONTEXT:-}" >>"$FAKE/hosts"
 block() {
   : >"$FAKE/blocked"
   read -r _ <"$FAKE/hold" || true
@@ -78,8 +83,13 @@ block() {
 }
 # or <name> <default>: the scenario file $FAKE/<name>, else <default>.
 or() { cat "$FAKE/$1" 2>/dev/null || echo "$2"; }
-# of <name> <image>: the scenario file name for <image>: <name>.<digest> if it exists.
-of() { if [[ -e $FAKE/$1.${2##*@} ]]; then echo "$1.${2##*@}"; else echo "$1"; fi; }
+# of <name> <image>: the scenario file name for <image>: <name>.<digest> if it exists. A
+# remote install names the image <repo>:sha256-<hex>.
+of() {
+  local d=${2##*@}
+  [[ $2 != *:sha256-* ]] || d=sha256:${2##*:sha256-}
+  if [[ -e $FAKE/$1.$d ]]; then echo "$1.$d"; else echo "$1"; fi
+}
 case $1 in
   images)
     case ${!#} in
@@ -87,7 +97,7 @@ case $1 in
       *) or images "" ;;
     esac
     ;;
-  rm) rm -f "$FAKE/running" ;;
+  rm) [[ " $* " == *" rcid "* || " $* " == *" hcid "* ]] || rm -f "$FAKE/running" ;;
   ps)
     if grep -qxF "${!##ancestor=}" "$FAKE/in_use" 2>/dev/null; then echo cid; fi
     ;;
@@ -151,11 +161,35 @@ case $1 in
     ;;
   version) [[ ! -f $FAKE/daemon_down ]] || exit 1 ;;
   create)
-    echo "$4" >"$FAKE/created"
-    echo cid1
+    if [[ ${!#} == compose ]]; then
+      echo rcid
+    elif [[ " $* " == *" -v egress-config:/etc/egress "* ]]; then
+      echo hcid
+    else
+      echo "$4" >"$FAKE/created"
+      echo cid1
+    fi
     ;;
+  start)
+    if grep -q BAD "$FAKE/render/config.local.yaml" 2>/dev/null; then
+      echo "proxy: config /etc/egress/config.local.yaml: network workers: BAD" >&2
+      exit 2
+    fi
+    printf 'services:\n  proxy:\n    networks:\n      workers: {}\nnetworks:\n  workers:\n    name: "egress-workers"\n    external: true\n'
+    ;;
+  volume) ;;
   logs) or logs "" ;;
   cp)
+    case $3 in
+      rcid:* | hcid:*)
+        d=$FAKE/volume
+        [[ $3 != rcid:* ]] || d=$FAKE/render
+        rm -rf "$d"
+        mkdir -p "$d"
+        "$REAL_CP" -R "${2%/.}/." "$d"
+        exit 0
+        ;;
+    esac
     if [[ -f $FAKE/cp_fails ]]; then
       echo "Error response from daemon: write $3/install.sh: no space left on device" >&2
       exit 1
@@ -274,7 +308,8 @@ fresh() {
   rm -f "$FAKE/running" "$FAKE/health" "$FAKE/up_fails" "$FAKE/calls" "$FAKE/contract" "$FAKE"/run_* \
     "$FAKE"/label.* "$FAKE"/health.* "$FAKE"/up_fails.* "$FAKE/logs" "$FAKE/images" "$FAKE/rm_fails" \
     "$FAKE"/legacy.* "$FAKE/in_use" "$FAKE/old_start" "$FAKE/old_start_rc" "$FAKE/old_start_image"
-  rm -rf "$FAKE"/egress.*
+  rm -rf "$FAKE"/egress.* "$FAKE/render" "$FAKE/volume"
+  rm -f "$FAKE/hosts"
 }
 out() { cat "$work/out"; }
 tree() { (cd "$dir" && find . -exec ls -ld {} + | sort) 2>/dev/null || true; }
@@ -1191,6 +1226,115 @@ is "$rc $(tail -n 1 "$work/out")" "11 install.sh: rolled back to egress-proxy 1.
 [[ ! -e $FAKE/old_start ]] || bad+="the old start.sh ran; "
 checkout_kept || bad+="the rollback install removed the checkout; "
 check migrate_resumed_rollback "$bad: $(out)" "$(st is "$bad" "")"
+
+# -------- A remote install: install.sh and start.sh (README.md › Remote Docker host) --------
+TGT=ssh://admin@pc.example:2222
+# ref <digest char>: the image's name on the target.
+ref() { echo "$REPO:sha256-$(digest "$1" | sed 's/^sha256://')"; }
+# hosts_ok: every docker call since $FAKE/hosts was emptied went to the target, no context.
+hosts_ok() { is "$(sort -u "$FAKE/hosts")" "$TGT|"; }
+# rstart [env...]: the installed start.sh, output in $work/out, exit code in $rc.
+rstart() {
+  rc=0
+  env "$@" PATH="$work/fast:$work/bin:$PATH" "$dir/start.sh" >"$work/out" 2>&1 || rc=$?
+}
+
+fresh remote_install
+DOCKER_CONTEXT=hostile install 1.0.0 a --docker-host "$TGT"
+bad=""
+is "$rc" 0 || bad+="exit $rc; "
+is "$(val "$dir/state/docker-host")" "$TGT" || bad+="state/docker-host: $(cat "$dir/state/docker-host" 2>/dev/null); "
+hosts_ok || bad+="hosts: $(sort -u "$FAKE/hosts" | xargs); "
+is "$(cat "$FAKE/running") $(val "$dir/state/runtime/image") $(record current_image)" "$(ref a) $(ref a) $(image a)" ||
+  bad+="running $(cat "$FAKE/running"), runtime image $(val "$dir/state/runtime/image"), record $(record current_image); "
+grep -E ' pull |--pull always| (build|buildx)( |$)|-v /|:/etc/egress:ro' "$FAKE/calls" && bad+="a pull, build or bind mount; "
+grep -qF ' volume create egress-config' "$FAKE/calls" || bad+="no volume create; "
+grep ' compose ' "$FAKE/calls" | grep -qvF "$dir/state/runtime/compose.remote.yaml" && bad+="compose without compose.remote.yaml; "
+cmp -s "$FAKE/volume/config.local.yaml" "$dir/config.local.yaml" || bad+="the volume does not hold the config; "
+like "$(out)" "egress-proxy 1.0.0 ($(digest a)) installed in $dir; start command: $dir/start.sh" || bad+="no installed message; "
+check remote_install "$bad: $(out)" "$(st is "$bad" "")"
+
+bad=""
+grep -qF "| Logs (config errors name the network and key) | \`docker --host $TGT logs egress-proxy\` |" "$dir/README.md" || bad+="logs row; "
+grep -qF "| Health | \`docker --host $TGT inspect" "$dir/README.md" || bad+="health row; "
+grep -qF "image \`$(image a)\`, on the Docker host $TGT" "$dir/README.md" || bad+="installed line; "
+check remote_readme "$bad: $(sed -n '1,30p' "$dir/README.md")" "$(st is "$bad" "")"
+
+rm -f "$FAKE/hosts"
+rstart DOCKER_HOST=tcp://hostile:1234 DOCKER_CONTEXT=hostile
+check remote_start_env "exit $rc, hosts $(sort -u "$FAKE/hosts" | xargs): $(out)" "$(st is "$rc $(hosts_ok && echo ok)" "0 ok")"
+
+before=$(sha "$FAKE/volume/config.local.yaml")
+"$REAL_CP" "$dir/config.local.yaml" "$work/config.saved"
+echo "# BAD" >>"$dir/config.local.yaml"
+: >"$FAKE/calls"
+rstart
+bad=""
+is "$rc" 2 || bad+="exit $rc; "
+like "$(out)" "config /etc/egress/config.local.yaml: network workers: BAD" || bad+="no config error; "
+is "$(sha "$FAKE/volume/config.local.yaml")" "$before" || bad+="the volume changed; "
+grep -E ' volume | up ' "$FAKE/calls" && bad+="it went on; "
+is "$(find "$dir/state" -maxdepth 1 -name '.config.*')" "" || bad+="a staged config is left; "
+check remote_config_error_unchanged "$bad: $(out)" "$(st is "$bad" "")"
+
+mv "$dir/config.local.yaml" "$work/config.bad"
+: >"$FAKE/calls"
+rstart
+check remote_config_missing "exit $rc, calls $(cat "$FAKE/calls"): $(out)" \
+  "$(st is "$rc $(wc -l <"$FAKE/calls" | tr -d ' ')" "2 0")"
+"$REAL_CP" "$work/config.saved" "$dir/config.local.yaml"
+
+"$REAL_CP" "$dir/state/docker-host" "$work/target.saved"
+echo 'ssh://pc;id' >"$dir/state/docker-host"
+: >"$FAKE/calls"
+rstart
+check remote_bad_target "exit $rc, calls $(cat "$FAKE/calls"): $(out)" \
+  "$(st like "$rc $(wc -l <"$FAKE/calls" | tr -d ' ') $(out)" "2 0 start.sh: $dir/state/docker-host is not ssh://")"
+"$REAL_CP" "$work/target.saved" "$dir/state/docker-host"
+
+before=$(tree)
+install 1.1.0 b
+check remote_dir_needs_target "exit $rc: $(out)" \
+  "$(st like "$rc $(out)" "2 install.sh: $dir is a remote install (state/docker-host)")"
+is "$(tree)" "$before" || fail remote_dir_needs_target "$dir changed"
+
+# The same downgrade rule: a published newer version is kept, judged by the image ID of the
+# recorded digest's tag (a loaded image has no RepoDigests).
+fresh remote_keep_newer
+install 1.2.0 c --docker-host "$TGT"
+echo 1.2.0 >"$FAKE/run_label"
+: >"$FAKE/calls"
+install 1.1.0 b --docker-host "$TGT"
+check remote_keep_newer "exit $rc, running $(cat "$FAKE/running"): $(out)" "$(st is "$rc $(cat "$FAKE/running") $(out)" \
+  "0 $(ref c) install.sh: kept the running egress-proxy 1.2.0 ($(digest c)), newer than 1.1.0; nothing was changed")"
+echo "$REPO:9.9.9" >"$FAKE/running"
+install 1.1.0 b --docker-host "$TGT"
+check remote_replaces_unpublished "exit $rc, running $(cat "$FAKE/running"): $(out)" \
+  "$(st is "$rc $(cat "$FAKE/running")" "0 $(ref b)")"
+
+fresh remote_cleanup
+install 1.0.0 a --docker-host "$TGT"
+install 1.1.0 b --docker-host "$TGT"
+printf 'sha256:id-%s\n' "$(ref a)" "$(ref b)" "$REPO:9.9.9" "$(ref c)" >"$FAKE/images"
+install 1.2.0 c --docker-host "$TGT"
+check remote_cleanup "exit $rc, left $(images_left): $(out)" "$(st is "$rc $(images_left)" "0 $(ref b) $(ref c)")"
+
+# The caller's docker: whatever `docker` is first on PATH, here a wrapper.
+fresh remote_docker_wrapper
+mkdir -p "$work/wrap"
+cat >"$work/wrap/docker" <<WRAP
+#!/usr/bin/env bash
+echo "\$*" >>"\$FAKE/wrapped"
+exec "$work/bin/docker" "\$@"
+WRAP
+chmod +x "$work/wrap/docker"
+rm -f "$FAKE/wrapped"
+echo 1.0.0 >"$FAKE/label"
+rc=0
+PATH="$work/wrap:$work/fast:$work/bin:$PATH" bash "$files/install.sh" --interface 1 --version 1.0.0 \
+  --digest "$(digest a)" --dir "$dir" --image "$(image a)" --files "$files" --docker-host "$TGT" >"$work/out" 2>&1 || rc=$?
+check remote_docker_wrapper "exit $rc, $(wc -l <"$FAKE/calls") calls, $(wc -l <"$FAKE/wrapped" 2>/dev/null) wrapped: $(out)" \
+  "$(st is "$rc $(wc -l <"$FAKE/calls")" "0 $(wc -l <"$FAKE/wrapped" 2>/dev/null)")"
 
 # -------- egress-install --------
 # The image's installer, for these cases: records its arguments, exits install_rc.
