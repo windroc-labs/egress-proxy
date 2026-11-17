@@ -6,8 +6,10 @@
 # with real Docker, a throwaway Docker client config and no gh login. A docker shim logs
 # every call and refuses any build. <registry container> is the registry's container,
 # stopped to take the registry offline, then started again for the upgrades: images built
-# FROM the installed one with other version labels, one never healthy, pushed there. Last,
+# FROM the installed one with other version labels, one never healthy, pushed there. Then
 # a source-checkout install (the v0.5.0 layout) migrates, once rolled back, once for good.
+# Last, a remote install (--docker-host ssh://…): this machine's daemon stands in for the
+# remote one, reached through an `ssh` on PATH that runs `docker system dial-stdio` here.
 # Linux CI only: it starts the proxy and its networks. Prints `ok <check>` per check and
 # stops at the first `FAIL <check>: <detail>`.
 set -euo pipefail
@@ -63,6 +65,7 @@ cleanup() {
   fi
   "$real_docker" rm -f "$PX" egress-test-caller egress-test-gateway >/dev/null 2>&1 || true
   "$real_docker" network rm egress-workers egress-uplink >/dev/null 2>&1 || true
+  "$real_docker" volume rm egress-config >/dev/null 2>&1 || true
   "$real_docker" start "$registry" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
@@ -329,5 +332,79 @@ rc=0
 "$legacy/verify-egress" workers || rc=$?
 ((rc == 0)) || fail migrate_callers "verify-egress workers exited $rc"
 ok migrate_callers
+
+# -------- A remote install (README.md › Remote Docker host) --------
+# The target: this daemon, through the ssh docker's ssh:// connection helper runs, the first
+# `ssh` on PATH. It starts without this repo's images or the proxy, so the install must
+# fetch the image on the caller's side and load it.
+"$real_docker" rm -f "$PX" egress-test-caller >/dev/null
+for id in $("$real_docker" images -q "$image_repo" | sort -u); do "$real_docker" image rm -f "$id" >/dev/null; done
+mkdir -p "$work/sshbin"
+cat >"$work/sshbin/ssh" <<SSH
+#!/usr/bin/env bash
+echo "\$*" >>"$work/ssh.log"
+exec env -u DOCKER_HOST -u DOCKER_CONTEXT "$real_docker" system dial-stdio
+SSH
+chmod +x "$work/sshbin/ssh"
+export PATH=$work/sshbin:$PATH
+TGT=ssh://egress-test-target
+rdir=$work/remote
+rref=$image_repo:sha256-${digest#sha256:}
+# since <n>: the docker calls logged from line <n> of docker.log on.
+since() { tail -n +"$1" "$work/docker.log"; }
+
+mark=$(($(wc -l <"$work/docker.log") + 1))
+rc=0
+"$repo/egress-install" --version "$version" --digest "$digest" --dir "$rdir" --docker-host "$TGT" || rc=$?
+((rc == 0)) || fail remote_install "egress-install exited $rc"
+grep -q "egress-test-target.*dial-stdio" "$work/ssh.log" || fail remote_install "docker did not go through ssh: $(cat "$work/ssh.log" 2>&1)"
+since "$mark" | grep -E '^pull |--pull always|-v /|type=bind' && fail remote_install "a pull or a bind mount on the target"
+[[ $(sed '/^#/d' "$rdir/state/docker-host") == "$TGT" ]] || fail remote_install "state/docker-host: $(cat "$rdir/state/docker-host")"
+ok remote_install
+
+since "$mark" | grep -q '^load -q -i ' || fail remote_image "no load"
+docker image inspect "$rref" >/dev/null || fail remote_image "no $rref"
+[[ $(inspect '{{.Config.Image}}') == "$rref" ]] || fail remote_image "$PX runs $(inspect '{{.Config.Image}}')"
+ok remote_image
+
+wait_health || fail remote_contract "not healthy"
+labels=$(inspect '{{index .Config.Labels "windroc.egress.contract"}} {{index .Config.Labels "windroc.egress.networks"}} {{index .Config.Labels "windroc.egress.network.workers.name"}}')
+[[ $labels == "1 workers egress-workers" ]] || fail remote_contract "labels: $(inspect '{{json .Config.Labels}}')"
+[[ $(docker network inspect --format '{{.Internal}}' egress-workers) == true ]] || fail remote_contract "egress-workers is not internal"
+[[ $(docker network inspect --format '{{.Internal}}' egress-uplink) == false ]] || fail remote_contract "egress-uplink is internal"
+mounts=$(inspect '{{range .Mounts}}{{.Type}}:{{.Name}}:{{.Destination}}:{{.RW}} {{end}}')
+[[ $mounts == "volume:egress-config:/etc/egress:false " ]] || fail remote_contract "mounts: $mounts"
+ok remote_contract
+
+started=$(inspect '{{.State.StartedAt}}')
+printf '    deny_ranges: [198.51.100.0/24]\n' >>"$rdir/config.local.yaml"
+"$rdir/start.sh"
+[[ $(inspect '{{.State.StartedAt}}') != "$started" ]] || fail remote_config_change "start.sh did not apply the change"
+wait_health || fail remote_config_change "not healthy after the change"
+grep -qxF '    198.51.100.0/24' "$rdir/effective-policy.txt" || fail remote_config_change "the rules file lacks the new deny range"
+ok remote_config_change
+
+rc=0
+"$rdir/verify-egress" workers || rc=$?
+((rc == 0)) || fail remote_verify "verify-egress workers exited $rc"
+ok remote_verify
+
+# The same rules as a local install: 0.0.3, then 0.0.4 rolls back, then 0.0.2 keeps 0.0.3.
+# These images are single-platform: the fetch takes their manifest itself.
+rc=0
+"$repo/egress-install" --version 0.0.3 --digest "$d3" --dir "$rdir" || rc=$?
+((rc == 0)) || fail remote_rollback "the install of 0.0.3 exited $rc"
+rc=0
+out=$("$repo/egress-install" --version 0.0.4 --digest "$d4" --dir "$rdir" 2>&1) || rc=$?
+((rc == 11)) || fail remote_rollback "egress-install exited $rc: $out"
+[[ $(inspect '{{.Config.Image}}') == "$image_repo:sha256-${d3#sha256:}" ]] || fail remote_rollback "$PX runs $(inspect '{{.Config.Image}}')"
+[[ $(inspect '{{.State.Health.Status}}') == healthy ]] || fail remote_rollback "$PX is $(inspect '{{.State.Health.Status}}')"
+grep -qxF "current_digest=$d3" "$rdir/state/installed" || fail remote_rollback "$(cat "$rdir/state/installed")"
+ok remote_rollback
+rc=0
+out=$("$repo/egress-install" --version 0.0.2 --digest "$d2" --dir "$rdir" 2>&1) || rc=$?
+((rc == 0)) || fail remote_keep_newer "egress-install exited $rc: $out"
+[[ $out == *"kept the running egress-proxy 0.0.3 ($d3), newer than 0.0.2"* ]] || fail remote_keep_newer "$out"
+ok remote_keep_newer
 
 echo "all checks passed"
