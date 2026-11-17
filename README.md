@@ -92,7 +92,7 @@ proxy does not come back either). Only that exact layout is migrated: a `current
 | 2 | usage, or Docker is not running or not reachable |
 | 3 | no access to the image: the message names the GitHub login and scope needed |
 | 4 | the pull failed: the message names the image, digest and registry; the running proxy keeps running |
-| 5 | the image is not that version, has no contract label, or has no installer |
+| 5 | the image is not that version, has no contract label, or has no installer, or (a remote install) is of a version that cannot be installed on a remote Docker host |
 | 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`), with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
 | 7 | the start command failed, with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
 | 8 | the installer does not know the `--interface` this `egress-install` speaks |

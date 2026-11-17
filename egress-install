@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# egress-install --version X.Y.Z --digest sha256:<64 hex> [--dir <path>]
+# egress-install --version X.Y.Z --digest sha256:<64 hex> [--dir <path>] [--docker-host ssh://<host>]
 #
 # The egress proxy's install entry (README.md, Setup): installs or reinstalls the
 # published image ghcr.io/windroc/egress-proxy@<digest> into <dir> (default ~/.egress).
@@ -17,30 +17,208 @@
 # Steps 1-3 change nothing outside a temp directory, removed on exit: a failure there
 # leaves <dir> and the running proxy as they were.
 #
+# A remote install (--docker-host, README.md › Remote Docker host) runs here, on the
+# caller, against the Docker daemon at that ssh:// URL, which <dir>/state/docker-host then
+# records; a later run without --docker-host uses the recorded one, and a new one replaces
+# it. The target never pulls: unless it has the image already (as the tag
+# <repo>:sha256-<hex>), this fetches the target platform's image from the registry by
+# digest, checks every digest, and loads it there (python3, below; for ghcr.io with the gh
+# login, its token kept in memory). docker, ssh, python3 and gh are whatever PATH names,
+# with this environment, but DOCKER_HOST and DOCKER_CONTEXT, which the target sets.
+#
 # EGRESS_IMAGE_REPO (default ghcr.io/windroc/egress-proxy) is the repo pulled from, and
 # part of the handoff: install.sh's rollback runs the previous version's egress-install
 # with the repo of that version's recorded image. Tests set it to a local registry.
 #
-# Exit codes: 0 installed; 1 another failure (e.g. copying the image's files); 2 usage, or
-# Docker not reachable; 3 no access to the image; 4 the pull failed; 5 the image has no
-# installer; other: the installer's (install.sh).
+# Exit codes: 0 installed; 1 another failure (e.g. copying the image's files, or loading
+# them on the target); 2 usage, Docker not reachable, or --docker-host on a local install;
+# 3 no access to the image; 4 the pull (remote: the fetch) failed; 5 the image has no
+# installer, or (remote) is of a version that cannot be installed on a remote Docker host;
+# other: the installer's (install.sh).
 #
 # Callers may ship a copy of this file: keep its arguments and its handoff to install.sh
 # (interface 1) stable. Runs on macOS's bash 3.2 and on Linux.
 set -euo pipefail
 
 usage() {
-  echo "usage: egress-install --version X.Y.Z --digest sha256:<64 hex> [--dir <path>]" >&2
+  echo "usage: egress-install --version X.Y.Z --digest sha256:<64 hex> [--dir <path>] [--docker-host ssh://<host>]" >&2
   exit 2
 }
 
-version="" digest="" dir=${HOME:-}/.egress
+# FETCH: python3 -I -c "$FETCH" <repo> <digest> <os/arch> <tag> <out>: fetches the image
+# <repo>@<digest> for platform <os/arch> from its registry (http for localhost and
+# 127.*), checks the digest of the index, the manifest, the config and every layer, and
+# writes <out> in the layout `docker save` writes (oci-layout, index.json, manifest.json,
+# blobs/sha256/), naming the image <tag>. Prints "<config digest> <manifest digest>".
+# Exit 3: the registry denied access (401, 403); 4: any other failure. Only for ghcr.io,
+# and only to an https realm on ghcr.io, does the token request carry the gh login; no
+# credential header follows a redirect, and none is ever printed or written.
+IFS= read -r -d '' FETCH <<'PY' || true
+import base64, hashlib, json, os, re, subprocess, sys, tarfile, urllib.error, urllib.parse, urllib.request
+
+repo, digest, platform, tag, out = sys.argv[1:6]
+registry, _, name = repo.partition("/")
+host = registry.split("]")[0] + "]" if registry.startswith("[") else registry.split(":")[0]
+scheme = "http" if host in ("localhost", "[::1]") or host.startswith("127.") else "https"
+base = "%s://%s/v2/%s" % (scheme, registry, name)
+INDEX = ("application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json")
+MANIFEST = ("application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json")
+DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+token = None
+
+
+class Fail(Exception):
+    def __init__(self, code, msg):
+        Exception.__init__(self, msg)
+        self.code = code
+
+
+def gh_login():
+    if registry != "ghcr.io":
+        return None
+    try:
+        tok = subprocess.run(["gh", "auth", "token", "--hostname", "github.com"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=60)
+        if tok.returncode != 0 or not tok.stdout.strip():
+            return None
+        user = subprocess.run(["gh", "api", "user", "--jq", ".login"], stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, universal_newlines=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return "%s:%s" % (user.stdout.strip() or "egress-install", tok.stdout.strip())
+
+
+def bearer(challenge):
+    m = re.match(r"(?i)bearer\s+(.*)", challenge or "")
+    params = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1))) if m else {}
+    realm = params.pop("realm", "")
+    if not realm:
+        raise Fail(3, "HTTP 401")
+    req = urllib.request.Request(realm + ("&" if "?" in realm else "?") + urllib.parse.urlencode(params))
+    url = urllib.parse.urlsplit(realm)
+    login = gh_login() if url.scheme == "https" and url.hostname == "ghcr.io" else None
+    if login:
+        req.add_unredirected_header("Authorization", "Basic " + base64.b64encode(login.encode()).decode())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            body = json.load(r)
+    except urllib.error.HTTPError as e:
+        raise Fail(3 if e.code in (401, 403) else 4, "token request: HTTP %d" % e.code)
+    found = body.get("token") or body.get("access_token")
+    if not found:
+        raise Fail(3, "token request: no token")
+    return found
+
+
+def get(path, accept=()):
+    global token
+    while True:
+        req = urllib.request.Request(base + path)
+        if accept:
+            req.add_header("Accept", ", ".join(accept))
+        if token:
+            req.add_unredirected_header("Authorization", "Bearer " + token)
+        try:
+            return urllib.request.urlopen(req, timeout=120)
+        except urllib.error.HTTPError as e:
+            if e.code == 401 and token is None:
+                token = bearer(e.headers.get("WWW-Authenticate"))
+                continue
+            raise Fail(3 if e.code in (401, 403) else 4, "%s: HTTP %d" % (path, e.code))
+
+
+def checked(d, kind):
+    if not DIGEST.match(d or ""):
+        raise Fail(4, "the %s digest is not sha256:<64 hex>" % kind)
+    return d
+
+
+def manifest(d, accept):
+    with get("/manifests/" + checked(d, "manifest"), accept) as r:
+        data, ctype = r.read(), r.headers.get("Content-Type", "").split(";")[0]
+    if "sha256:" + hashlib.sha256(data).hexdigest() != d:
+        raise Fail(4, "manifest %s does not match its digest" % d)
+    return data, ctype
+
+
+def blob(desc, kind, blobs):
+    d = checked(desc.get("digest"), kind)
+    path = os.path.join(blobs, d[7:])
+    h = hashlib.sha256()
+    with get("/blobs/" + d) as r, open(path + ".part", "wb") as f:
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+            f.write(chunk)
+    if "sha256:" + h.hexdigest() != d:
+        raise Fail(4, "%s %s does not match its digest" % (kind, d))
+    os.rename(path + ".part", path)
+    return d
+
+
+def main():
+    want_os, _, want_arch = platform.partition("/")
+    data, ctype = manifest(digest, INDEX + MANIFEST)
+    doc = json.loads(data)
+    mdigest = digest
+    if (doc.get("mediaType") or ctype) in INDEX:
+        found = [m for m in doc.get("manifests", []) if (m.get("platform") or {}).get("os") == want_os
+                 and m["platform"].get("architecture") == want_arch]
+        if not found:
+            raise Fail(4, "no %s image in %s@%s" % (platform, repo, digest))
+        mdigest = found[0].get("digest")
+        data, ctype = manifest(mdigest, MANIFEST)
+        doc = json.loads(data)
+    mtype = doc.get("mediaType") or ctype
+    if mtype not in MANIFEST:
+        raise Fail(4, "manifest %s has media type %s" % (mdigest, mtype))
+    root = out + ".d"
+    blobs = os.path.join(root, "blobs", "sha256")
+    os.makedirs(blobs)
+    with open(os.path.join(blobs, mdigest[7:]), "wb") as f:
+        f.write(data)
+    config = blob(doc.get("config") or {}, "config", blobs)
+    with open(os.path.join(blobs, config[7:]), "rb") as f:
+        conf = json.load(f)
+    if (conf.get("os"), conf.get("architecture")) != (want_os, want_arch):
+        raise Fail(4, "the image is %s/%s, not %s" % (conf.get("os"), conf.get("architecture"), platform))
+    layers = [blob(layer, "layer", blobs) for layer in doc.get("layers", [])]
+    with open(os.path.join(root, "oci-layout"), "w") as f:
+        json.dump({"imageLayoutVersion": "1.0.0"}, f)
+    with open(os.path.join(root, "index.json"), "w") as f:
+        json.dump({"schemaVersion": 2, "mediaType": INDEX[0], "manifests": [{
+            "mediaType": mtype, "digest": mdigest, "size": len(data),
+            "annotations": {"io.containerd.image.name": tag,
+                            "org.opencontainers.image.ref.name": tag.rsplit(":", 1)[1]}}]}, f)
+    with open(os.path.join(root, "manifest.json"), "w") as f:
+        json.dump([{"Config": "blobs/sha256/" + config[7:], "RepoTags": [tag],
+                    "Layers": ["blobs/sha256/" + d[7:] for d in layers]}], f)
+    with tarfile.open(out, "w") as tar:
+        for entry in ("oci-layout", "index.json", "manifest.json", "blobs"):
+            tar.add(os.path.join(root, entry), arcname=entry)
+    print(config, mdigest)
+
+
+try:
+    main()
+except Fail as e:
+    sys.stderr.write("%s\n" % e)
+    sys.exit(e.code)
+except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+    sys.stderr.write("%s\n" % (getattr(e, "reason", None) or e))
+    sys.exit(4)
+PY
+
+version="" digest="" dir=${HOME:-}/.egress docker_host=""
 while (($# > 0)); do
   (($# >= 2)) || usage
   case $1 in
     --version) version=$2 ;;
     --digest) digest=$2 ;;
     --dir) dir=$2 ;;
+    --docker-host) docker_host=$2 ;;
     *) usage ;;
   esac
   shift 2
@@ -48,6 +226,25 @@ done
 [[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
 [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || usage
 [[ -n $dir && $dir != /.egress ]] || usage
+target_re='^ssh://([A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+(:[0-9]+)?$'
+if [[ -n $docker_host ]]; then
+  [[ $docker_host =~ $target_re ]] || usage
+  if [[ ! -f $dir/state/docker-host ]] &&
+    [[ -e $dir/state/installed || -e $dir/current || -L $dir/current || -e $dir/versions ]]; then
+    echo "egress-install: $dir holds a local install; install the remote one into another directory (--dir <path>); nothing was changed" >&2
+    exit 2
+  fi
+elif [[ -f $dir/state/docker-host ]]; then
+  docker_host=$(sed '/^#/d' "$dir/state/docker-host")
+  if ! [[ $docker_host =~ $target_re ]]; then
+    echo "egress-install: $dir/state/docker-host is not ssh://[user@]host[:port]: $docker_host" >&2
+    exit 2
+  fi
+fi
+if [[ -n $docker_host ]]; then
+  export DOCKER_HOST=$docker_host
+  unset DOCKER_CONTEXT
+fi
 
 repo=${EGRESS_IMAGE_REPO:-ghcr.io/windroc/egress-proxy}
 image=$repo@$digest
@@ -68,10 +265,45 @@ trap 'exit 130' INT TERM
 # Without a daemon every docker call below fails, and a pull's error would read as a
 # registry or access problem.
 if ! docker version --format '{{.Server.Version}}' >/dev/null 2>&1; then
-  echo "egress-install: Docker is not running or not reachable (docker version failed); nothing was changed" >&2
+  echo "egress-install: Docker${docker_host:+ on $docker_host} is not running or not reachable (docker version failed); nothing was changed" >&2
   exit 2
 fi
-if ! docker image inspect "$image" >/dev/null 2>&1; then
+# What the Docker daemon calls the image: remote, the tag the load below gives it, since a
+# loaded image has no digest reference.
+ref=$image
+if [[ -n $docker_host ]]; then
+  ref=$repo:sha256-${digest#sha256:}
+  if ! docker image inspect "$ref" >/dev/null 2>&1; then
+    if ! platform=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}' 2>/dev/null) || [[ -z $platform ]]; then
+      echo "egress-install: cannot read the platform of Docker on $docker_host; nothing was changed" >&2
+      exit 2
+    fi
+    if ! command -v python3 >/dev/null; then
+      echo "egress-install: python3 is needed to fetch the image for a remote Docker host; nothing was changed" >&2
+      exit 2
+    fi
+    rc=0
+    ids=$(python3 -I -c "$FETCH" "$repo" "$digest" "$platform" "$ref" "$tmp/image.tar" 2>"$tmp/fetch.err") || rc=$?
+    if ((rc == 3)); then
+      echo "egress-install: no access to $repo: needs a GitHub login (gh auth login) whose account can read the package $repo, with scope read:packages (gh auth refresh -h github.com -s read:packages); nothing was changed" >&2
+      exit 3
+    elif ((rc != 0)); then
+      echo "egress-install: cannot fetch $image for $platform from registry $registry ($(tail -n 1 "$tmp/fetch.err")); nothing was changed and the running proxy, if any, keeps running" >&2
+      exit 4
+    fi
+    if ! docker load -q -i "$tmp/image.tar" >/dev/null 2>"$tmp/docker.err"; then
+      echo "egress-install: cannot load $ref on $docker_host: $(tail -n 1 "$tmp/docker.err")" >&2
+      exit 1
+    fi
+    # The load names whatever the archive says: the tag must be the image just verified (its
+    # config digest on the classic image store, its manifest digest on the containerd one).
+    id=$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null) || id=""
+    if [[ -z $id || " $ids " != *" $id "* ]]; then
+      echo "egress-install: $ref on $docker_host is ${id:-missing}, not the fetched image ($ids)" >&2
+      exit 1
+    fi
+  fi
+elif ! docker image inspect "$image" >/dev/null 2>&1; then
   # The pull's own client config: the user's contexts (with their TLS material), the
   # current context, no stored credential, and for ghcr.io the gh helper.
   if ! context=$(docker context show 2>/dev/null) || [[ -z $context ]]; then
@@ -118,8 +350,8 @@ HELPER
 fi
 
 # -------- Its files, and its installer --------
-if ! cid=$(docker create --pull never "$image" 2>"$tmp/docker.err"); then
-  echo "egress-install: cannot create a container of $image: $(tail -n 1 "$tmp/docker.err")" >&2
+if ! cid=$(docker create --pull never "$ref" 2>"$tmp/docker.err"); then
+  echo "egress-install: cannot create a container of $ref: $(tail -n 1 "$tmp/docker.err")" >&2
   exit 1
 fi
 mkdir "$tmp/files"
@@ -136,6 +368,17 @@ if ((rc != 0)); then
   exit 1
 fi
 
+# Every version before remote installs lacks compose.remote.yaml; its install.sh would
+# ignore --docker-host.
+remote=()
+if [[ -n $docker_host ]]; then
+  if [[ ! -f $tmp/files/compose.remote.yaml ]]; then
+    echo "egress-install: egress-proxy $version cannot be installed on a remote Docker host (its image has no compose.remote.yaml); install a version that supports it" >&2
+    exit 5
+  fi
+  remote=(--docker-host "$docker_host")
+fi
+
 # Its exit code is this script's (set -e); the EXIT trap still removes the temp files.
 bash "$tmp/files/install.sh" --interface 1 --version "$version" --digest "$digest" --dir "$dir" \
-  --image "$image" --files "$tmp/files"
+  --image "$image" --files "$tmp/files" ${remote[@]+"${remote[@]}"}
