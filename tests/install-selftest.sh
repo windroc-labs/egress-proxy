@@ -219,7 +219,7 @@ chmod +x "$work/bin/docker" "$work/bin/chmod" "$work/bin/mv" "$work/fast/sleep"
 # The image's /egress, as egress-install copies it out.
 files=$work/files
 mkdir -p "$files"
-for f in start.sh verify-egress compose.yaml config.example.yaml config.default.yaml install.sh egress-install; do
+for f in start.sh verify-egress compose.yaml compose.remote.yaml config.example.yaml config.default.yaml install.sh egress-install; do
   if [[ -f $repo/$f ]]; then
     "$REAL_CP" -p "$repo/$f" "$files/$f"
   else
