@@ -6,6 +6,7 @@
 !egress-install
 !install.sh
 !compose.yaml
+!compose.remote.yaml
 !config.example.yaml
 !config.default.yaml
 proxy/target

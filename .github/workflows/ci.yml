@@ -64,7 +64,12 @@ jobs:
         env:
           EGRESS_CONFIG_DIR: ${{ runner.temp }}
           EGRESS_IMAGE: egress-proxy
-        run: docker compose -f compose.yaml config -q
+        run: |
+          docker compose -f compose.yaml config -q
+          # A remote install's overlay mounts only the volume egress-config at /etc/egress.
+          remote=$(docker compose -f compose.yaml -f compose.remote.yaml config)
+          grep -q 'type: volume' <<<"$remote"
+          if grep -q 'type: bind' <<<"$remote"; then echo "compose.remote.yaml keeps a bind mount" >&2; exit 1; fi
 
   # The install entry and installer run on the user's Mac: macOS's own bash 3.2 and BSD
   # tools, not Homebrew's.

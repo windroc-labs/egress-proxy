@@ -26,7 +26,7 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d55
 COPY --from=fetch --chmod=0555 /tmp/smokescreen /smokescreen
 COPY --from=build /proxy /proxy
 COPY --chmod=0555 start.sh verify-egress egress-install install.sh /egress/
-COPY --chmod=0444 compose.yaml config.example.yaml config.default.yaml /egress/
+COPY --chmod=0444 compose.yaml compose.remote.yaml config.example.yaml config.default.yaml /egress/
 USER 65532:65532
 # The checks run per network in parallel and take at most about 8 s (proxy/src/health.rs).
 HEALTHCHECK --interval=15s --timeout=10s --start-period=20s --start-interval=2s --retries=2 CMD ["/proxy", "health"]

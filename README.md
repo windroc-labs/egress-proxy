@@ -89,10 +89,10 @@ proxy does not come back either). Only that exact layout is migrated: a `current
 | --- | --- |
 | 0 | installed, or a newer, healthy running proxy kept instead of downgrading |
 | 1 | another failure, e.g. the image's files could not be copied out, or `state/installed` has a newer format |
-| 2 | usage, or Docker is not running or not reachable |
+| 2 | usage (also: a remote install without --docker-host), or Docker is not running or not reachable |
 | 3 | no access to the image: the message names the GitHub login and scope needed |
 | 4 | the pull failed: the message names the image, digest and registry; the running proxy keeps running |
-| 5 | the image is not that version, has no contract label, or has no installer |
+| 5 | the image is not that version, has no contract label, or has no installer, or (a remote install) is of a version that cannot be installed on a remote Docker host |
 | 6 | the proxy was not healthy within 120 s (`docker logs egress-proxy`), with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
 | 7 | the start command failed, with no previous version to roll back to (or in a rollback): the version being installed is left as it is |
 | 8 | the installer does not know the `--interface` this `egress-install` speaks |
@@ -125,6 +125,56 @@ It is idempotent: running it again changes nothing. Never run a bare
 Desktop restart, or a Mac restart (with Docker Desktop set to start at login), from the
 image on the machine.
 
+### Remote Docker host
+
+To run the proxy on another machine's Docker (e.g. a PC whose workers a Mac starts), run the
+install on the caller's machine, against that Docker daemon over SSH:
+
+```
+egress-install --version X.Y.Z --digest sha256:<digest> --dir ~/.egress-pc --docker-host ssh://user@pc
+```
+
+The target needs only Docker Engine 26 or later, with the `docker` CLI on the PATH of its
+SSH login shell (`docker --host ssh://…` runs `docker system dial-stdio` there), and SSH
+key login from the caller. It needs no bash, `gh`, GitHub login, registry credential or
+directory of this install, and never pulls the image: unless the target has it already,
+`egress-install` fetches the target platform's image from the registry by digest on the
+caller (with the caller's `gh` login for `ghcr.io`, the token kept in memory), checks the
+digest of the index, the manifest, the config and every layer, and loads it there as
+`ghcr.io/windroc/egress-proxy:sha256-<hex of the digest>` (a loaded image has no digest
+reference); the tag's image ID must then be the verified config or manifest digest. The
+caller needs `python3` for that fetch and Docker Compose 2.24.4 or later (`!override` in
+`compose.remote.yaml`). Only versions that ship `compose.remote.yaml` install remotely; an
+older one exits 5 before anything changes.
+
+`docker`, `ssh`, `python3` and `gh` are whatever the caller's `PATH` names, with its
+environment, so a wrapper first on `PATH` can add options (e.g. an `ssh` with `-F <file>`).
+`DOCKER_HOST` and `DOCKER_CONTEXT` are ignored: the target is the one recorded in
+`<dir>/state/docker-host`, an `ssh://[user@]host[:port]` URL whose host is a name or an
+IPv4 address (not a bracketed IPv6 address).
+
+The install directory (`--dir`, here `~/.egress-pc`) stays on the caller, with the layout
+above plus `state/docker-host`. A directory is local or remote for good: `--docker-host` on
+a local install exits 2 (`egress-install`), and so does installing a remote one without it from an installer
+that predates remote installs. Later commands need no `--docker-host`; a new one replaces
+the recorded target, and the proxy on the old target keeps running until
+`docker --host <old target> rm -f egress-proxy`.
+
+- The config is `<dir>/config.local.yaml` on the caller. `<dir>/start.sh`, run on the
+  caller, validates it, copies it into the Docker volume `egress-config` on the target
+  (mounted read-only at `/etc/egress`) and applies it as locally; a config error leaves the
+  volume and the running proxy as they were. Until `start.sh` runs, the remote proxy
+  neither sees an edit nor reports `unhealthy` for it.
+- Upgrades, the downgrade rule (a newer version is kept when its image is the one the
+  record's current digest loaded), the rollback and the cleanup of old images work as
+  locally; exit codes are the same.
+- Status, logs and stop: `<dir>/README.md` lists them, e.g.
+  `docker --host ssh://user@pc logs egress-proxy`.
+- `<dir>/verify-egress <network>` and `--tools <image>` check the target, without the
+  host-side checks (`host_listener`, the host's addresses and gateways), which need a
+  shell on the target; it then needs no `python3`. Its probe image is pulled on the target
+  from Docker Hub, anonymously.
+
 ## Commands
 
 | Task | Command |
@@ -137,6 +187,7 @@ image on the machine.
 | Stop | `docker stop egress-proxy` |
 | Check a caller network's allows and denies ([Verify](#verify)) | `~/.egress/verify-egress <network>` |
 | Check how a worker image's tools behave behind the proxy | `~/.egress/verify-egress --tools <image>` |
+| Install on a remote Docker host ([Remote Docker host](#remote-docker-host)) | `egress-install --version X.Y.Z --digest sha256:<digest> --dir <dir> --docker-host ssh://<host>`; then `<dir>/start.sh`, and `docker --host ssh://<host> …` for health, logs and stop |
 
 A config change takes effect when `~/.egress/start.sh` runs: it restarts the proxy when the
 running policy differs from the config, and otherwise leaves it running. Until then the
@@ -276,11 +327,13 @@ egress-proxy-proxy`, and in a checkout where you built the entrypoint, `rm -rf g
 - verify-egress: `tests/verify-egress-selftest.sh` runs it against a fake `docker` (no
   daemon).
 - Install entry and installer: `tests/install-selftest.sh` runs `egress-install` and
-  `install.sh` against a fake `docker` and `gh` (no daemon).
+  `install.sh` against a fake `docker` and `gh` (no daemon), and a remote install's
+  image fetch against a fake registry on 127.0.0.1.
 - Docker end-to-end: `tests/integration.sh` runs in CI only (Linux; it restarts the
   Docker daemon and uses a throwaway Docker client config), from a checkout's `start.sh`.
   `tests/install-integration.sh` runs in CI's `image` job: it installs the image that job
-  published to its local registry by digest.
+  published to its local registry by digest, then installs it remotely with this daemon as
+  the target, through an `ssh` shim on `PATH`.
 - Release steps (`.github/release_image.py`): `python3 -B -m unittest discover -s .github -p 'test_*.py'`
   (requires `PyYAML==6.0.2`); no Docker or registry.
 - CI (`.github/workflows/ci.yml`) runs on every pull request and push to `main`, and as

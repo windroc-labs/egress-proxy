@@ -1,0 +1,17 @@
+# A remote install's override of compose.yaml (README.md › Remote Docker host): the config
+# comes from the Docker volume egress-config on the target, which start.sh fills from the
+# caller's config.local.yaml, not from a directory on the Docker host. `!override`
+# replaces compose.yaml's bind mount whole (Docker Compose 2.24.4 or later).
+services:
+  proxy:
+    volumes: !override
+      - type: volume
+        source: egress-config
+        target: /etc/egress
+        read_only: true
+
+volumes:
+  # start.sh creates it before the first start; external, like the networks.
+  egress-config:
+    name: egress-config
+    external: true
