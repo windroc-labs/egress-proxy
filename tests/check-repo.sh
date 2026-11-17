@@ -120,6 +120,20 @@ else
   fail tool_rows_documented "$detail"
 fi
 
+# Every file a Dockerfile COPY takes from the build context is allowed by .dockerignore,
+# which lists them (`!<path>`) after excluding everything: otherwise the build fails.
+missing=""
+while read -r src; do
+  grep -qxF "!$src" .dockerignore 2>/dev/null || missing+="$src "
+done < <(awk 'toupper($1) == "COPY" && $2 !~ /^--from=/ {
+    for (i = 2; i < NF; i++) if ($i !~ /^--/) print $i
+  }' Dockerfile)
+if [[ -n $missing ]]; then
+  fail dockerignore_allows_copies "not in .dockerignore: ${missing% }"
+else
+  ok dockerignore_allows_copies
+fi
+
 # README.md's Setup starts with the install entry, a version and a digest (FR-23); a
 # checkout's ./start.sh is for development, not in Setup.
 setup=$(awk '/^## Setup$/ { on = 1; next } /^## / { on = 0 } on' README.md 2>/dev/null || true)

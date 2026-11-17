@@ -104,6 +104,10 @@ dir=$(tree setup_checkout_start)
 awk '{ print } /^## Setup$/ { print ""; print "From a checkout: `./start.sh`" }' "$repo/README.md" >"$dir/README.md"
 expect_only_failure setup_checkout_start "$dir" "FAIL setup_install_entry: README.md Setup runs ./start.sh from a checkout"
 
+dir=$(tree dockerignore)
+grep -vxF '!compose.remote.yaml' "$repo/.dockerignore" >"$dir/.dockerignore"
+expect_only_failure dockerignore "$dir" "FAIL dockerignore_allows_copies: not in .dockerignore: compose.remote.yaml"
+
 dir=$(tree network_key)
 printf 'networks:\n  %s:\n    mode: allowlist\n' "${c}${d}" >"$dir/notes.yaml"
 out=$(run_check "$dir")

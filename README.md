@@ -89,7 +89,7 @@ proxy does not come back either). Only that exact layout is migrated: a `current
 | --- | --- |
 | 0 | installed, or a newer, healthy running proxy kept instead of downgrading |
 | 1 | another failure, e.g. the image's files could not be copied out, or `state/installed` has a newer format |
-| 2 | usage, or Docker is not running or not reachable |
+| 2 | usage (also: a remote install without --docker-host), or Docker is not running or not reachable |
 | 3 | no access to the image: the message names the GitHub login and scope needed |
 | 4 | the pull failed: the message names the image, digest and registry; the running proxy keeps running |
 | 5 | the image is not that version, has no contract label, or has no installer, or (a remote install) is of a version that cannot be installed on a remote Docker host |
@@ -150,11 +150,12 @@ older one exits 5 before anything changes.
 `docker`, `ssh`, `python3` and `gh` are whatever the caller's `PATH` names, with its
 environment, so a wrapper first on `PATH` can add options (e.g. an `ssh` with `-F <file>`).
 `DOCKER_HOST` and `DOCKER_CONTEXT` are ignored: the target is the one recorded in
-`<dir>/state/docker-host`, an `ssh://[user@]host[:port]` URL.
+`<dir>/state/docker-host`, an `ssh://[user@]host[:port]` URL whose host is a name or an
+IPv4 address (not a bracketed IPv6 address).
 
 The install directory (`--dir`, here `~/.egress-pc`) stays on the caller, with the layout
 above plus `state/docker-host`. A directory is local or remote for good: `--docker-host` on
-a local install exits 2, and so does installing a remote one without it from an installer
+a local install exits 2 (`egress-install`), and so does installing a remote one without it from an installer
 that predates remote installs. Later commands need no `--docker-host`; a new one replaces
 the recorded target, and the proxy on the old target keeps running until
 `docker --host <old target> rm -f egress-proxy`.

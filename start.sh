@@ -25,8 +25,9 @@
 # volume and the running proxy as they were.
 #
 # Exit codes: 0 started; 2 no config, a config error (the error names the network and
-# key), a bad state/docker-host or, installed, the image not on the Docker host; 1 an existing network with the wrong
-# internal or IPv6 setting; any other: the failing docker command's. On a config or
+# key), a bad state/docker-host or, installed, the image not on the Docker host; 1 an
+# existing network with the wrong internal or IPv6 setting; any other: the failing docker
+# command's. On a config or
 # network error the override and the running proxy are left as they were; an upgrade
 # removes the old project's container before `up`, so a failing `up` leaves no proxy
 # running.
@@ -86,13 +87,19 @@ elif ! docker image inspect "$image" >/dev/null 2>&1; then
 fi
 
 tmp=$(mktemp "$config_dir/state/.compose.networks.XXXXXX")
-stage=""
-trap 'rm -f "$tmp"; rm -rf "$stage"' EXIT
+# stage: a remote install's copy of the config; helper: the container (remote) that renders
+# it or fills the volume with it, removed on exit too if this stops before its own `rm`.
+stage="" helper=""
+cleanup_remote() {
+  rm -rf "$stage"
+  if [[ -n $helper ]]; then docker rm -f "$helper" >/dev/null 2>&1 || true; fi
+}
+trap 'rm -f "$tmp"; cleanup_remote' EXIT
 
 # render: prints the override for the config. Remote, the config is copied (readable by the
 # proxy's user) into a stopped container's /etc/egress, so errors name the same path as here.
 render() {
-  local cid rc=0
+  local rc=0
   if [[ -z $target ]]; then
     docker run --rm --pull never --network none --read-only --cap-drop ALL \
       --security-opt no-new-privileges:true -v "$config_dir:/etc/egress:ro" \
@@ -103,11 +110,12 @@ render() {
   cp "$config_dir/config.local.yaml" "$stage/config.local.yaml"
   chmod 0755 "$stage"
   chmod 0644 "$stage/config.local.yaml"
-  cid=$(docker create --pull never --network none --cap-drop ALL \
+  helper=$(docker create --pull never --network none --cap-drop ALL \
     --security-opt no-new-privileges:true "$image" compose) || return
-  docker cp "$stage/." "$cid:/etc/egress" >/dev/null || rc=$?
-  ((rc != 0)) || docker start -a "$cid" || rc=$?
-  docker rm -f "$cid" >/dev/null 2>&1 || true
+  docker cp "$stage/." "$helper:/etc/egress" >/dev/null || rc=$?
+  ((rc != 0)) || docker start -a "$helper" || rc=$?
+  docker rm -f "$helper" >/dev/null 2>&1 || true
+  helper=""
   return "$rc"
 }
 {
@@ -148,6 +156,7 @@ if [[ -n $target ]]; then
   rc=0
   docker cp "$stage/." "$helper:/etc/egress" >/dev/null || rc=$?
   docker rm -f "$helper" >/dev/null 2>&1 || true
+  helper=""
   ((rc == 0)) || exit "$rc"
 fi
 
@@ -186,7 +195,7 @@ fi
 rules_file=$config_dir/effective-policy.txt
 rules_tmp=$(mktemp "$config_dir/state/.effective-policy.txt.XXXXXX")
 rules_err=$(mktemp "$config_dir/state/.rules.err.XXXXXX")
-trap 'rm -f "$tmp" "$rules_tmp" "$rules_err"; rm -rf "$stage"' EXIT
+trap 'rm -f "$tmp" "$rules_tmp" "$rules_err"; cleanup_remote' EXIT
 version=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$image" 2>/dev/null) ||
   version=""
 [[ -n $version && $version != "<no value>" ]] || version="development build"

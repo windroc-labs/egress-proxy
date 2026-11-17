@@ -382,6 +382,15 @@ printf '    deny_ranges: [198.51.100.0/24]\n' >>"$rdir/config.local.yaml"
 [[ $(inspect '{{.State.StartedAt}}') != "$started" ]] || fail remote_config_change "start.sh did not apply the change"
 wait_health || fail remote_config_change "not healthy after the change"
 grep -qxF '    198.51.100.0/24' "$rdir/effective-policy.txt" || fail remote_config_change "the rules file lacks the new deny range"
+# The install command, rerun with the same arguments, applies a change too.
+started=$(inspect '{{.State.StartedAt}}')
+printf '    deny_ranges: [198.51.100.0/24, 203.0.113.0/24]\n' >>"$rdir/config.local.yaml"
+sed -i '/^    deny_ranges: \[198.51.100.0\/24\]$/d' "$rdir/config.local.yaml"
+rc=0
+"$repo/egress-install" --version "$version" --digest "$digest" --dir "$rdir" --docker-host "$TGT" || rc=$?
+((rc == 0)) || fail remote_config_change "the rerun of egress-install exited $rc"
+[[ $(inspect '{{.State.StartedAt}}') != "$started" ]] || fail remote_config_change "the rerun did not apply the change"
+grep -qxF '    203.0.113.0/24' "$rdir/effective-policy.txt" || fail remote_config_change "the rerun's rules file lacks 203.0.113.0/24"
 ok remote_config_change
 
 rc=0

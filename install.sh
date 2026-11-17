@@ -53,7 +53,8 @@
 #   0   installed, or a newer, healthy running proxy kept instead of downgrading
 #   1   another failure, e.g. the image's files could not be copied out, or
 #       `state/installed` has a newer format
-#   2   usage, or Docker is not running or not reachable
+#   2   usage (also: a remote install without --docker-host), or Docker is not running or
+#       not reachable
 #   3   no access to the image: the message names the GitHub login and scope needed
 #   4   the pull failed: the message names the image, digest and registry; the running
 #       proxy keeps running

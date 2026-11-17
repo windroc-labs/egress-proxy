@@ -1508,8 +1508,9 @@ check no_installer "exit $rc: $(err)" "$(st is "$rc $(err)" "5 egress-install: $
 # A fake registry on 127.0.0.1: one multi-arch image (linux/amd64 and linux/arm64, one tiny
 # layer each), its index digest in reg_digest, each config digest in reg_cfg_<arch>. It logs
 # "<path> <Authorization>" per request in reg_log. Scenarios: reg_deny (403 for manifests),
-# reg_auth (a bearer token from its /token is required), reg_corrupt (a layer's bytes differ
-# from its digest).
+# reg_auth (a bearer token from its /token is required), reg_realm (the token realm it
+# names instead of its own /token), reg_redirect (blobs answer 307 to /redirected/<digest>),
+# reg_corrupt (a layer's bytes differ from its digest).
 cat >"$work/registry.py" <<'PY'
 import gzip, hashlib, http.server, io, json, os, sys, tarfile
 
@@ -1567,8 +1568,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         on = lambda name: os.path.exists(os.path.join(fake, name))
         if self.path.startswith("/token"):
             return self.send(200, b'{"token": "regtoken"}', "application/json")
+        if self.path.startswith("/redirected/"):
+            return self.send(200, blobs[self.path.rsplit("/", 1)[1]])
         if on("reg_auth") and auth != "Bearer regtoken":
-            realm = 'Bearer realm="http://127.0.0.1:%d/token",service="fake",scope="repository:egress-proxy:pull"' % self.server.server_port
+            url = "http://127.0.0.1:%d/token" % self.server.server_port
+            if on("reg_realm"):
+                with open(os.path.join(fake, "reg_realm")) as f:
+                    url = f.read().strip()
+            realm = 'Bearer realm="%s",service="fake",scope="repository:egress-proxy:pull"' % url
             return self.send(401, b"{}", "application/json", [("WWW-Authenticate", realm)])
         kind, _, d = self.path.rpartition("/")
         if kind.endswith("/manifests") and d in manifests:
@@ -1576,6 +1583,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(403, b"{}", "application/json")
             return self.send(200, manifests[d], json.loads(manifests[d])["mediaType"])
         if kind.endswith("/blobs") and d in blobs:
+            if on("reg_redirect"):
+                return self.send(307, b"", headers=[("Location", "/redirected/" + d)])
             data = blobs[d]
             if on("reg_corrupt") and json.loads(manifests[entries[0]["digest"]])["layers"][0]["digest"] == d:
                 data = data[:-1] + b"x"
@@ -1609,13 +1618,14 @@ handoff() { cat "$FAKE/handoff" 2>/dev/null || true; }
 rreset() {
   reset "$1"
   rm -rf "${FAKE:?}/loaded"
-  rm -f "${FAKE:?}"/{load_id,load_fails,platform,reg_log,reg_deny,reg_auth,reg_corrupt,hosts}
+  rm -f "${FAKE:?}"/{load_id,load_fails,platform,reg_log,reg_deny,reg_auth,reg_realm,reg_redirect,reg_corrupt,hosts}
   touch "$FAKE/image_missing"
 }
 # rbootstrap <args...>: bootstrap of the registry's image (repo $REG).
 rbootstrap() { EGRESS_IMAGE_REPO=$REG DOCKER_CONTEXT=hostile bootstrap 1.0.0 "$RD" "$@"; }
-# not_loaded: nothing reached the target's image store, and the installer did not run.
-not_loaded() { [[ ! -d $FAKE/loaded && ! -f $FAKE/handoff ]]; }
+# not_loaded: nothing reached the target's image store, the installer did not run, and the
+# install directory was not created.
+not_loaded() { [[ ! -d $FAKE/loaded && ! -f $FAKE/handoff && ! -e $dir ]]; }
 
 rreset remote_fetch_load
 rbootstrap --docker-host "$TGT"
@@ -1661,6 +1671,66 @@ grep -q "/manifests/$RD Bearer regtoken" "$FAKE/reg_log" || bad+="no bearer requ
 grep '^/token' "$FAKE/reg_log" | grep -q Basic && bad+="credentials sent to a non-ghcr realm; "
 [[ ! -f $FAKE/gh_calls ]] || bad+="gh ran for $REG; "
 check remote_auth_token "$bad" "$(st is "$bad" "")"
+
+# The ghcr.io path: egress-install's own fetch program, run with urlopen pointed at the fake
+# registry for https://ghcr.io and https://elsewhere.example (a patched stdlib call; the
+# program is unchanged). With a gh login, only the https ghcr.io realm gets the Basic
+# credential, a blob redirect carries no credential, and the token is in no argv, file or
+# output; with none, the token request is anonymous.
+cat >"$work/ghcr-fetch.py" <<'PY'
+import sys, urllib.request
+
+port, entry = sys.argv[1:3]
+src = open(entry).read().split("IFS= read -r -d '' FETCH <<'PY' || true\n", 1)[1].split("\nPY\n", 1)[0]
+real = urllib.request.urlopen
+
+
+def urlopen(req, *args, **kwargs):
+    for origin in ("https://ghcr.io/", "https://elsewhere.example/"):
+        if req.full_url.startswith(origin):
+            req.full_url = "http://127.0.0.1:%s/%s" % (port, req.full_url[len(origin):])
+    return real(req, *args, **kwargs)
+
+
+urllib.request.urlopen = urlopen
+sys.argv = ["fetch"] + sys.argv[3:]
+exec(compile(src, "egress-install FETCH", "exec"), {"__name__": "__main__"})
+PY
+# gfetch <case> <realm> [logged_out]: the fetch of ghcr.io/windroc/egress-proxy@$RD into
+# $work/gf, with a gh that logs its arguments (logged_out: no gh login); exit code in $rc.
+gfetch() {
+  rreset "$1"
+  touch "$FAKE/reg_auth" "$FAKE/reg_redirect"
+  echo "$2" >"$FAKE/reg_realm"
+  if [[ ${3:-} == logged_out ]]; then touch "$FAKE/gh_logged_out"; fi
+  rm -rf "${work:?}/gf"
+  mkdir -p "$work/gf"
+  rc=0
+  PATH="$work/bin:$PATH" python3 -I "$work/ghcr-fetch.py" "$(cat "$work/reg_port")" "$repo/egress-install" \
+    ghcr.io/windroc/egress-proxy "$RD" linux/amd64 "ghcr.io/windroc/egress-proxy:sha256-${RD#sha256:}" \
+    "$work/gf/image.tar" >"$work/out" 2>"$work/err" || rc=$?
+}
+basic=$(printf 'octo:%s' "$FAKE_TOKEN" | base64 | tr -d '\n')
+gfetch remote_fetch_ghcr_token https://ghcr.io/token
+bad=""
+is "$rc $(out)" "0 $(cat "$FAKE/reg_cfg_amd64") $(grep -o 'sha256:[0-9a-f]*' "$work/out" | tail -n 1)" || bad+="exit $rc: $(out) $(err); "
+grep -qxF "/token?service=fake&scope=repository%3Aegress-proxy%3Apull Basic $basic" "$FAKE/reg_log" || bad+="no Basic token request: $(grep '^/token' "$FAKE/reg_log" || true); "
+grep -q "^/v2/windroc/egress-proxy/manifests/$RD Bearer regtoken$" "$FAKE/reg_log" || bad+="no bearer manifest request; "
+grep -q '^/redirected/' "$FAKE/reg_log" || bad+="no blob redirect; "
+grep '^/redirected/' "$FAKE/reg_log" | grep -v ' -$' && bad+="a credential followed a redirect; "
+grep -F "$FAKE_TOKEN" "$FAKE/gh_calls" && bad+="the token in gh's argv; "
+grep -rlF "$FAKE_TOKEN" "$work/gf" && bad+="the token in a file; "
+grep -F "$FAKE_TOKEN" "$work/out" "$work/err" && bad+="the token in the output; "
+check remote_fetch_ghcr_token "$bad" "$(st is "$bad" "")"
+
+gfetch remote_fetch_other_realm https://elsewhere.example/token
+check remote_fetch_other_realm "exit $rc, $(grep '^/token' "$FAKE/reg_log" || true), gh $(cat "$FAKE/gh_calls" 2>/dev/null || true): $(err)" \
+  "$(st is "$rc $(grep '^/token' "$FAKE/reg_log" | awk '{ print $2 }') $([[ -f $FAKE/gh_calls ]] || echo nogh)" "0 - nogh")"
+
+gfetch remote_fetch_no_gh_login https://ghcr.io/token logged_out
+check remote_fetch_no_gh_login "exit $rc, $(grep '^/token' "$FAKE/reg_log" || true): $(err)" \
+  "$(st is "$rc $(grep '^/token' "$FAKE/reg_log" | awk '{ print $2 }')" "0 -")"
+rm -f "${FAKE:?}/gh_logged_out"
 
 rreset remote_no_access
 touch "$FAKE/reg_deny"
@@ -1713,7 +1783,7 @@ check remote_new_target "exit $rc, hosts $(sort -u "$FAKE/hosts" | xargs): $(err
 rreset remote_old_version
 rm -f "${FAKE:?}/egress/compose.remote.yaml"
 rbootstrap --docker-host "$TGT"
-check remote_old_version "exit $rc: $(err)" "$(st is "$rc $([[ -f $FAKE/handoff ]] || echo none) $(err)" \
+check remote_old_version "exit $rc: $(err)" "$(st is "$rc $([[ -f $FAKE/handoff || -e $dir ]] || echo none) $(err)" \
   "5 none egress-install: egress-proxy 1.0.0 cannot be installed on a remote Docker host (its image has no compose.remote.yaml); install a version that supports it")"
 cp "$repo/compose.remote.yaml" "$FAKE/egress/"
 
