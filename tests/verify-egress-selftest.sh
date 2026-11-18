@@ -486,6 +486,41 @@ out=$(run --tools worker:test)
 expect tools_not_local "$out" 1 "FAIL tools_image worker:test: image worker:test is not local, want a local image"
 [[ ! -f $FAKE/tool_run ]] || fail tools_not_local "the tool container ran"
 
+# A remote install's verify-egress: the recorded target over a hostile environment, no host
+# facts or listener, and no python3.
+scenario remote_target
+rdir=$work/remote-install
+mkdir -p "$rdir/state" "$work/nopy"
+printf '# generated\nssh://admin@pc.example:2222\n' >"$rdir/state/docker-host"
+ln -sf "$repo/verify-egress" "$rdir/verify-egress"
+cat >"$work/nopy/python3" <<'NOPY'
+#!/usr/bin/env bash
+touch "$FAKE/python_ran"
+exit 127
+NOPY
+chmod +x "$work/nopy/python3"
+rc=0
+out=$(DOCKER_HOST=tcp://hostile:1234 DOCKER_CONTEXT=hostile PATH="$work/nopy:$work/bin:$PATH" "$rdir/verify-egress" workers 2>&1) || rc=$?
+out=$(printf '%s\nexit=%s\n' "$out" "$rc")
+expect remote_target "$out" 0 \
+  "verify-egress: remote target ssh://admin@pc.example:2222: host-side checks (host_listener, host addresses, gateways) skipped" \
+  "ok proxy_deny 10.0.0.1:443 connect=407" \
+  "all $((TOTAL - 1)) checks passed"
+bad=""
+grep -v ' DOCKER_HOST=ssh://admin@pc.example:2222 ' "$FAKE/calls" && bad+="a call to another daemon; "
+grep -q ' plan workers --listener-port 9$' "$FAKE/calls" || bad+="plan: $(grep ' plan ' "$FAKE/calls" || true); "
+[[ ! -f $FAKE/python_ran ]] || bad+="python3 ran; "
+[[ $out != *host_listener\ 127* ]] || bad+="a host listener; "
+if [[ -n $bad ]]; then fail remote_target_calls "$bad"; else ok remote_target_calls; fi
+
+scenario remote_bad_target
+echo 'tcp://pc:2375' >"$rdir/state/docker-host"
+rc=0
+out=$(PATH="$work/bin:$PATH" "$rdir/verify-egress" workers 2>&1) || rc=$?
+out=$(printf '%s\nexit=%s\n' "$out" "$rc")
+expect remote_bad_target "$out" 2 "verify-egress: $rdir/state/docker-host is not ssh://[user@]host[:port]: tcp://pc:2375"
+[[ ! -s $FAKE/calls ]] || fail remote_bad_target_calls "docker was called"
+
 scenario usage
 for args in "" "a b" "--bogus" "Bad_Key" "--tools" "--tools -x" "--tools a b"; do
   # shellcheck disable=SC2086 # word splitting builds each argument list

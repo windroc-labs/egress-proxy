@@ -67,10 +67,19 @@ export REAL_CP REAL_CHMOD REAL_MV
 #                  lines; `image rm` of either removes the line
 #   in_use         image references a container uses: `ps --filter ancestor=` lists one
 #                  (`rm -f`, the container's removal, removes running)
+#   hosts          every call's DOCKER_HOST|DOCKER_CONTEXT
+#   render/        what start.sh copied into its render container (a remote install);
+#                  `start -a` of it prints the override, or fails when its config holds BAD
+#   volume/        the volume egress-config, as start.sh's helper container filled it
+#   platform       the daemon's Server.Os/Server.Arch (default linux/amd64)
+#   loaded/        the archive the last `docker load -i` read; load_id the image ID it
+#                  gave its tag (its config digest), which `image inspect {{.Id}}` reports;
+#                  load_fails makes the load fail
 cat >"$work/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
 set -euo pipefail
 echo "EGRESS_IMAGE=${EGRESS_IMAGE:-} $*" >>"$FAKE/calls"
+echo "${DOCKER_HOST:-}|${DOCKER_CONTEXT:-}" >>"$FAKE/hosts"
 block() {
   : >"$FAKE/blocked"
   read -r _ <"$FAKE/hold" || true
@@ -78,8 +87,13 @@ block() {
 }
 # or <name> <default>: the scenario file $FAKE/<name>, else <default>.
 or() { cat "$FAKE/$1" 2>/dev/null || echo "$2"; }
-# of <name> <image>: the scenario file name for <image>: <name>.<digest> if it exists.
-of() { if [[ -e $FAKE/$1.${2##*@} ]]; then echo "$1.${2##*@}"; else echo "$1"; fi; }
+# of <name> <image>: the scenario file name for <image>: <name>.<digest> if it exists. A
+# remote install names the image <repo>:sha256-<hex>.
+of() {
+  local d=${2##*@}
+  [[ $2 != *:sha256-* ]] || d=sha256:${2##*:sha256-}
+  if [[ -e $FAKE/$1.$d ]]; then echo "$1.$d"; else echo "$1"; fi
+}
 case $1 in
   images)
     case ${!#} in
@@ -87,7 +101,7 @@ case $1 in
       *) or images "" ;;
     esac
     ;;
-  rm) rm -f "$FAKE/running" ;;
+  rm) [[ " $* " == *" rcid "* || " $* " == *" hcid "* ]] || rm -f "$FAKE/running" ;;
   ps)
     if grep -qxF "${!##ancestor=}" "$FAKE/in_use" 2>/dev/null; then echo cid; fi
     ;;
@@ -104,7 +118,7 @@ case $1 in
       done
     elif [[ $3 == --format ]]; then
       case $4 in
-        '{{.Id}}') echo "sha256:id-$5" ;;
+        '{{.Id}}') if [[ -f $FAKE/load_id ]]; then cat "$FAKE/load_id"; else echo "sha256:id-$5"; fi ;;
         # The running proxy's image (`inspect`'s ID below).
         *RepoDigests*) printf '%s|%s\n' "$(or run_label "<no value>")" "$(or run_repodigests "")" ;;
         *egress-proxy.contract*) printf '%s|%s\n' "$(or "$(of label "$5")" "<no value>")" "$(or contract 1)" ;;
@@ -149,13 +163,51 @@ case $1 in
     rm -f "$FAKE/image_missing"
     echo "$3"
     ;;
-  version) [[ ! -f $FAKE/daemon_down ]] || exit 1 ;;
-  create)
-    echo "$4" >"$FAKE/created"
-    echo cid1
+  version)
+    [[ ! -f $FAKE/daemon_down ]] || exit 1
+    [[ $* != *Server.Os* ]] || or platform linux/amd64
     ;;
+  load)
+    if [[ -f $FAKE/load_fails ]]; then
+      echo "Error response from daemon: no space left on device" >&2
+      exit 1
+    fi
+    rm -rf "${FAKE:?}/loaded"
+    mkdir -p "$FAKE/loaded"
+    tar -xf "${!#}" -C "$FAKE/loaded"
+    sed -E 's/.*"Config": *"blobs\/sha256\/([0-9a-f]{64})".*/sha256:\1/' "$FAKE/loaded/manifest.json" >"$FAKE/load_id"
+    rm -f "$FAKE/image_missing"
+    ;;
+  create)
+    if [[ ${!#} == compose ]]; then
+      echo rcid
+    elif [[ " $* " == *" -v egress-config:/etc/egress "* ]]; then
+      echo hcid
+    else
+      echo "$4" >"$FAKE/created"
+      echo cid1
+    fi
+    ;;
+  start)
+    if grep -q BAD "$FAKE/render/config.local.yaml" 2>/dev/null; then
+      echo "proxy: config /etc/egress/config.local.yaml: network workers: BAD" >&2
+      exit 2
+    fi
+    printf 'services:\n  proxy:\n    networks:\n      workers: {}\nnetworks:\n  workers:\n    name: "egress-workers"\n    external: true\n'
+    ;;
+  volume) ;;
   logs) or logs "" ;;
   cp)
+    case $3 in
+      rcid:* | hcid:*)
+        d=$FAKE/volume
+        [[ $3 != rcid:* ]] || d=$FAKE/render
+        rm -rf "${d:?}"
+        mkdir -p "$d"
+        "$REAL_CP" -R "${2%/.}/." "$d"
+        exit 0
+        ;;
+    esac
     if [[ -f $FAKE/cp_fails ]]; then
       echo "Error response from daemon: write $3/install.sh: no space left on device" >&2
       exit 1
@@ -219,7 +271,7 @@ chmod +x "$work/bin/docker" "$work/bin/chmod" "$work/bin/mv" "$work/fast/sleep"
 # The image's /egress, as egress-install copies it out.
 files=$work/files
 mkdir -p "$files"
-for f in start.sh verify-egress compose.yaml config.example.yaml config.default.yaml install.sh egress-install; do
+for f in start.sh verify-egress compose.yaml compose.remote.yaml config.example.yaml config.default.yaml install.sh egress-install; do
   if [[ -f $repo/$f ]]; then
     "$REAL_CP" -p "$repo/$f" "$files/$f"
   else
@@ -274,7 +326,8 @@ fresh() {
   rm -f "$FAKE/running" "$FAKE/health" "$FAKE/up_fails" "$FAKE/calls" "$FAKE/contract" "$FAKE"/run_* \
     "$FAKE"/label.* "$FAKE"/health.* "$FAKE"/up_fails.* "$FAKE/logs" "$FAKE/images" "$FAKE/rm_fails" \
     "$FAKE"/legacy.* "$FAKE/in_use" "$FAKE/old_start" "$FAKE/old_start_rc" "$FAKE/old_start_image"
-  rm -rf "$FAKE"/egress.*
+  rm -rf "${FAKE:?}"/egress.* "${FAKE:?}/render" "${FAKE:?}/volume"
+  rm -f "${FAKE:?}/hosts"
 }
 out() { cat "$work/out"; }
 tree() { (cd "$dir" && find . -exec ls -ld {} + | sort) 2>/dev/null || true; }
@@ -1192,6 +1245,134 @@ is "$rc $(tail -n 1 "$work/out")" "11 install.sh: rolled back to egress-proxy 1.
 checkout_kept || bad+="the rollback install removed the checkout; "
 check migrate_resumed_rollback "$bad: $(out)" "$(st is "$bad" "")"
 
+# -------- A remote install: install.sh and start.sh (README.md › Remote Docker host) --------
+TGT=ssh://admin@pc.example:2222
+# ref <digest char>: the image's name on the target.
+ref() { echo "$REPO:sha256-$(digest "$1" | sed 's/^sha256://')"; }
+# hosts_ok: every docker call since $FAKE/hosts was emptied went to the target, no context.
+hosts_ok() { is "$(sort -u "$FAKE/hosts")" "$TGT|"; }
+# rstart [env...]: the installed start.sh, output in $work/out, exit code in $rc.
+rstart() {
+  rc=0
+  env "$@" PATH="$work/fast:$work/bin:$PATH" "$dir/start.sh" >"$work/out" 2>&1 || rc=$?
+}
+
+fresh remote_install
+DOCKER_CONTEXT=hostile install 1.0.0 a --docker-host "$TGT"
+bad=""
+is "$rc" 0 || bad+="exit $rc; "
+is "$(val "$dir/state/docker-host")" "$TGT" || bad+="state/docker-host: $(cat "$dir/state/docker-host" 2>/dev/null); "
+hosts_ok || bad+="hosts: $(sort -u "$FAKE/hosts" | xargs); "
+is "$(cat "$FAKE/running") $(val "$dir/state/runtime/image") $(record current_image)" "$(ref a) $(ref a) $(image a)" ||
+  bad+="running $(cat "$FAKE/running"), runtime image $(val "$dir/state/runtime/image"), record $(record current_image); "
+grep -E ' pull |--pull always| (build|buildx)( |$)|-v /|:/etc/egress:ro' "$FAKE/calls" && bad+="a pull, build or bind mount; "
+grep -qF ' volume create egress-config' "$FAKE/calls" || bad+="no volume create; "
+grep ' compose ' "$FAKE/calls" | grep -qvF "$dir/state/runtime/compose.remote.yaml" && bad+="compose without compose.remote.yaml; "
+cmp -s "$FAKE/volume/config.local.yaml" "$dir/config.local.yaml" || bad+="the volume does not hold the config; "
+like "$(out)" "egress-proxy 1.0.0 ($(digest a)) installed in $dir; start command: $dir/start.sh" || bad+="no installed message; "
+check remote_install "$bad: $(out)" "$(st is "$bad" "")"
+
+bad=""
+grep -qF "| Logs (config errors name the network and key) | \`docker --host $TGT logs egress-proxy\` |" "$dir/README.md" || bad+="logs row; "
+grep -qF "| Health | \`docker --host $TGT inspect" "$dir/README.md" || bad+="health row; "
+grep -qF "image \`$(image a)\`, on the Docker host $TGT" "$dir/README.md" || bad+="installed line; "
+check remote_readme "$bad: $(sed -n '1,30p' "$dir/README.md")" "$(st is "$bad" "")"
+
+rm -f "${FAKE:?}/hosts"
+rstart DOCKER_HOST=tcp://hostile:1234 DOCKER_CONTEXT=hostile
+check remote_start_env "exit $rc, hosts $(sort -u "$FAKE/hosts" | xargs): $(out)" "$(st is "$rc $(hosts_ok && echo ok)" "0 ok")"
+
+before=$(sha "$FAKE/volume/config.local.yaml")
+"$REAL_CP" "$dir/config.local.yaml" "$work/config.saved"
+echo "# BAD" >>"$dir/config.local.yaml"
+: >"$FAKE/calls"
+rstart
+bad=""
+is "$rc" 2 || bad+="exit $rc; "
+like "$(out)" "config /etc/egress/config.local.yaml: network workers: BAD" || bad+="no config error; "
+is "$(sha "$FAKE/volume/config.local.yaml")" "$before" || bad+="the volume changed; "
+grep -E ' volume | up ' "$FAKE/calls" && bad+="it went on; "
+is "$(find "$dir/state" -maxdepth 1 -name '.config.*')" "" || bad+="a staged config is left; "
+check remote_config_error_unchanged "$bad: $(out)" "$(st is "$bad" "")"
+
+mv "$dir/config.local.yaml" "$work/config.bad"
+: >"$FAKE/calls"
+rstart
+check remote_config_missing "exit $rc, calls $(cat "$FAKE/calls"): $(out)" \
+  "$(st is "$rc $(wc -l <"$FAKE/calls" | tr -d ' ')" "2 0")"
+"$REAL_CP" "$work/config.saved" "$dir/config.local.yaml"
+
+"$REAL_CP" "$dir/state/docker-host" "$work/target.saved"
+echo 'ssh://pc;id' >"$dir/state/docker-host"
+: >"$FAKE/calls"
+rstart
+check remote_bad_target "exit $rc, calls $(cat "$FAKE/calls"): $(out)" \
+  "$(st like "$rc $(wc -l <"$FAKE/calls" | tr -d ' ') $(out)" "2 0 start.sh: $dir/state/docker-host is not ssh://")"
+"$REAL_CP" "$work/target.saved" "$dir/state/docker-host"
+
+before=$(tree)
+install 1.1.0 b
+check remote_dir_needs_target "exit $rc: $(out)" \
+  "$(st like "$rc $(out)" "2 install.sh: $dir is a remote install (state/docker-host)")"
+is "$(tree)" "$before" || fail remote_dir_needs_target "$dir changed"
+
+# The same downgrade rule: a published newer version is kept, judged by the image ID of the
+# recorded digest's tag (a loaded image has no RepoDigests).
+fresh remote_keep_newer
+install 1.2.0 c --docker-host "$TGT"
+echo 1.2.0 >"$FAKE/run_label"
+: >"$FAKE/calls"
+install 1.1.0 b --docker-host "$TGT"
+check remote_keep_newer "exit $rc, running $(cat "$FAKE/running"): $(out)" "$(st is "$rc $(cat "$FAKE/running") $(out)" \
+  "0 $(ref c) install.sh: kept the running egress-proxy 1.2.0 ($(digest c)), newer than 1.1.0; nothing was changed")"
+echo "$REPO:9.9.9" >"$FAKE/running"
+install 1.1.0 b --docker-host "$TGT"
+check remote_replaces_unpublished "exit $rc, running $(cat "$FAKE/running"): $(out)" \
+  "$(st is "$rc $(cat "$FAKE/running")" "0 $(ref b)")"
+
+fresh remote_cleanup
+install 1.0.0 a --docker-host "$TGT"
+install 1.1.0 b --docker-host "$TGT"
+printf 'sha256:id-%s\n' "$(ref a)" "$(ref b)" "$REPO:9.9.9" "$(ref c)" >"$FAKE/images"
+install 1.2.0 c --docker-host "$TGT"
+check remote_cleanup "exit $rc, left $(images_left): $(out)" "$(st is "$rc $(images_left)" "0 $(ref b) $(ref c)")"
+
+# The same rollback rule: the previous version's own egress-install, from its runtime set,
+# reinstalls it on the recorded target.
+fresh remote_rollback
+install 1.0.0 a --docker-host "$TGT"
+install 1.1.0 b --docker-host "$TGT"
+old_image b 1.1.0
+echo starting >"$FAKE/health.$(digest c)"
+rm -f "${FAKE:?}/hosts"
+install 1.2.0 c --docker-host "$TGT"
+bad=""
+is "$rc" 11 || bad+="exit $rc; "
+is "$(tail -n 1 "$work/out")" "install.sh: rolled back to egress-proxy 1.1.0 ($(digest b)), which is healthy; egress-proxy 1.2.0 was not installed; see docker logs egress-proxy" ||
+  bad+="last line: $(tail -n 1 "$work/out"); "
+is "$(cat "$FAKE/running") $(record current_version) $(val "$dir/state/docker-host")" "$(ref b) 1.1.0 $TGT" ||
+  bad+="running $(cat "$FAKE/running"): $(cat "$dir/state/installed"); "
+hosts_ok || bad+="hosts: $(sort -u "$FAKE/hosts" | xargs); "
+check remote_rollback "$bad: $(out)" "$(st is "$bad" "")"
+rm -f "${FAKE:?}/health.$(digest c)"
+
+# The caller's docker: whatever `docker` is first on PATH, here a wrapper.
+fresh remote_docker_wrapper
+mkdir -p "$work/wrap"
+cat >"$work/wrap/docker" <<WRAP
+#!/usr/bin/env bash
+echo "\$*" >>"\$FAKE/wrapped"
+exec "$work/bin/docker" "\$@"
+WRAP
+chmod +x "$work/wrap/docker"
+rm -f "$FAKE/wrapped"
+echo 1.0.0 >"$FAKE/label"
+rc=0
+PATH="$work/wrap:$work/fast:$work/bin:$PATH" bash "$files/install.sh" --interface 1 --version 1.0.0 \
+  --digest "$(digest a)" --dir "$dir" --image "$(image a)" --files "$files" --docker-host "$TGT" >"$work/out" 2>&1 || rc=$?
+check remote_docker_wrapper "exit $rc, $(wc -l <"$FAKE/calls") calls, $(wc -l <"$FAKE/wrapped" 2>/dev/null) wrapped: $(out)" \
+  "$(st is "$rc $(wc -l <"$FAKE/calls")" "0 $(wc -l <"$FAKE/wrapped" 2>/dev/null)")"
+
 # -------- egress-install --------
 # The image's installer, for these cases: records its arguments, exits install_rc.
 mkdir -p "$FAKE/egress" "$work/tmpdir"
@@ -1220,7 +1401,7 @@ no_temp() { is "$(find "$work/tmpdir" -mindepth 1 -print)" ""; }
 
 reset bs_usage
 bootstrap 1.0 "$D"
-check bs_usage "exit $rc: $(err)" "$(st is "$rc $(err)" "2 usage: egress-install --version X.Y.Z --digest sha256:<64 hex> [--dir <path>]")"
+check bs_usage "exit $rc: $(err)" "$(st is "$rc $(err)" "2 usage: egress-install --version X.Y.Z --digest sha256:<64 hex> [--dir <path>] [--docker-host ssh://<host>]")"
 bootstrap 1.0.0 sha256:abc
 is "$rc" 2 || fail bs_usage "a short digest: exit $rc"
 
@@ -1322,5 +1503,294 @@ reset no_installer
 rm "$FAKE/egress/install.sh"
 bootstrap 1.0.0 "$D"
 check no_installer "exit $rc: $(err)" "$(st is "$rc $(err)" "5 egress-install: $IMG has no installer (/egress/install.sh)")"
+
+# -------- egress-install --docker-host (README.md › Remote Docker host) --------
+# A fake registry on 127.0.0.1: one multi-arch image (linux/amd64 and linux/arm64, one tiny
+# layer each), its index digest in reg_digest, each config digest in reg_cfg_<arch>. It logs
+# "<path> <Authorization>" per request in reg_log. Scenarios: reg_deny (403 for manifests),
+# reg_auth (a bearer token from its /token is required), reg_realm (the token realm it
+# names instead of its own /token), reg_redirect (blobs answer 307 to /redirected/<digest>),
+# reg_corrupt (a layer's bytes differ from its digest).
+cat >"$work/registry.py" <<'PY'
+import gzip, hashlib, http.server, io, json, os, sys, tarfile
+
+fake, port_file = sys.argv[1:3]
+blobs, manifests = {}, {}
+
+
+def put(store, data):
+    d = "sha256:" + hashlib.sha256(data).hexdigest()
+    store[d] = data
+    return d
+
+
+entries = []
+for arch in ("amd64", "arm64"):
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w") as tar:
+        body = ("hello " + arch).encode()
+        info = tarfile.TarInfo("hello")
+        info.size = len(body)
+        tar.addfile(info, io.BytesIO(body))
+    layer = gzip.compress(raw.getvalue(), mtime=0)
+    config = json.dumps({"architecture": arch, "os": "linux", "config": {"Labels": {}},
+                         "rootfs": {"type": "layers", "diff_ids": ["sha256:" + hashlib.sha256(raw.getvalue()).hexdigest()]}}).encode()
+    cd, ld = put(blobs, config), put(blobs, layer)
+    with open(os.path.join(fake, "reg_cfg_" + arch), "w") as f:
+        f.write(cd)
+    man = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                      "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": cd, "size": len(config)},
+                      "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": ld, "size": len(layer)}]}).encode()
+    entries.append({"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": put(manifests, man),
+                    "size": len(man), "platform": {"architecture": arch, "os": "linux"}})
+index = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": entries}).encode()
+with open(os.path.join(fake, "reg_digest"), "w") as f:
+    f.write(put(manifests, index))
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def send(self, code, data=b"", ctype="application/octet-stream", headers=()):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        auth = self.headers.get("Authorization", "-")
+        with open(os.path.join(fake, "reg_log"), "a") as f:
+            f.write("%s %s\n" % (self.path, auth))
+        on = lambda name: os.path.exists(os.path.join(fake, name))
+        if self.path.startswith("/token"):
+            return self.send(200, b'{"token": "regtoken"}', "application/json")
+        if self.path.startswith("/redirected/"):
+            return self.send(200, blobs[self.path.rsplit("/", 1)[1]])
+        if on("reg_auth") and auth != "Bearer regtoken":
+            url = "http://127.0.0.1:%d/token" % self.server.server_port
+            if on("reg_realm"):
+                with open(os.path.join(fake, "reg_realm")) as f:
+                    url = f.read().strip()
+            realm = 'Bearer realm="%s",service="fake",scope="repository:egress-proxy:pull"' % url
+            return self.send(401, b"{}", "application/json", [("WWW-Authenticate", realm)])
+        kind, _, d = self.path.rpartition("/")
+        if kind.endswith("/manifests") and d in manifests:
+            if on("reg_deny"):
+                return self.send(403, b"{}", "application/json")
+            return self.send(200, manifests[d], json.loads(manifests[d])["mediaType"])
+        if kind.endswith("/blobs") and d in blobs:
+            if on("reg_redirect"):
+                return self.send(307, b"", headers=[("Location", "/redirected/" + d)])
+            data = blobs[d]
+            if on("reg_corrupt") and json.loads(manifests[entries[0]["digest"]])["layers"][0]["digest"] == d:
+                data = data[:-1] + b"x"
+            return self.send(200, data)
+        self.send(404, b"{}", "application/json")
+
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+with open(port_file + ".tmp", "w") as f:
+    f.write(str(server.server_port))
+os.rename(port_file + ".tmp", port_file)
+server.serve_forever()
+PY
+python3 -I "$work/registry.py" "$FAKE" "$work/reg_port" &
+reg_pid=$!
+trap 'kill "$reg_pid" 2>/dev/null || true; rm -rf "${work:?}"' EXIT
+for _ in $(seq 1 50); do [[ -f $work/reg_port ]] && break; sleep 0.1; done
+REG=127.0.0.1:$(cat "$work/reg_port")/egress-proxy
+RD=$(cat "$FAKE/reg_digest")
+RREF=$REG:sha256-${RD#sha256:}
+# The image's /egress again (no_installer above removed its installer), with the overlay a
+# remote install needs.
+cat >"$FAKE/egress/install.sh" <<'FAKE'
+#!/usr/bin/env bash
+echo "$*" >"$FAKE/handoff"
+exit "$(cat "$FAKE/install_rc" 2>/dev/null || echo 0)"
+FAKE
+cp "$repo/compose.remote.yaml" "$FAKE/egress/"
+handoff() { cat "$FAKE/handoff" 2>/dev/null || true; }
+# rreset <case>: reset, no image on the target, and the registry's default scenario.
+rreset() {
+  reset "$1"
+  rm -rf "${FAKE:?}/loaded"
+  rm -f "${FAKE:?}"/{load_id,load_fails,platform,reg_log,reg_deny,reg_auth,reg_realm,reg_redirect,reg_corrupt,hosts}
+  touch "$FAKE/image_missing"
+}
+# rbootstrap <args...>: bootstrap of the registry's image (repo $REG).
+rbootstrap() { EGRESS_IMAGE_REPO=$REG DOCKER_CONTEXT=hostile bootstrap 1.0.0 "$RD" "$@"; }
+# not_loaded: nothing reached the target's image store, the installer did not run, and the
+# install directory was not created.
+not_loaded() { [[ ! -d $FAKE/loaded && ! -f $FAKE/handoff && ! -e $dir ]]; }
+
+rreset remote_fetch_load
+rbootstrap --docker-host "$TGT"
+bad=""
+is "$rc" 0 || bad+="exit $rc: $(err); "
+like "$(handoff)" "--image $REG@$RD --files $work/tmpdir/" || bad+="handoff: $(handoff); "
+like "$(handoff)" " --docker-host $TGT" || bad+="no --docker-host in the handoff; "
+hosts_ok || bad+="hosts: $(sort -u "$FAKE/hosts" | xargs); "
+grep -qF " load -q -i $work/tmpdir/" "$FAKE/calls" || bad+="no load: $(grep load "$FAKE/calls" || true); "
+grep -qF " create --pull never $RREF" "$FAKE/calls" || bad+="the files not from $RREF; "
+grep -E ' pull |--pull always' "$FAKE/calls" && bad+="the target pulled; "
+[[ ! -f $FAKE/gh_calls ]] || bad+="gh ran for $REG: $(cat "$FAKE/gh_calls"); "
+got=$(cd "$FAKE/loaded" 2>/dev/null && find . -type f | sed 's|^\./||' | sed 's|blobs/sha256/[0-9a-f]*$|blob|' | sort | uniq -c | xargs)
+is "$got" "3 blob 1 index.json 1 manifest.json 1 oci-layout" || bad+="archive: $got; "
+like "$(cat "$FAKE/loaded/manifest.json" 2>/dev/null)" "\"RepoTags\": [\"$RREF\"]" || bad+="manifest.json: $(cat "$FAKE/loaded/manifest.json" 2>/dev/null); "
+like "$(cat "$FAKE/loaded/index.json" 2>/dev/null)" "\"io.containerd.image.name\": \"$RREF\"" || bad+="index.json names; "
+is "$(cat "$FAKE/load_id" 2>/dev/null)" "$(cat "$FAKE/reg_cfg_amd64")" || bad+="not the amd64 config; "
+no_temp || bad+="temp files left"
+check remote_fetch_load "$bad" "$(st is "$bad" "")"
+
+rreset remote_image_present
+rm -f "${FAKE:?}/image_missing"
+rbootstrap --docker-host "$TGT"
+check remote_image_present "exit $rc, registry $(cat "$FAKE/reg_log" 2>/dev/null): $(err)" \
+  "$(st is "$rc $(grep -c ' load ' "$FAKE/calls" || true) $(cat "$FAKE/reg_log" 2>/dev/null)" "0 0 ")"
+
+rreset remote_platform
+echo linux/arm64 >"$FAKE/platform"
+rbootstrap --docker-host "$TGT"
+check remote_platform "exit $rc: $(err)" "$(st is "$rc $(cat "$FAKE/load_id" 2>/dev/null)" "0 $(cat "$FAKE/reg_cfg_arm64")")"
+rreset remote_platform_missing
+echo linux/s390x >"$FAKE/platform"
+rbootstrap --docker-host "$TGT"
+check remote_platform_missing "exit $rc: $(err)" \
+  "$(st like "$rc $(not_loaded && echo none) $(err)" "4 none egress-install: cannot fetch $REG@$RD for linux/s390x from registry ${REG%%/*} (no linux/s390x image in")"
+
+rreset remote_auth_token
+touch "$FAKE/reg_auth"
+rbootstrap --docker-host "$TGT"
+bad=""
+is "$rc" 0 || bad+="exit $rc: $(err); "
+grep -q "/manifests/$RD Bearer regtoken" "$FAKE/reg_log" || bad+="no bearer request: $(cat "$FAKE/reg_log"); "
+grep '^/token' "$FAKE/reg_log" | grep -q Basic && bad+="credentials sent to a non-ghcr realm; "
+[[ ! -f $FAKE/gh_calls ]] || bad+="gh ran for $REG; "
+check remote_auth_token "$bad" "$(st is "$bad" "")"
+
+# The ghcr.io path: egress-install's own fetch program, run with urlopen pointed at the fake
+# registry for https://ghcr.io and https://elsewhere.example (a patched stdlib call; the
+# program is unchanged). With a gh login, only the https ghcr.io realm gets the Basic
+# credential, a blob redirect carries no credential, and the token is in no argv, file or
+# output; with none, the token request is anonymous.
+cat >"$work/ghcr-fetch.py" <<'PY'
+import sys, urllib.request
+
+port, entry = sys.argv[1:3]
+src = open(entry).read().split("IFS= read -r -d '' FETCH <<'PY' || true\n", 1)[1].split("\nPY\n", 1)[0]
+real = urllib.request.urlopen
+
+
+def urlopen(req, *args, **kwargs):
+    for origin in ("https://ghcr.io/", "https://elsewhere.example/"):
+        if req.full_url.startswith(origin):
+            req.full_url = "http://127.0.0.1:%s/%s" % (port, req.full_url[len(origin):])
+    return real(req, *args, **kwargs)
+
+
+urllib.request.urlopen = urlopen
+sys.argv = ["fetch"] + sys.argv[3:]
+exec(compile(src, "egress-install FETCH", "exec"), {"__name__": "__main__"})
+PY
+# gfetch <case> <realm> [logged_out]: the fetch of ghcr.io/windroc/egress-proxy@$RD into
+# $work/gf, with a gh that logs its arguments (logged_out: no gh login); exit code in $rc.
+gfetch() {
+  rreset "$1"
+  touch "$FAKE/reg_auth" "$FAKE/reg_redirect"
+  echo "$2" >"$FAKE/reg_realm"
+  if [[ ${3:-} == logged_out ]]; then touch "$FAKE/gh_logged_out"; fi
+  rm -rf "${work:?}/gf"
+  mkdir -p "$work/gf"
+  rc=0
+  PATH="$work/bin:$PATH" python3 -I "$work/ghcr-fetch.py" "$(cat "$work/reg_port")" "$repo/egress-install" \
+    ghcr.io/windroc/egress-proxy "$RD" linux/amd64 "ghcr.io/windroc/egress-proxy:sha256-${RD#sha256:}" \
+    "$work/gf/image.tar" >"$work/out" 2>"$work/err" || rc=$?
+}
+basic=$(printf 'octo:%s' "$FAKE_TOKEN" | base64 | tr -d '\n')
+gfetch remote_fetch_ghcr_token https://ghcr.io/token
+bad=""
+is "$rc $(out)" "0 $(cat "$FAKE/reg_cfg_amd64") $(grep -o 'sha256:[0-9a-f]*' "$work/out" | tail -n 1)" || bad+="exit $rc: $(out) $(err); "
+grep -qxF "/token?service=fake&scope=repository%3Aegress-proxy%3Apull Basic $basic" "$FAKE/reg_log" || bad+="no Basic token request: $(grep '^/token' "$FAKE/reg_log" || true); "
+grep -q "^/v2/windroc/egress-proxy/manifests/$RD Bearer regtoken$" "$FAKE/reg_log" || bad+="no bearer manifest request; "
+grep -q '^/redirected/' "$FAKE/reg_log" || bad+="no blob redirect; "
+grep '^/redirected/' "$FAKE/reg_log" | grep -v ' -$' && bad+="a credential followed a redirect; "
+grep -F "$FAKE_TOKEN" "$FAKE/gh_calls" && bad+="the token in gh's argv; "
+grep -rlF "$FAKE_TOKEN" "$work/gf" && bad+="the token in a file; "
+grep -F "$FAKE_TOKEN" "$work/out" "$work/err" && bad+="the token in the output; "
+check remote_fetch_ghcr_token "$bad" "$(st is "$bad" "")"
+
+gfetch remote_fetch_other_realm https://elsewhere.example/token
+check remote_fetch_other_realm "exit $rc, $(grep '^/token' "$FAKE/reg_log" || true), gh $(cat "$FAKE/gh_calls" 2>/dev/null || true): $(err)" \
+  "$(st is "$rc $(grep '^/token' "$FAKE/reg_log" | awk '{ print $2 }') $([[ -f $FAKE/gh_calls ]] || echo nogh)" "0 - nogh")"
+
+gfetch remote_fetch_no_gh_login https://ghcr.io/token logged_out
+check remote_fetch_no_gh_login "exit $rc, $(grep '^/token' "$FAKE/reg_log" || true): $(err)" \
+  "$(st is "$rc $(grep '^/token' "$FAKE/reg_log" | awk '{ print $2 }')" "0 -")"
+rm -f "${FAKE:?}/gh_logged_out"
+
+rreset remote_no_access
+touch "$FAKE/reg_deny"
+rbootstrap --docker-host "$TGT"
+check remote_no_access "exit $rc: $(err)" \
+  "$(st like "$rc $(not_loaded && echo none) $(err)" "3 none egress-install: no access to $REG: needs a GitHub login")"
+
+rreset remote_fetch_fails
+touch "$FAKE/reg_corrupt"
+rbootstrap --docker-host "$TGT"
+check remote_fetch_fails "exit $rc: $(err)" \
+  "$(st like "$rc $(not_loaded && echo none) $(no_temp && echo clean) $(err)" "4 none clean egress-install: cannot fetch $REG@$RD for linux/amd64 from registry ${REG%%/*} (layer sha256:")"
+grep -q 'does not match its digest' "$work/err" || fail remote_fetch_fails "$(err)"
+
+rreset remote_load_fails
+touch "$FAKE/load_fails"
+rbootstrap --docker-host "$TGT"
+check remote_load_fails "exit $rc: $(err)" \
+  "$(st is "$rc $([[ -f $FAKE/handoff ]] || echo none) $(err)" "1 none egress-install: cannot load $RREF on $TGT: Error response from daemon: no space left on device")"
+
+rreset remote_on_local_dir
+mkdir -p "$dir/state"
+: >"$dir/state/installed"
+rbootstrap --docker-host "$TGT"
+check remote_on_local_dir "exit $rc, calls $(cat "$FAKE/calls" 2>/dev/null): $(err)" "$(st is "$rc $([[ -s $FAKE/calls ]] || echo nocalls) $(err)" \
+  "2 nocalls egress-install: $dir holds a local install; install the remote one into another directory (--dir <path>); nothing was changed")"
+
+for h in tcp://pc:2375 'ssh://pc;id' 'ssh://' 'ssh://pc/x' 'ssh://a b'; do
+  rreset remote_bad_host
+  rbootstrap --docker-host "$h"
+  is "$rc $([[ -s $FAKE/calls ]] || echo nocalls)" "2 nocalls" || fail remote_bad_host "$h: exit $rc: $(err)"
+done
+ok remote_bad_host
+
+rreset remote_recorded_target
+mkdir -p "$dir/state"
+printf '# generated\n%s\n' "$TGT" >"$dir/state/docker-host"
+rbootstrap
+check remote_recorded_target "exit $rc, hosts $(sort -u "$FAKE/hosts" | xargs): $(err)" \
+  "$(st like "$rc $(hosts_ok && echo ok) $(handoff)" "0 ok --interface 1")"
+like "$(handoff)" "--docker-host $TGT" || fail remote_recorded_target "handoff: $(handoff)"
+
+rreset remote_new_target
+mkdir -p "$dir/state"
+printf '# generated\n%s\n' "$TGT" >"$dir/state/docker-host"
+rbootstrap --docker-host ssh://pc-tailnet
+check remote_new_target "exit $rc, hosts $(sort -u "$FAKE/hosts" | xargs): $(err)" \
+  "$(st like "$rc $(sort -u "$FAKE/hosts" | xargs) $(handoff)" "0 ssh://pc-tailnet| --interface 1")"
+
+rreset remote_old_version
+rm -f "${FAKE:?}/egress/compose.remote.yaml"
+rbootstrap --docker-host "$TGT"
+check remote_old_version "exit $rc: $(err)" "$(st is "$rc $([[ -f $FAKE/handoff || -e $dir ]] || echo none) $(err)" \
+  "5 none egress-install: egress-proxy 1.0.0 cannot be installed on a remote Docker host (its image has no compose.remote.yaml); install a version that supports it")"
+cp "$repo/compose.remote.yaml" "$FAKE/egress/"
+
+rreset remote_daemon_down
+touch "$FAKE/daemon_down"
+rbootstrap --docker-host "$TGT"
+check remote_daemon_down "exit $rc: $(err)" \
+  "$(st is "$rc $(err)" "2 egress-install: Docker on $TGT is not running or not reachable (docker version failed); nothing was changed")"
 
 exit "$status"

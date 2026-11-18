@@ -19,8 +19,13 @@
 # comes only from exit codes and the proxy's log (did the proxy allow a request from
 # that container to the row's destination), never from a tool's own output.
 #
+# A remote install's verify-egress (<dir>/verify-egress, its <dir>/state/docker-host naming
+# an ssh:// target; README.md › Remote Docker host) checks that target, whatever DOCKER_HOST
+# or DOCKER_CONTEXT says, without the host's facts: run on the caller, it cannot see the
+# target's interfaces or open a listener there. It then needs no python3.
+#
 # Exit codes: 0 every check passed (--tools: it ran); 1 a check or precondition failed;
-# 2 usage, or no python3 or Docker context.
+# 2 usage, a bad state/docker-host, or no python3 or Docker context.
 #
 # Runs on macOS's bash 3.2 and on Linux.
 set -euo pipefail
@@ -44,6 +49,19 @@ elif (($# == 1)); then
   [[ $key =~ ^[a-z][a-z0-9-]{0,30}$ ]] || usage
 else
   usage
+fi
+
+# This script's directory, symlinks not resolved: <dir>/verify-egress links into <dir>/state.
+here=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
+target=""
+if [[ -f $here/state/docker-host ]]; then
+  target=$(sed '/^#/d' "$here/state/docker-host")
+  if ! [[ $target =~ ^ssh://([A-Za-z0-9._-]+@)?[A-Za-z0-9._-]+(:[0-9]+)?$ ]]; then
+    echo "verify-egress: $here/state/docker-host is not ssh://[user@]host[:port]: $target" >&2
+    exit 2
+  fi
+  export DOCKER_HOST=$target
+  unset DOCKER_CONTEXT
 fi
 
 tmp=$(mktemp -d)
@@ -374,57 +392,63 @@ fi
 
 # -------- Host facts --------
 host_args=()
-# prefix_of_mask <0xffffff00>: the prefix length of a hex netmask.
-prefix_of_mask() {
-  local mask=$(($1)) bits=0
-  while ((mask & 0x80000000)); do
-    bits=$((bits + 1))
-    mask=$(((mask << 1) & 0xffffffff))
-  done
-  echo "$bits"
-}
-add_gateway() {
-  local ip=${1%%%*}
-  if [[ -n $ip ]]; then host_args+=(--default-gateway "$ip"); fi
-}
-if [[ $(uname -s) == Darwin ]]; then
-  add_gateway "$(route -n get default 2>/dev/null | awk '$1 == "gateway:" { print $2; exit }' || true)"
-  add_gateway "$(route -n get -inet6 default 2>/dev/null | awk '$1 == "gateway:" { print $2; exit }' || true)"
-  while read -r kind addr mask; do
-    case $kind in
-      inet) host_args+=(--host-addr "$addr/$(prefix_of_mask "$mask")") ;;
-      inet6) host_args+=(--host-addr "${addr%%%*}/$mask") ;;
-    esac
-  done < <(ifconfig 2>/dev/null | awk '
-    $1 == "inet" { for (i = 3; i < NF; i++) if ($i == "netmask") print "inet", $2, $(i + 1) }
-    $1 == "inet6" { for (i = 3; i < NF; i++) if ($i == "prefixlen") print "inet6", $2, $(i + 1) }')
+if [[ -n $target ]]; then
+  echo "verify-egress: remote target $target: host-side checks (host_listener, host addresses, gateways) skipped" >&2
+  # The plan's host listener checks then probe a port nothing listens on.
+  listen_port=9
 else
-  add_gateway "$(ip -4 route show default 2>/dev/null | awk '$1 == "default" && $2 == "via" { print $3; exit }' || true)"
-  add_gateway "$(ip -6 route show default 2>/dev/null | awk '$1 == "default" && $2 == "via" { print $3; exit }' || true)"
-  while read -r addr; do
-    host_args+=(--host-addr "$addr")
-  done < <(ip -o addr show 2>/dev/null | awk '$3 == "inet" || $3 == "inet6" { print $4 }')
-fi
-
-# -------- The host listener on 127.0.0.1, serving an empty directory --------
-command -v python3 >/dev/null || {
-  echo "verify-egress: python3 is needed for the host listener" >&2
-  exit 2
-}
-listen_port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-mkdir -p "$tmp/www"
-python3 -m http.server --bind 127.0.0.1 --directory "$tmp/www" "$listen_port" >/dev/null 2>&1 &
-listener_pid=$!
-listening=no
-for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-  if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$listen_port/"; then
-    listening=yes
-    break
+  # prefix_of_mask <0xffffff00>: the prefix length of a hex netmask.
+  prefix_of_mask() {
+    local mask=$(($1)) bits=0
+    while ((mask & 0x80000000)); do
+      bits=$((bits + 1))
+      mask=$(((mask << 1) & 0xffffffff))
+    done
+    echo "$bits"
+  }
+  add_gateway() {
+    local ip=${1%%%*}
+    if [[ -n $ip ]]; then host_args+=(--default-gateway "$ip"); fi
+  }
+  if [[ $(uname -s) == Darwin ]]; then
+    add_gateway "$(route -n get default 2>/dev/null | awk '$1 == "gateway:" { print $2; exit }' || true)"
+    add_gateway "$(route -n get -inet6 default 2>/dev/null | awk '$1 == "gateway:" { print $2; exit }' || true)"
+    while read -r kind addr mask; do
+      case $kind in
+        inet) host_args+=(--host-addr "$addr/$(prefix_of_mask "$mask")") ;;
+        inet6) host_args+=(--host-addr "${addr%%%*}/$mask") ;;
+      esac
+    done < <(ifconfig 2>/dev/null | awk '
+      $1 == "inet" { for (i = 3; i < NF; i++) if ($i == "netmask") print "inet", $2, $(i + 1) }
+      $1 == "inet6" { for (i = 3; i < NF; i++) if ($i == "prefixlen") print "inet6", $2, $(i + 1) }')
+  else
+    add_gateway "$(ip -4 route show default 2>/dev/null | awk '$1 == "default" && $2 == "via" { print $3; exit }' || true)"
+    add_gateway "$(ip -6 route show default 2>/dev/null | awk '$1 == "default" && $2 == "via" { print $3; exit }' || true)"
+    while read -r addr; do
+      host_args+=(--host-addr "$addr")
+    done < <(ip -o addr show 2>/dev/null | awk '$3 == "inet" || $3 == "inet6" { print $4 }')
   fi
-  sleep 0.5
-done
-[[ $listening == yes ]] || stop host_listener "127.0.0.1:$listen_port" "no answer" "an answer on the host"
-pass host_listener "127.0.0.1:$listen_port" "answers on the host"
+
+  # -------- The host listener on 127.0.0.1, serving an empty directory --------
+  command -v python3 >/dev/null || {
+    echo "verify-egress: python3 is needed for the host listener" >&2
+    exit 2
+  }
+  listen_port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+  mkdir -p "$tmp/www"
+  python3 -m http.server --bind 127.0.0.1 --directory "$tmp/www" "$listen_port" >/dev/null 2>&1 &
+  listener_pid=$!
+  listening=no
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$listen_port/"; then
+      listening=yes
+      break
+    fi
+    sleep 0.5
+  done
+  [[ $listening == yes ]] || stop host_listener "127.0.0.1:$listen_port" "no answer" "an answer on the host"
+  pass host_listener "127.0.0.1:$listen_port" "answers on the host"
+fi
 
 # -------- The plan --------
 plan_args=(plan "$key" --listener-port "$listen_port")
