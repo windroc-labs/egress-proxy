@@ -279,7 +279,7 @@ for f in start.sh verify-egress compose.yaml compose.remote.yaml config.example.
   fi
 done
 
-REPO=ghcr.io/windroc/egress-proxy
+REPO=ghcr.io/windroc-labs/egress-proxy
 # digest <char>: a digest of 64 times <char>.
 digest() { printf 'sha256:%s' "$(printf "%064d" 0 | tr 0 "$1")"; }
 image() { echo "$REPO@$(digest "$1")"; }
@@ -1453,7 +1453,7 @@ check gh_helper_other_registry "$bad" "$(st is "$bad" "")"
 
 reset no_access
 touch "$FAKE/image_missing" "$FAKE/gh_logged_out"
-echo "Error response from daemon: Head \"https://ghcr.io/v2/windroc/egress-proxy/manifests/$D\": denied" >"$FAKE/pull_err"
+echo "Error response from daemon: Head \"https://ghcr.io/v2/windroc-labs/egress-proxy/manifests/$D\": denied" >"$FAKE/pull_err"
 bootstrap 1.0.0 "$D"
 want="egress-install: no access to $REPO: needs a GitHub login (gh auth login) whose account can read the package $REPO, with scope read:packages (gh auth refresh -h github.com -s read:packages); nothing was changed"
 bad=""
@@ -1479,7 +1479,7 @@ check pull_fails "$bad" "$(st is "$bad" "")"
 reset pull_fails_digest_401
 D401=sha256:$(printf '401403%058d' 0)
 touch "$FAKE/image_missing"
-echo "Error response from daemon: Get \"https://ghcr.io/v2/windroc/egress-proxy/manifests/$D401\": net/http: TLS handshake timeout" >"$FAKE/pull_err"
+echo "Error response from daemon: Get \"https://ghcr.io/v2/windroc-labs/egress-proxy/manifests/$D401\": net/http: TLS handshake timeout" >"$FAKE/pull_err"
 bootstrap 1.0.0 "$D401"
 check pull_fails_digest_401 "exit $rc: $(err)" "$(st like "$rc $(err)" "4 egress-install: cannot pull $REPO@$D401 from registry ghcr.io")"
 
@@ -1696,7 +1696,7 @@ urllib.request.urlopen = urlopen
 sys.argv = ["fetch"] + sys.argv[3:]
 exec(compile(src, "egress-install FETCH", "exec"), {"__name__": "__main__"})
 PY
-# gfetch <case> <realm> [logged_out]: the fetch of ghcr.io/windroc/egress-proxy@$RD into
+# gfetch <case> <realm> [logged_out]: the fetch of ghcr.io/windroc-labs/egress-proxy@$RD into
 # $work/gf, with a gh that logs its arguments (logged_out: no gh login); exit code in $rc.
 gfetch() {
   rreset "$1"
@@ -1707,7 +1707,7 @@ gfetch() {
   mkdir -p "$work/gf"
   rc=0
   PATH="$work/bin:$PATH" python3 -I "$work/ghcr-fetch.py" "$(cat "$work/reg_port")" "$repo/egress-install" \
-    ghcr.io/windroc/egress-proxy "$RD" linux/amd64 "ghcr.io/windroc/egress-proxy:sha256-${RD#sha256:}" \
+    ghcr.io/windroc-labs/egress-proxy "$RD" linux/amd64 "ghcr.io/windroc-labs/egress-proxy:sha256-${RD#sha256:}" \
     "$work/gf/image.tar" >"$work/out" 2>"$work/err" || rc=$?
 }
 basic=$(printf 'octo:%s' "$FAKE_TOKEN" | base64 | tr -d '\n')
@@ -1715,7 +1715,7 @@ gfetch remote_fetch_ghcr_token https://ghcr.io/token
 bad=""
 is "$rc $(out)" "0 $(cat "$FAKE/reg_cfg_amd64") $(grep -o 'sha256:[0-9a-f]*' "$work/out" | tail -n 1)" || bad+="exit $rc: $(out) $(err); "
 grep -qxF "/token?service=fake&scope=repository%3Aegress-proxy%3Apull Basic $basic" "$FAKE/reg_log" || bad+="no Basic token request: $(grep '^/token' "$FAKE/reg_log" || true); "
-grep -q "^/v2/windroc/egress-proxy/manifests/$RD Bearer regtoken$" "$FAKE/reg_log" || bad+="no bearer manifest request; "
+grep -q "^/v2/windroc-labs/egress-proxy/manifests/$RD Bearer regtoken$" "$FAKE/reg_log" || bad+="no bearer manifest request; "
 grep -q '^/redirected/' "$FAKE/reg_log" || bad+="no blob redirect; "
 grep '^/redirected/' "$FAKE/reg_log" | grep -v ' -$' && bad+="a credential followed a redirect; "
 grep -F "$FAKE_TOKEN" "$FAKE/gh_calls" && bad+="the token in gh's argv; "
