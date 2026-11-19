@@ -22,7 +22,7 @@ import sys
 import tarfile
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SOURCE = "https://github.com/windroc/egress-proxy"
+SOURCE = "https://github.com/windroc-labs/egress-proxy"
 PLATFORMS = ("linux/amd64", "linux/arm64")
 
 OCI_INDEX = "application/vnd.oci.image.index.v1+json"

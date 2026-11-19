@@ -35,7 +35,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/windroc/egress-proxy
+  IMAGE: ghcr.io/windroc-labs/egress-proxy
 
 jobs:
   checks:
