@@ -1,8 +1,8 @@
-"""Release steps for the egress-proxy image (release.yml and ci.yml's `image` jobs): the tag's
+"""Release steps for the egress-proxy image (release.yml and ci.yml's `image` jobs): the next
 version, the label contract version, the build of one platform to an OCI image layout, the
 platforms' layouts combined into one multi-arch layout and its checks (the image labels and
 NFR-5: no source, tests or credential in anything published), the copy of exactly those
-bytes to the registry, and the GitHub Release.
+bytes to the registry, and the tag and GitHub Release.
 
 Stdlib only: it runs in the release job that holds write permissions, which installs
 nothing. Each subcommand prints `ok <step> ...` lines, or `FAIL <step>: <detail>` on stderr
@@ -44,7 +44,8 @@ FORBIDDEN_NAMES = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "Dockerfil
 FORBIDDEN_DIRS = {".git", ".github"}
 FORBIDDEN_ROOT_DIRS = {"src", "tests", "target"}
 TOKEN_RE = re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}")
-VERSION_RE = re.compile(r"refs/tags/v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))")
+TAG_RE = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
+FIRST_VERSION = "0.1.0"
 CONTRACT_RE = re.compile(r'^\s+windroc\.egress\.contract:\s*"?(\d+)"?\s*$', re.MULTILINE)
 # skopeo's wording when the tag (or the whole repository) does not exist.
 NOT_FOUND_RE = re.compile(r"manifest unknown|name unknown|not found", re.IGNORECASE)
@@ -331,11 +332,31 @@ docker pull {repo}@{digest}
 """
 
 
-def cmd_version(args):
-    match = VERSION_RE.fullmatch(args.ref)
-    if not match:
-        raise Fail("version", f"{args.ref} is not a release tag vX.Y.Z")
-    print(match.group(1))
+def git(step, *args):
+    """git's stdout; Fail on a non-zero exit."""
+    result = run(["git", *args])
+    if result.returncode != 0:
+        raise Fail(step, f"git {args[0]} exited {result.returncode}: {stderr_text(result)}")
+    return result.stdout.decode()
+
+
+def cmd_next_version(args):
+    """The patch after the highest vX.Y.Z tag, for a commit that comes after that tag's."""
+    versions = [tuple(map(int, m.groups())) for m in map(TAG_RE.fullmatch, git("version", "tag", "--list").split()) if m]
+    if not versions:
+        print(FIRST_VERSION)
+        return
+    major, minor, patch = max(versions)
+    tag = f"v{major}.{minor}.{patch}"
+    tagged = git("version", "rev-parse", "--verify", tag + "^{commit}").strip()
+    if tagged == args.commit:
+        raise Fail("version", f"{args.commit} is already released as {tag}")
+    result = run(["git", "merge-base", "--is-ancestor", tagged, args.commit])
+    if result.returncode == 1:
+        raise Fail("version", f"{tag} ({tagged}) is not an ancestor of {args.commit}")
+    if result.returncode != 0:
+        raise Fail("version", f"git merge-base exited {result.returncode}: {stderr_text(result)}")
+    print(f"{major}.{minor}.{patch + 1}")
 
 
 def cmd_contract(args):
@@ -428,8 +449,25 @@ def cmd_release_absent(args):
     print(f"ok release {args.tag} does not exist yet")
 
 
+def create_tag(tag, revision):
+    """The tag at `revision`, made now, or already there from an earlier attempt of this run."""
+    result = run(["gh", "api", "--method", "POST", "repos/{owner}/{repo}/git/refs",
+                  "-f", f"ref=refs/tags/{tag}", "-f", f"sha={revision}"])
+    if result.returncode == 0:
+        print(f"ok tag {tag} {revision}")
+        return
+    existing = run(["gh", "api", f"repos/{{owner}}/{{repo}}/git/ref/tags/{tag}", "--jq", ".object.sha"])
+    if existing.returncode != 0:
+        raise Fail("release", f"cannot create tag {tag}: {stderr_text(result)}")
+    sha = existing.stdout.decode().strip()
+    if sha != revision:
+        raise Fail("release", f"tag {tag} exists at {sha}, want {revision}")
+    print(f"ok tag {tag} already at {revision}")
+
+
 def cmd_release_create(args):
     tag = f"v{args.version}"
+    create_tag(tag, args.revision)
     notes = release_notes(args.version, args.contract, args.digest, args.revision, args.repo)
     result = run(["gh", "release", "create", tag, "--verify-tag", "--title", tag, "--notes", notes])
     if result.returncode != 0:
@@ -441,9 +479,9 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("version", help="print X.Y.Z of a refs/tags/vX.Y.Z ref")
-    s.add_argument("ref")
-    s.set_defaults(func=cmd_version)
+    s = sub.add_parser("next-version", help="print the version after the highest vX.Y.Z tag for the commit")
+    s.add_argument("commit")
+    s.set_defaults(func=cmd_next_version)
 
     s = sub.add_parser("contract", help="print the label contract version from compose.yaml")
     s.add_argument("--compose", default=str(REPO_ROOT / "compose.yaml"))
@@ -492,7 +530,7 @@ def parser():
     s.add_argument("--tag", required=True)
     s.set_defaults(func=cmd_release_absent)
 
-    s = sub.add_parser("release-create", help="create the GitHub Release for v<version>")
+    s = sub.add_parser("release-create", help="create the tag v<version> at the revision and its GitHub Release")
     for flag in ("--version", "--contract", "--digest", "--revision", "--repo"):
         s.add_argument(flag, required=True)
     s.set_defaults(func=cmd_release_create)

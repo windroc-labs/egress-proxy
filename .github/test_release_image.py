@@ -149,19 +149,75 @@ def completed(args, returncode=0, stdout=b"", stderr=b""):
     return subprocess.CompletedProcess(args, returncode, stdout, stderr)
 
 
-class VersionTests(unittest.TestCase):
-    def test_release_tag(self):
-        self.assertEqual(run_main("version", "refs/tags/v1.2.3")[:2], (0, "1.2.3\n"))
-        self.assertEqual(run_main("version", "refs/tags/v0.10.0")[:2], (0, "0.10.0\n"))
+OLD = "f" * 40
 
-    def test_not_a_release_tag(self):
-        for ref in ("refs/tags/v1.2", "refs/tags/v1.2.3-rc.1", "refs/tags/v01.2.3",
-                    "refs/heads/v1.2.3", "refs/tags/1.2.3", "refs/tags/v1.2.3\n"):
-            with self.subTest(ref=ref):
-                code, out, err = run_main("version", ref)
+
+class FakeGit:
+    """Stands in for git behind subprocess.run: `tags` maps a tag to its commit, `ancestors`
+    holds the commits that are ancestors of REVISION, `errors` maps a git subcommand to its
+    (exit code, stderr)."""
+
+    def __init__(self, tags=(), ancestors=(), errors=None):
+        self.tags = dict(tags)
+        self.ancestors = set(ancestors)
+        self.errors = errors or {}
+        self.calls = []
+
+    def __call__(self, args, **kwargs):
+        self.calls.append(list(args))
+        if args[0] != "git":
+            raise AssertionError(f"unexpected command {args}")
+        if args[1] in self.errors:
+            return completed(args, self.errors[args[1]][0], b"", self.errors[args[1]][1])
+        if args[1:] == ["tag", "--list"]:
+            return completed(args, 0, "".join(f"{tag}\n" for tag in self.tags).encode())
+        if args[1] == "rev-parse":
+            return completed(args, 0, self.tags[args[-1].removesuffix("^{commit}")].encode() + b"\n")
+        if args[1:3] == ["merge-base", "--is-ancestor"]:
+            return completed(args, 0 if args[3] in self.ancestors and args[4] == REVISION else 1)
+        raise AssertionError(f"unexpected command {args}")
+
+
+class NextVersionTests(unittest.TestCase):
+    def next(self, git):
+        with mock.patch.object(subprocess, "run", side_effect=git):
+            return run_main("next-version", REVISION)
+
+    def test_patch_bump_of_the_highest_release_tag(self):
+        # Only vX.Y.Z counts, compared as numbers; v0.1.0 published nothing and still counts.
+        git = FakeGit(tags={"v0.1.0": "a" * 40, "v0.1.10": OLD, "v0.1.9": "b" * 40, "v0.2.0-rc.1": "c" * 40,
+                            "v01.0.0": "d" * 40, "v1.0": "e" * 40, "latest": "e" * 40},
+                      ancestors={OLD})
+        self.assertEqual(self.next(git)[:2], (0, "0.1.11\n"))
+        self.assertIn(["git", "rev-parse", "--verify", "v0.1.10^{commit}"], git.calls)
+        self.assertIn(["git", "merge-base", "--is-ancestor", OLD, REVISION], git.calls)
+
+    def test_first_release(self):
+        git = FakeGit(tags={"latest": OLD})
+        self.assertEqual(self.next(git)[:2], (0, "0.1.0\n"))
+        self.assertEqual(git.calls, [["git", "tag", "--list"]])
+
+    def test_already_released(self):
+        # A re-run after the Release: the commit already carries the highest version.
+        code, out, err = self.next(FakeGit(tags={"v0.1.1": REVISION}))
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"FAIL version: {REVISION} is already released as v0.1.1", err)
+
+    def test_older_than_the_last_release(self):
+        # A late re-run of an older commit must not publish it under a newer version.
+        code, out, err = self.next(FakeGit(tags={"v0.1.1": OLD}))
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"FAIL version: v0.1.1 ({OLD}) is not an ancestor of {REVISION}", err)
+
+    def test_git_errors(self):
+        for command, expected in (("tag", "git tag exited 128: fatal: boom"),
+                                  ("rev-parse", "git rev-parse exited 128: fatal: boom"),
+                                  ("merge-base", "git merge-base exited 128: fatal: boom")):
+            with self.subTest(command=command):
+                code, _, err = self.next(FakeGit(tags={"v0.1.1": OLD}, ancestors={OLD},
+                                                 errors={command: (128, b"fatal: boom")}))
                 self.assertEqual(code, 1)
-                self.assertEqual(out, "")
-                self.assertIn(f"FAIL version: {ref} is not a release tag vX.Y.Z", err)
+                self.assertIn(f"FAIL version: {expected}", err)
 
 
 class ContractTests(unittest.TestCase):
@@ -417,7 +473,7 @@ class FakeTools:
     `<repo>:<tag>` to raw index bytes, `configs` maps an arch to its image labels."""
 
     def __init__(self, registry=None, configs=None, copy_writes=None, inspect_error=None,
-                 copy_rc=0, gh_view=(1, b"release not found"), gh_create_rc=0):
+                 copy_rc=0, gh_view=(1, b"release not found"), gh_create_rc=0, tags=None, gh_api_error=None):
         self.registry = dict(registry or {})
         self.configs = configs or {"amd64": labels(), "arm64": labels()}
         self.copy_writes = copy_writes
@@ -425,6 +481,8 @@ class FakeTools:
         self.copy_rc = copy_rc
         self.gh_view = gh_view
         self.gh_create_rc = gh_create_rc
+        self.tags = dict(tags or {})
+        self.gh_api_error = gh_api_error
         self.calls = []
 
     def __call__(self, args, **kwargs):
@@ -446,6 +504,19 @@ class FakeTools:
             return completed(args, self.copy_rc, b"", b"copy failed" if self.copy_rc else b"")
         if tool == "gh" and args[1:3] == ["release", "view"]:
             return completed(args, self.gh_view[0], b"", self.gh_view[1])
+        if tool == "gh" and args[1] == "api":
+            if self.gh_api_error:
+                return completed(args, 1, b"", self.gh_api_error)
+            if args[2:5] == ["--method", "POST", "repos/{owner}/{repo}/git/refs"]:
+                tag, sha = args[6].removeprefix("ref=refs/tags/"), args[8].removeprefix("sha=")
+                if tag in self.tags:
+                    return completed(args, 1, b"", b"gh: Reference already exists (HTTP 422)")
+                self.tags[tag] = sha
+                return completed(args, 0, b"{}")
+            tag = args[2].removeprefix("repos/{owner}/{repo}/git/ref/tags/")
+            if tag in self.tags:
+                return completed(args, 0, self.tags[tag].encode() + b"\n")
+            return completed(args, 1, b"", b"gh: Not Found (HTTP 404)")
         if tool == "gh" and args[1:3] == ["release", "create"]:
             return completed(args, self.gh_create_rc, b"", b"" if self.gh_create_rc == 0 else b"HTTP 422")
         if tool == "docker":
@@ -633,8 +704,13 @@ class ReleaseTests(unittest.TestCase):
 
     def test_create(self):
         tools = FakeTools()
-        code, _, err = self.create(tools)
+        code, out, err = self.create(tools)
         self.assertEqual(code, 0, err)
+        # The tag is made here, at the built commit, before the Release that verifies it.
+        self.assertEqual(tools.calls[0], ["gh", "api", "--method", "POST", "repos/{owner}/{repo}/git/refs",
+                                          "-f", "ref=refs/tags/v1.2.3", "-f", f"sha={REVISION}"])
+        self.assertEqual(tools.tags, {"v1.2.3": REVISION})
+        self.assertIn(f"ok tag v1.2.3 {REVISION}", out)
         (args,) = tools.ran("gh", "release", "create")
         self.assertEqual(args[:8], ["gh", "release", "create", "v1.2.3", "--verify-tag", "--title", "v1.2.3", "--notes"])
         notes = args[8]
@@ -646,6 +722,28 @@ class ReleaseTests(unittest.TestCase):
         code, _, err = self.create(FakeTools(gh_create_rc=1))
         self.assertEqual(code, 1)
         self.assertIn("FAIL release: gh release create exited 1: HTTP 422", err)
+
+    def test_rerun_with_tag_at_the_commit(self):
+        # "Re-run failed jobs" after the tag was made but the Release was not.
+        tools = FakeTools(tags={"v1.2.3": REVISION})
+        code, out, err = self.create(tools)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"ok tag v1.2.3 already at {REVISION}", out)
+        self.assertEqual(len(tools.ran("gh", "release", "create")), 1)
+
+    def test_tag_at_another_commit(self):
+        tools = FakeTools(tags={"v1.2.3": OLD})
+        code, _, err = self.create(tools)
+        self.assertEqual(code, 1)
+        self.assertIn(f"FAIL release: tag v1.2.3 exists at {OLD}, want {REVISION}", err)
+        self.assertEqual(tools.ran("gh", "release", "create"), [])
+
+    def test_tag_api_error(self):
+        tools = FakeTools(gh_api_error=b"gh: Resource not accessible by integration (HTTP 403)")
+        code, _, err = self.create(tools)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL release: cannot create tag v1.2.3: gh: Resource not accessible by integration (HTTP 403)", err)
+        self.assertEqual(tools.ran("gh", "release", "create"), [])
 
 
 GITHUB = Path(__file__).parent
@@ -739,10 +837,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.jobs = self.wf["jobs"]
 
     def test_release_gated_on_ci(self):
-        self.assertEqual(self.wf["on"], {"push": {"tags": ["v*"]}})
+        self.assertEqual(set(self.wf["on"]), {"push", "workflow_dispatch"})
+        self.assertEqual(self.wf["on"]["push"]["branches"], ["main"])
         self.assertEqual(self.wf["permissions"], {"contents": "read"})
-        self.assertIs(self.wf["concurrency"]["cancel-in-progress"], False)
-        self.assertTrue(self.wf["concurrency"]["group"].startswith("release-"))
+        # One release at a time, in push order, never cancelled mid-publish.
+        self.assertEqual(self.wf["concurrency"], {"group": "release", "cancel-in-progress": False})
         self.assertEqual(self.jobs["checks"]["uses"], "./.github/workflows/ci.yml")
         self.assertEqual(self.jobs["prepare"]["needs"], "checks")
         self.assertEqual(self.jobs["build"]["needs"], "prepare")
@@ -759,10 +858,27 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(prepare["permissions"], {"contents": "read", "packages": "read"})
         self.assertEqual(prepare["steps"][0]["with"]["fetch-depth"], 0)
         script = "\n".join(runs(prepare))
-        for command in ("release_image.py version", "release_image.py on-main", "release_image.py contract",
+        for command in ("release_image.py next-version", "release_image.py on-main", "release_image.py contract",
                         "release_image.py release-absent", "release_image.py registry-absent"):
             self.assertIn(command, script)
         self.assertEqual({s["uses"].split("@")[0] for s in prepare["steps"] if "uses" in s}, {"actions/checkout"})
+
+    def test_release_only_when_the_image_changes(self):
+        """The push paths are the image's build context, read from .dockerignore (whose
+        `!` lines are all it lets in), plus .dockerignore itself; tests under proxy/ are in
+        the context but not in the binary, so they never release on their own."""
+        allowed = [line[1:] for line in (GITHUB.parent / ".dockerignore").read_text().splitlines()
+                   if line.startswith("!")]
+        self.assertIn("Dockerfile", allowed)
+        want = [".dockerignore"] + [p + "**" if p.endswith("/") else p for p in allowed] + ["!proxy/tests/**"]
+        self.assertEqual(self.wf["on"]["push"]["paths"], want)
+
+    def test_ci_concurrency_apart_from_release(self):
+        # Called by release.yml, github.workflow is "release": ci.yml's own run on the same
+        # push to main must not cancel the release's checks.
+        group = load("workflows/ci.yml")["concurrency"]["group"]
+        self.assertIn("${{ github.workflow }}", group)
+        self.assertIn("${{ github.ref }}", group)
 
     def test_publish_steps_unconditional(self):
         for step in self.jobs["publish"]["steps"][:-1]:

@@ -14,8 +14,10 @@ on:
 permissions:
   contents: read
 
+# github.workflow is "release" when release.yml calls this: its checks never share a group
+# with ci.yml's own run on the same push to main.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

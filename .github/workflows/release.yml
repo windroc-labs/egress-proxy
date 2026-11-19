@@ -1,20 +1,37 @@
-# A pushed version tag vX.Y.Z: every CI check (ci.yml, gated on its CI aggregate), then each
-# platform built natively in parallel in jobs without write permissions, combined into one
-# multi-arch image and checked, published to GHCR as exactly those bytes, and the GitHub
-# Release with the index digest. See README.md › Release.
+# A push to main that changes the image (or a manual run on main): every CI check (ci.yml,
+# gated on its CI aggregate), then the next version, each platform built natively in
+# parallel in jobs without write permissions, combined into one multi-arch image and
+# checked, published to GHCR as exactly those bytes, and the tag and GitHub Release with
+# the index digest. See README.md › Release.
 name: release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    # The image's build context: what .dockerignore lets in (test_release_image.py keeps
+    # them equal), less the entrypoint's tests, which are not in the binary.
+    paths:
+      - .dockerignore
+      - Dockerfile
+      - proxy/**
+      - start.sh
+      - verify-egress
+      - egress-install
+      - install.sh
+      - compose.yaml
+      - compose.remote.yaml
+      - config.example.yaml
+      - config.default.yaml
+      - "!proxy/tests/**"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-# One run per tag at a time, never cancelled mid-publish; distinct from ci.yml's group,
-# which the called workflow uses.
+# One release at a time, in push order, never cancelled mid-publish. A newer push replaces
+# a pending run, not a running one; its commit holds the replaced one's changes.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 env:
@@ -24,8 +41,8 @@ jobs:
   checks:
     uses: ./.github/workflows/ci.yml
 
-  # Every guard before anything is built or written: a vX.Y.Z tag on a main commit, no
-  # Release yet, and the version not in GHCR yet.
+  # Every guard before anything is built or written: a main commit after the last release,
+  # no Release yet, and the version not in GHCR yet.
   prepare:
     name: prepare
     needs: checks
@@ -42,14 +59,14 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
-          # origin/main, for the ancestry check.
+          # origin/main and the tags, for the ancestry checks and the next version.
           fetch-depth: 0
-      - name: Version, revision and contract; the commit is on main
+      - name: Revision, next version and contract; the commit is on main
         id: meta
         run: |
-          version=$(python3 -B .github/release_image.py version "$GITHUB_REF")
           revision=$(git rev-parse HEAD)
           python3 -B .github/release_image.py on-main "$revision"
+          version=$(python3 -B .github/release_image.py next-version "$revision")
           contract=$(python3 -B .github/release_image.py contract)
           { echo "version=$version"; echo "revision=$revision"; echo "contract=$contract"; } >>"$GITHUB_OUTPUT"
       - name: The Release does not exist yet
@@ -149,7 +166,7 @@ jobs:
             --version "$VERSION" --authfile "$auth"
           digest=$(python3 -B .github/release_image.py digest "$RUNNER_TEMP/layout")
           echo "digest=$digest" >>"$GITHUB_OUTPUT"
-      - name: Create the Release
+      - name: Create the tag and the Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

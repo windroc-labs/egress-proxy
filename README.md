@@ -354,34 +354,44 @@ A release is the image `ghcr.io/windroc/egress-proxy:X.Y.Z` for `linux/amd64` an
 `linux/arm64`, plus the GitHub Release `vX.Y.Z` that gives its index digest. Install and pin
 it by that digest, never by the tag ([Setup](#setup)).
 
-1. Merge the change to `main`.
-2. Tag that `main` commit and push the tag: `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`.
+Releases are automatic: each push to `main` that changes the image's build context runs
+`.github/workflows/release.yml`. The context is what `.dockerignore` lets in (`Dockerfile`,
+`proxy/`, `start.sh`, `verify-egress`, `egress-install`, `install.sh`, the compose and
+config files) plus `.dockerignore`; the workflow's `paths` list must match it (the
+release-step tests check). A push that changes only other files (docs, `tests/`,
+`proxy/tests/`, CI) releases nothing. To release such a change, e.g. new builder pins in
+`.github/actions/build-image`, run the workflow by hand on `main` (Actions › release › Run
+workflow).
 
-The version is semver for the image (`vX.Y.Z` only; no pre-release suffix) and is
-independent of the label contract version, which changes only per
-[docs/label-contract.md](docs/label-contract.md#versioning); the Release notes give both.
+The version is semver for the image (`vX.Y.Z` only; no pre-release suffix): the patch after
+the highest `vX.Y.Z` tag (`v0.1.0` → `0.1.1`), or `0.1.0` when there is none; releases
+bump only the patch. It is independent of the label contract version, which changes only per [docs/label-contract.md](docs/label-contract.md#versioning);
+the Release notes give both.
 
-`.github/workflows/release.yml` then runs, each job only if the previous one passed:
+The workflow runs one release at a time, in push order, each job only if the previous one
+passed. A push while a release runs waits; a later push replaces a waiting one, whose
+changes it holds.
 
 | Job | Permissions | Does |
 | --- | --- | --- |
 | `checks` | read | all of CI (`ci.yml`) |
-| `prepare` | read | fails unless the tag is `vX.Y.Z` on a commit in `main`, the Release does not exist and the version is not in GHCR yet |
+| `prepare` | read | fails unless the commit is in `main` and the highest `vX.Y.Z` tag is on an earlier commit of it (so a re-run after a release, or of an older commit, fails), the Release does not exist and the version is not in GHCR yet |
 | `build (amd64)`, `build (arm64)` | read | in parallel, each on a runner of its architecture (no QEMU): builds that platform into an OCI layout with the [image labels](docs/label-contract.md#image-labels) |
-| `publish` | write | combines the two layouts into one multi-arch index; checks every layer and the image history (no source, tests, `.git`, build output or credential) and the labels; copies exactly those bytes to GHCR (`skopeo copy --preserve-digests`), verifies the registry's digest and labels, and creates the Release |
+| `publish` | write | combines the two layouts into one multi-arch index; checks every layer and the image history (no source, tests, `.git`, build output or credential) and the labels; copies exactly those bytes to GHCR (`skopeo copy --preserve-digests`), verifies the registry's digest and labels, then creates the tag `vX.Y.Z` at the commit and the Release |
 
-A published version never changes: a tag pushed again for an existing version fails in
-`prepare` and leaves GHCR as it was; ship a fix as a new version. If `publish` fails after
-the push but before the Release exists, use "Re-run failed jobs" within a day (while the
-`build` jobs' layout artifacts are kept): `publish` combines and checks the same layouts again, accepts the
-tag because it already holds exactly that digest, and creates the Release. "Re-run all
-jobs" fails in `prepare`, since the version is then in GHCR; after that day, create the
-Release by hand from the digest GHCR shows.
+A published version never changes, and the org's tag ruleset forbids updating or deleting
+any tag; ship a fix as a new version. If a release fails, fix the cause and push it to
+`main` (or run the workflow by hand); the next run takes the same version while its tag does
+not exist yet. If `publish` fails after the GHCR push, use "Re-run failed jobs" within a day
+(while the `build` jobs' layout artifacts are kept): `publish` combines and checks the same
+layouts again, accepts the GHCR tag because it already holds exactly that digest, accepts
+the git tag if it is already at the commit, and creates the Release. "Re-run all jobs" fails
+in `prepare`, since the version is then in GHCR; after that day, create the tag and Release
+by hand from the digest GHCR shows.
 
-Who may publish is set by a tag ruleset, which the repo's owner keeps: target `v*` tags,
-restrict creation, updates and deletion, with only the owner on the bypass list. Without
-it, anyone with write access could tag a commit; the `main` check in `prepare` catches a
-wrong commit but is not a control, since the tagged commit's own `release.yml` runs.
+Publishing is controlled by who can change `main` (its ruleset requires a pull request and
+the `CI` check) and who can run workflows (write access). Pushing a `vX.Y.Z` tag publishes
+nothing; it only sets the version the next release bumps from.
 
 ## Manual checks (Mac)
 
