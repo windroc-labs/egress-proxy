@@ -1,7 +1,8 @@
 # Every pull request: build and test the entrypoint, lint the repo, build the image and
-# run the Docker end-to-end checks, and build, check and publish the multi-arch image to a
-# local registry (the release path, without GHCR) and install it from there by digest. CI aggregates every job for branch
-# protection; release.yml calls this workflow before it publishes.
+# run the Docker end-to-end checks, and build each platform natively, combine and check the
+# multi-arch image, publish it to a local registry (the release path, without GHCR) and
+# install it from there by digest. CI aggregates every job for branch protection;
+# release.yml calls this workflow before it publishes.
 name: ci
 
 on:
@@ -99,17 +100,20 @@ jobs:
           persist-credentials: false
       - run: tests/integration.sh
 
-  image:
-    name: image
-    runs-on: ubuntu-24.04
-    # arm64 builds under QEMU.
-    timeout-minutes: 60
+  # Each platform on a runner of its own architecture, in parallel.
+  image-build:
+    name: image-build (${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     permissions:
       contents: read
-    services:
-      registry:
-        image: docker.io/library/registry:3.1.2@sha256:d4032d4cc323c1731c707931ecada07a53076eac38e3b61ae57533f170f2c6c3
-        ports: ["5000:5000"]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -120,8 +124,44 @@ jobs:
         with:
           version: 0.0.0
           revision: ${{ steps.revision.outputs.sha }}
+          platform: linux/${{ matrix.arch }}
           out: ${{ runner.temp }}/layout
-          scan-token: ${{ github.token }}
+      # Named apart from release.yml's layout-<arch>: a release run holds both.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ci-layout-${{ matrix.arch }}
+          path: ${{ runner.temp }}/layout
+          retention-days: 1
+          if-no-files-found: error
+
+  image:
+    name: image
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      registry:
+        image: docker.io/library/registry:3.1.2@sha256:d4032d4cc323c1731c707931ecada07a53076eac38e3b61ae57533f170f2c6c3
+        ports: ["5000:5000"]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ci-layout-*
+          path: ${{ runner.temp }}/layouts
+      - name: Combine both platforms into one index and check every layer, the history and the labels
+        env:
+          EGRESS_RELEASE_TOKEN: ${{ github.token }}
+        run: |
+          python3 -B .github/release_image.py combine "$RUNNER_TEMP/layout" \
+            "$RUNNER_TEMP/layouts/ci-layout-amd64" "$RUNNER_TEMP/layouts/ci-layout-arm64"
+          contract=$(python3 -B .github/release_image.py contract)
+          python3 -B .github/release_image.py check "$RUNNER_TEMP/layout" --version 0.0.0 \
+            --revision "$(git rev-parse HEAD)" --contract "$contract"
       - name: Publish to the local registry and verify it by digest
         run: >-
           python3 -B .github/release_image.py publish "$RUNNER_TEMP/layout"
@@ -135,7 +175,7 @@ jobs:
 
   ci:
     name: CI
-    needs: [rust, lint, macos, integration, image]
+    needs: [rust, lint, macos, integration, image-build, image]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

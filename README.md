@@ -340,10 +340,12 @@ egress-proxy-proxy`, and in a checkout where you built the entrypoint, `rm -rf g
   the first job of every release.
   Set `CI` as the only required status check in the `main` branch ruleset. It aggregates
   `rust`, `lint`, `macos` (every script parsed, and the install self-test run, with
-  macOS's own bash 3.2 and BSD tools), `integration` and `image`, and fails if any dependency fails, is cancelled
-  or is skipped. `image` runs the release path against a local registry: it builds both
-  platforms (`.github/actions/build-image`, arm64 under QEMU), checks the layout and
-  publishes it as version `0.0.0`, then installs it from there. When adding a job, add it to `ci.needs`; the `lint` job
+  macOS's own bash 3.2 and BSD tools), `integration`, `image-build` and `image`, and fails if any dependency fails, is cancelled
+  or is skipped. `image-build` and `image` run the release path against a local registry:
+  `image-build` builds each platform on a runner of its architecture, in parallel
+  (`.github/actions/build-image`; `ubuntu-24.04` and `ubuntu-24.04-arm`, no QEMU); `image`
+  combines the two layouts into one multi-arch index, checks it and publishes it as
+  version `0.0.0`, then installs it from there. When adding a job, add it to `ci.needs`; the `lint` job
   checks completeness with `.github/check_ci_needs.py` (requires `PyYAML==6.0.2`).
 
 ## Release
@@ -365,13 +367,13 @@ independent of the label contract version, which changes only per
 | --- | --- | --- |
 | `checks` | read | all of CI (`ci.yml`) |
 | `prepare` | read | fails unless the tag is `vX.Y.Z` on a commit in `main`, the Release does not exist and the version is not in GHCR yet |
-| `build` | read | builds both platforms into an OCI layout with the [image labels](docs/label-contract.md#image-labels), and checks every layer and the image history: no source, tests, `.git`, build output or credential |
-| `publish` | write | checks the layout again, copies exactly those bytes to GHCR (`skopeo copy --preserve-digests`), verifies the registry's digest and labels, and creates the Release |
+| `build (amd64)`, `build (arm64)` | read | in parallel, each on a runner of its architecture (no QEMU): builds that platform into an OCI layout with the [image labels](docs/label-contract.md#image-labels) |
+| `publish` | write | combines the two layouts into one multi-arch index; checks every layer and the image history (no source, tests, `.git`, build output or credential) and the labels; copies exactly those bytes to GHCR (`skopeo copy --preserve-digests`), verifies the registry's digest and labels, and creates the Release |
 
 A published version never changes: a tag pushed again for an existing version fails in
 `prepare` and leaves GHCR as it was; ship a fix as a new version. If `publish` fails after
 the push but before the Release exists, use "Re-run failed jobs" within a day (while the
-`build` job's layout artifact is kept): `publish` checks the same layout again, accepts the
+`build` jobs' layout artifacts are kept): `publish` combines and checks the same layouts again, accepts the
 tag because it already holds exactly that digest, and creates the Release. "Re-run all
 jobs" fails in `prepare`, since the version is then in GHCR; after that day, create the
 Release by hand from the digest GHCR shows.

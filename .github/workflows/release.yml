@@ -1,7 +1,7 @@
-# A pushed version tag vX.Y.Z: every CI check (ci.yml, gated on its CI aggregate), then the
-# multi-arch image built and checked in a job without write permissions, published to GHCR
-# as exactly those bytes, and the GitHub Release with the index digest. See README.md ›
-# Release.
+# A pushed version tag vX.Y.Z: every CI check (ci.yml, gated on its CI aggregate), then each
+# platform built natively in parallel in jobs without write permissions, combined into one
+# multi-arch image and checked, published to GHCR as exactly those bytes, and the GitHub
+# Release with the index digest. See README.md › Release.
 name: release
 
 on:
@@ -68,13 +68,20 @@ jobs:
           skopeo login --authfile "$auth" --username "$GITHUB_ACTOR" --password-stdin ghcr.io <<<"$TOKEN"
           python3 -B .github/release_image.py registry-absent --repo "$IMAGE" --version "$VERSION" --authfile "$auth"
 
-  # Third-party actions and the Rust build run here, with read permissions only.
+  # Third-party actions and the Rust build run here, with read permissions only: each
+  # platform on a runner of its own architecture, in parallel.
   build:
-    name: build
+    name: build (${{ matrix.arch }})
     needs: prepare
-    runs-on: ubuntu-24.04
-    # arm64 builds under QEMU.
-    timeout-minutes: 90
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -89,11 +96,11 @@ jobs:
         with:
           version: ${{ needs.prepare.outputs.version }}
           revision: ${{ needs.prepare.outputs.revision }}
+          platform: linux/${{ matrix.arch }}
           out: ${{ runner.temp }}/layout
-          scan-token: ${{ github.token }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: layout
+          name: layout-${{ matrix.arch }}
           path: ${{ runner.temp }}/layout
           retention-days: 1
           if-no-files-found: error
@@ -119,15 +126,17 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: layout
-          path: ${{ runner.temp }}/layout
-      # Every blob is checked against its digest, so what is pushed is what build checked.
-      - name: Check the downloaded layout
+          pattern: layout-*
+          path: ${{ runner.temp }}/layouts
+      # Every blob is checked against its digest, so what is pushed is what this step checked.
+      - name: Combine both platforms into one index and check every layer, the history and the labels
         env:
           EGRESS_RELEASE_TOKEN: ${{ github.token }}
-        run: >-
-          python3 -B .github/release_image.py check "$RUNNER_TEMP/layout" --version "$VERSION"
-          --revision "$REVISION" --contract "$CONTRACT"
+        run: |
+          python3 -B .github/release_image.py combine "$RUNNER_TEMP/layout" \
+            "$RUNNER_TEMP/layouts/layout-amd64" "$RUNNER_TEMP/layouts/layout-arm64"
+          python3 -B .github/release_image.py check "$RUNNER_TEMP/layout" --version "$VERSION" \
+            --revision "$REVISION" --contract "$CONTRACT"
       - name: Publish to GHCR and verify it by digest
         id: publish
         env:

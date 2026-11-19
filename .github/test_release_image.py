@@ -113,6 +113,27 @@ def build_layout(root, files=None, platforms=("linux/amd64", "linux/arm64"),
     return layout.finish(manifests, annotations)
 
 
+def single_layout(root, platform, top="manifest", image_labels=None, files=None, variant=None):
+    """A one-platform layout like `buildx --platform=<platform> --output type=oci,tar=false`:
+    index.json names the image manifest itself (`top="manifest"`) or an index of only it."""
+    layout = Layout(root)
+    descriptor = layout.image(platform, dict(GOOD_FILES if files is None else files),
+                              labels() if image_labels is None else image_labels)
+    if variant:
+        manifest = json.loads((layout.root / "blobs" / "sha256" / descriptor["digest"][7:]).read_bytes())
+        config_path = layout.root / "blobs" / "sha256" / manifest["config"]["digest"][7:]
+        config = dict(json.loads(config_path.read_bytes()), variant=variant)
+        manifest["config"] = layout.blob(json.dumps(config).encode(), CONFIG)
+        descriptor = layout.blob(json.dumps(manifest).encode(), MANIFEST)
+    descriptor.pop("platform", None)
+    if top == "index":
+        index = {"schemaVersion": 2, "mediaType": INDEX, "manifests": [descriptor]}
+        descriptor = layout.blob(json.dumps(index).encode(), INDEX)
+    (layout.root / "index.json").write_text(json.dumps({"schemaVersion": 2, "manifests": [descriptor]}))
+    (layout.root / "oci-layout").write_text('{"imageLayoutVersion": "1.0.0"}')
+    return descriptor
+
+
 def run_main(*argv, env=None):
     """release_image.main's exit code, stdout and stderr."""
     out, err = io.StringIO(), io.StringIO()
@@ -314,6 +335,77 @@ class CheckTests(unittest.TestCase):
         self.assert_fails(self.check(root), "index.json")
 
 
+class CombineTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.out = self.tmp / "out"
+
+    def single(self, name, platform, **kwargs):
+        root = self.tmp / name
+        single_layout(root, platform, **kwargs)
+        return str(root)
+
+    def combine(self, *roots):
+        return run_main("combine", str(self.out), *roots)
+
+    def test_combined_layout_passes_check(self):
+        # buildx names the manifest itself or a one-entry index; combine takes both.
+        amd = self.single("amd", "linux/amd64")
+        arm = self.single("arm", "linux/arm64", top="index", variant="v8",
+                          files=dict(GOOD_FILES, arch=b"arm64"))
+        code, out, err = self.combine(amd, arm)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"ok combine {self.out}", out)
+        index = json.loads(release_image.Layout(self.out).blob(release_image.Layout(self.out).index_descriptor()))
+        self.assertEqual([m["platform"] for m in index["manifests"]],
+                         [{"architecture": "amd64", "os": "linux"},
+                          {"architecture": "arm64", "os": "linux", "variant": "v8"}])
+        code, out, err = run_main("check", str(self.out), "--version", VERSION, "--revision", REVISION,
+                                  "--contract", CONTRACT)
+        self.assertEqual(code, 0, err)
+        self.assertIn("ok check linux/arm64", out)
+        # Only the referenced blobs: the arm64 layout's own one-entry index is not carried over.
+        blobs = {p.name for p in (self.out / "blobs" / "sha256").iterdir()}
+        self.assertEqual(len(blobs), 1 + 2 * 3)
+
+    def test_order_does_not_matter(self):
+        amd = self.single("amd", "linux/amd64")
+        arm = self.single("arm", "linux/arm64")
+        self.assertEqual(self.combine(arm, amd)[0], 0)
+        digest = run_main("digest", str(self.out))[1]
+        other = self.tmp / "other"
+        self.assertEqual(run_main("combine", str(other), amd, arm)[0], 0)
+        self.assertEqual(run_main("digest", str(other))[1], digest)
+
+    def test_same_platform_twice(self):
+        code, _, err = self.combine(self.single("a", "linux/amd64"), self.single("b", "linux/amd64"))
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL combine:", err)
+        self.assertIn("linux/amd64 twice", err)
+
+    def test_more_than_one_image(self):
+        root = self.tmp / "multi"
+        build_layout(root)
+        code, _, err = self.combine(str(root))
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL combine:", err)
+        self.assertIn("exactly one image", err)
+
+    def test_corrupt_blob(self):
+        amd = self.single("amd", "linux/amd64")
+        blobs = sorted((Path(amd) / "blobs" / "sha256").iterdir(), key=lambda p: p.stat().st_size)
+        blobs[-1].write_bytes(blobs[-1].read_bytes() + b"x")
+        code, _, err = self.combine(amd)
+        self.assertEqual(code, 1)
+        self.assertIn("digest mismatch", err)
+
+    def test_out_exists(self):
+        self.out.mkdir()
+        code, _, err = self.combine(self.single("amd", "linux/amd64"))
+        self.assertEqual(code, 1)
+        self.assertIn(f"FAIL combine: {self.out} already exists", err)
+
+
 REPO = "ghcr.io/windroc/egress-proxy"
 INDEX_RAW = b'{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}'
 INDEX_DIGEST = "sha256:" + hashlib.sha256(INDEX_RAW).hexdigest()
@@ -374,10 +466,10 @@ class BuildTests(unittest.TestCase):
         out_dir = Path(self.enterContext(tempfile.TemporaryDirectory())) / "layout"
         tools = FakeTools()
         code, _, err = with_tools(tools, "build", "--version", VERSION, "--revision", REVISION,
-                                  "--contract", CONTRACT, "--out", str(out_dir))
+                                  "--contract", CONTRACT, "--platform", "linux/arm64", "--out", str(out_dir))
         self.assertEqual(code, 0, err)
         (args,) = tools.ran("docker", "buildx", "build")
-        self.assertIn("--platform=linux/amd64,linux/arm64", args)
+        self.assertIn("--platform=linux/arm64", args)
         self.assertIn("--provenance=false", args)
         self.assertIn("--sbom=false", args)
         for key, value in labels().items():
@@ -389,7 +481,7 @@ class BuildTests(unittest.TestCase):
         out_dir = self.enterContext(tempfile.TemporaryDirectory())
         tools = FakeTools()
         code, _, err = with_tools(tools, "build", "--version", VERSION, "--revision", REVISION,
-                                  "--contract", CONTRACT, "--out", out_dir)
+                                  "--contract", CONTRACT, "--platform", "linux/amd64", "--out", out_dir)
         self.assertEqual(code, 1)
         self.assertIn("FAIL build:", err)
         self.assertEqual(tools.calls, [])
@@ -398,9 +490,18 @@ class BuildTests(unittest.TestCase):
         out_dir = Path(self.enterContext(tempfile.TemporaryDirectory())) / "layout"
         with mock.patch.object(subprocess, "run", return_value=completed([], 1)):
             code, _, err = run_main("build", "--version", VERSION, "--revision", REVISION,
-                                    "--contract", CONTRACT, "--out", str(out_dir))
+                                    "--contract", CONTRACT, "--platform", "linux/amd64", "--out", str(out_dir))
         self.assertEqual(code, 1)
         self.assertIn("FAIL build: docker buildx build exited 1", err)
+
+    def test_one_release_platform(self):
+        out_dir = Path(self.enterContext(tempfile.TemporaryDirectory())) / "layout"
+        for platform in ("linux/amd64,linux/arm64", "linux/386"):
+            with self.subTest(platform=platform), contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as raised:
+                run_main("build", "--version", VERSION, "--revision", REVISION, "--contract", CONTRACT,
+                         "--platform", platform, "--out", str(out_dir))
+            self.assertEqual(raised.exception.code, 2)
 
 
 class RegistryAbsentTests(unittest.TestCase):
@@ -561,16 +662,48 @@ def step_env(step):
     return step.get("env") or {}
 
 
+NATIVE = [{"arch": "amd64", "runner": "ubuntu-24.04"}, {"arch": "arm64", "runner": "ubuntu-24.04-arm"}]
+
+
+def assert_native_matrix(test, job):
+    """Each platform built in parallel on a runner of its own architecture."""
+    test.assertEqual(job["strategy"]["matrix"], {"include": NATIVE})
+    test.assertEqual(job["runs-on"], "${{ matrix.runner }}")
+    test.assertEqual(job["permissions"], {"contents": "read"})
+    (build,) = (s for s in job["steps"] if s.get("uses") == "./.github/actions/build-image")
+    test.assertEqual(build["with"]["platform"], "linux/${{ matrix.arch }}")
+    (upload,) = (s for s in job["steps"] if s.get("uses", "").startswith("actions/upload-artifact@"))
+    return build, upload
+
+
+def combine_step(test, job, prefix):
+    """The step that combines both platforms' artifacts `<prefix><arch>` and checks the result."""
+    (download,) = (s for s in job["steps"] if s.get("uses", "").startswith("actions/download-artifact@"))
+    test.assertEqual(download["with"]["pattern"], prefix + "*")
+    (step,) = (s for s in job["steps"] if "release_image.py combine" in s.get("run", ""))
+    run = step["run"]
+    for arch in ("amd64", "arm64"):
+        test.assertIn(f'"$RUNNER_TEMP/layouts/{prefix}{arch}"', run)
+    test.assertLess(run.index("release_image.py combine"), run.index("release_image.py check"))
+    test.assertIn("EGRESS_RELEASE_TOKEN", step_env(step))
+    return step
+
+
 class WorkflowTests(unittest.TestCase):
     def test_ci_is_callable_with_image_job(self):
         ci = load("workflows/ci.yml")
         self.assertIn("workflow_call", ci["on"])
         self.assertIn("image", ci["jobs"]["ci"]["needs"])
+        self.assertIn("image-build", ci["jobs"]["ci"]["needs"])
+        build, upload = assert_native_matrix(self, ci["jobs"]["image-build"])
+        self.assertEqual(build["with"]["version"], "0.0.0")
+        # Distinct from release.yml's `layout-<arch>`: a release run holds both.
+        self.assertEqual(upload["with"]["name"], "ci-layout-${{ matrix.arch }}")
         image = ci["jobs"]["image"]
+        self.assertEqual(image["needs"], "image-build")
         self.assertEqual(image["permissions"], {"contents": "read"})
         self.assertRegex(image["services"]["registry"]["image"], r"@sha256:[0-9a-f]{64}$")
-        uses = [s.get("uses") for s in image["steps"]]
-        self.assertIn("./.github/actions/build-image", uses)
+        combine_step(self, image, "ci-layout-")
         publish = [s for s in image["steps"] if "release_image.py publish" in s.get("run", "")]
         self.assertEqual(len(publish), 1)
         self.assertIn("--repo localhost:5000/egress-proxy", publish[0]["run"])
@@ -583,21 +716,17 @@ class WorkflowTests(unittest.TestCase):
     def test_build_image_action(self):
         action = load("actions/build-image/action.yml")
         self.assertEqual(action["runs"]["using"], "composite")
+        self.assertEqual(set(action["inputs"]), {"version", "revision", "platform", "out"})
         steps = action["runs"]["steps"]
+        # Native runners: no QEMU.
         uses = [s["uses"].split("@")[0] for s in steps if "uses" in s]
-        self.assertEqual(uses, ["docker/setup-qemu-action", "docker/setup-buildx-action"])
-        qemu, buildx = (s for s in steps if "uses" in s)
-        self.assertRegex(qemu["with"]["image"], r"@sha256:[0-9a-f]{64}$")
-        self.assertIs(qemu["with"]["cache-image"], False)
+        self.assertEqual(uses, ["docker/setup-buildx-action"])
+        (buildx,) = (s for s in steps if "uses" in s)
         self.assertRegex(buildx["with"]["driver-opts"], r"@sha256:[0-9a-f]{64}$")
         self.assertRegex(buildx["with"]["version"], r"^v\d+\.\d+\.\d+$")
-        runs = [s.get("run", "") for s in steps]
-        self.assertTrue(any("release_image.py build" in r for r in runs))
-        self.assertTrue(any("release_image.py check" in r for r in runs))
-        # The scan token reaches only the stdlib check step, never a third-party action.
-        with_token = [s for s in steps if "EGRESS_RELEASE_TOKEN" in step_env(s)]
-        self.assertEqual(len(with_token), 1)
-        self.assertIn("release_image.py check", with_token[0]["run"])
+        (build,) = (s for s in steps if "release_image.py build" in s.get("run", ""))
+        self.assertIn('--platform "$PLATFORM"', build["run"])
+        self.assertFalse(any("EGRESS_RELEASE_TOKEN" in step_env(s) for s in steps))
 
 
 def runs(job):
@@ -617,6 +746,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(self.jobs["checks"]["uses"], "./.github/workflows/ci.yml")
         self.assertEqual(self.jobs["prepare"]["needs"], "checks")
         self.assertEqual(self.jobs["build"]["needs"], "prepare")
+        build, upload = assert_native_matrix(self, self.jobs["build"])
+        self.assertEqual(upload["with"]["name"], "layout-${{ matrix.arch }}")
         self.assertEqual(sorted(self.jobs["publish"]["needs"]), ["build", "prepare"])
         # No `if`: each job runs only when every job it needs succeeded.
         for name in ("prepare", "build", "publish"):
@@ -638,7 +769,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertNotIn("if", step, step)
         names = [s["uses"].split("@")[0] if "uses" in s else re.search(r"release_image\.py (\S+)", s["run"]).group(1)
                  for s in self.jobs["publish"]["steps"][1:-1]]
-        self.assertEqual(names, ["actions/download-artifact", "check", "publish", "release-create"])
+        self.assertEqual(names, ["actions/download-artifact", "combine", "publish", "release-create"])
+        combine_step(self, self.jobs["publish"], "layout-")
 
     def test_write_job_trust(self):
         publish = self.jobs["publish"]
@@ -649,9 +781,6 @@ class ReleaseWorkflowTests(unittest.TestCase):
         with_token = [s for s in publish["steps"] if "EGRESS_RELEASE_TOKEN" in step_env(s)]
         self.assertEqual(len(with_token), 1)
         self.assertIn("release_image.py check", with_token[0]["run"])
-        build = self.jobs["build"]
-        self.assertEqual(build["permissions"], {"contents": "read"})
-        self.assertIn("./.github/actions/build-image", [s.get("uses") for s in build["steps"]])
 
     def test_credential_scope(self):
         for name, job in self.jobs.items():
