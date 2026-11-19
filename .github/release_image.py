@@ -1,7 +1,8 @@
-"""Release steps for the egress-proxy image (release.yml and ci.yml's `image` job): the tag's
-version, the label contract version, the build to an OCI image layout and its checks (the
-image labels and NFR-5: no source, tests or credential in anything published), the copy of
-exactly those bytes to the registry, and the GitHub Release.
+"""Release steps for the egress-proxy image (release.yml and ci.yml's `image` jobs): the next
+version, the label contract version, the build of one platform to an OCI image layout, the
+platforms' layouts combined into one multi-arch layout and its checks (the image labels and
+NFR-5: no source, tests or credential in anything published), the copy of exactly those
+bytes to the registry, and the tag and GitHub Release.
 
 Stdlib only: it runs in the release job that holds write permissions, which installs
 nothing. Each subcommand prints `ok <step> ...` lines, or `FAIL <step>: <detail>` on stderr
@@ -24,8 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SOURCE = "https://github.com/windroc-labs/egress-proxy"
 PLATFORMS = ("linux/amd64", "linux/arm64")
 
-INDEX_TYPES = {"application/vnd.oci.image.index.v1+json",
-               "application/vnd.docker.distribution.manifest.list.v2+json"}
+OCI_INDEX = "application/vnd.oci.image.index.v1+json"
+INDEX_TYPES = {OCI_INDEX, "application/vnd.docker.distribution.manifest.list.v2+json"}
+MANIFEST_TYPES = {"application/vnd.oci.image.manifest.v1+json",
+                  "application/vnd.docker.distribution.manifest.v2+json"}
 LAYER_MODES = {
     "application/vnd.oci.image.layer.v1.tar": "r:",
     "application/vnd.oci.image.layer.v1.tar+gzip": "r:gz",
@@ -41,7 +44,8 @@ FORBIDDEN_NAMES = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "Dockerfil
 FORBIDDEN_DIRS = {".git", ".github"}
 FORBIDDEN_ROOT_DIRS = {"src", "tests", "target"}
 TOKEN_RE = re.compile(rb"gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}")
-VERSION_RE = re.compile(r"refs/tags/v((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))")
+TAG_RE = re.compile(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)")
+FIRST_VERSION = "0.1.0"
 CONTRACT_RE = re.compile(r'^\s+windroc\.egress\.contract:\s*"?(\d+)"?\s*$', re.MULTILINE)
 # skopeo's wording when the tag (or the whole repository) does not exist.
 NOT_FOUND_RE = re.compile(r"manifest unknown|name unknown|not found", re.IGNORECASE)
@@ -115,15 +119,26 @@ class Layout:
             raise Fail("check", f"blob {digest}: digest mismatch")
         return data
 
-    def index_descriptor(self):
+    def top(self, step):
+        """The descriptors index.json names."""
         try:
-            top = json.loads((self.root / "index.json").read_text())
-        except (OSError, ValueError) as error:
-            raise Fail("check", f"cannot read {self.root}/index.json: {error}") from None
-        manifests = top.get("manifests", [])
+            return json.loads((self.root / "index.json").read_text()).get("manifests", [])
+        except (OSError, ValueError, AttributeError) as error:
+            raise Fail(step, f"cannot read {self.root}/index.json: {error}") from None
+
+    def index_descriptor(self):
+        manifests = self.top("check")
         if len(manifests) != 1 or manifests[0].get("mediaType") not in INDEX_TYPES:
             raise Fail("check", f"{self.root}/index.json must hold exactly one image index")
         return manifests[0]
+
+    def write_blob(self, data, media_type):
+        """Stores `data`; returns its descriptor."""
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        path = self.root / "blobs" / "sha256" / digest[7:]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return {"mediaType": media_type, "digest": digest, "size": len(data)}
 
 
 def platform_of(descriptor):
@@ -203,6 +218,48 @@ def check_layout(root, version, revision, contract):
     return lines
 
 
+def single_image(layout):
+    """The image manifest descriptor of a one-platform layout, with its platform from the
+    image config: buildx names the manifest in index.json, or an index of only it."""
+    manifests = layout.top("combine")
+    if len(manifests) == 1 and manifests[0].get("mediaType") in INDEX_TYPES:
+        manifests = json.loads(layout.blob(manifests[0])).get("manifests", [])
+    if len(manifests) != 1 or manifests[0].get("mediaType") not in MANIFEST_TYPES:
+        raise Fail("combine", f"{layout.root} must hold exactly one image manifest")
+    descriptor = manifests[0]
+    manifest = json.loads(layout.blob(descriptor))
+    config = json.loads(layout.blob(manifest["config"]))
+    platform = {"architecture": config.get("architecture"), "os": config.get("os")}
+    if config.get("variant"):
+        platform["variant"] = config["variant"]
+    blobs = [descriptor, manifest["config"], *manifest.get("layers", [])]
+    return {k: descriptor[k] for k in ("mediaType", "digest", "size")} | {"platform": platform}, blobs
+
+
+def combine_layouts(out, roots):
+    """Writes the new layout `out`: one index of every root's single image, in platform
+    order, holding only the blobs those images reference (each checked on read)."""
+    out = Layout(out)
+    if out.root.exists():
+        raise Fail("combine", f"{out.root} already exists")
+    images = {}
+    for root in roots:
+        layout = Layout(root)
+        descriptor, blobs = single_image(layout)
+        platform = platform_of(descriptor)
+        if platform in images:
+            raise Fail("combine", f"{platform} twice")
+        for blob in blobs:
+            data = layout.blob(blob)
+            out.write_blob(data, blob.get("mediaType"))
+        images[platform] = descriptor
+    index = {"schemaVersion": 2, "mediaType": OCI_INDEX, "manifests": [images[p] for p in sorted(images)]}
+    top = out.write_blob(json.dumps(index, sort_keys=True).encode(), OCI_INDEX)
+    (out.root / "index.json").write_text(json.dumps({"schemaVersion": 2, "manifests": [top]}))
+    (out.root / "oci-layout").write_text('{"imageLayoutVersion": "1.0.0"}')
+    return top["digest"]
+
+
 def skopeo_args(command, options, refs, authfile, insecure, insecure_flag="--tls-verify=false"):
     """A skopeo command line; `insecure_flag` is the TLS opt-out its `command` takes."""
     result = ["skopeo", command, *options]
@@ -275,11 +332,31 @@ docker pull {repo}@{digest}
 """
 
 
-def cmd_version(args):
-    match = VERSION_RE.fullmatch(args.ref)
-    if not match:
-        raise Fail("version", f"{args.ref} is not a release tag vX.Y.Z")
-    print(match.group(1))
+def git(step, *args):
+    """git's stdout; Fail on a non-zero exit."""
+    result = run(["git", *args])
+    if result.returncode != 0:
+        raise Fail(step, f"git {args[0]} exited {result.returncode}: {stderr_text(result)}")
+    return result.stdout.decode()
+
+
+def cmd_next_version(args):
+    """The patch after the highest vX.Y.Z tag, for a commit that comes after that tag's."""
+    versions = [tuple(map(int, m.groups())) for m in map(TAG_RE.fullmatch, git("version", "tag", "--list").split()) if m]
+    if not versions:
+        print(FIRST_VERSION)
+        return
+    major, minor, patch = max(versions)
+    tag = f"v{major}.{minor}.{patch}"
+    tagged = git("version", "rev-parse", "--verify", tag + "^{commit}").strip()
+    if tagged == args.commit:
+        raise Fail("version", f"{args.commit} is already released as {tag}")
+    result = run(["git", "merge-base", "--is-ancestor", tagged, args.commit])
+    if result.returncode == 1:
+        raise Fail("version", f"{tag} ({tagged}) is not an ancestor of {args.commit}")
+    if result.returncode != 0:
+        raise Fail("version", f"git merge-base exited {result.returncode}: {stderr_text(result)}")
+    print(f"{major}.{minor}.{patch + 1}")
 
 
 def cmd_contract(args):
@@ -307,6 +384,11 @@ def cmd_digest(args):
     print(Layout(args.layout).index_descriptor()["digest"])
 
 
+def cmd_combine(args):
+    digest = combine_layouts(args.out, args.layouts)
+    print(f"ok combine {args.out} {digest}")
+
+
 def cmd_check(args):
     for line in check_layout(args.layout, args.version, args.revision, args.contract):
         print(line)
@@ -316,7 +398,7 @@ def cmd_build(args):
     out = Path(args.out)
     if out.exists():
         raise Fail("build", f"{out} already exists")
-    command = ["docker", "buildx", "build", f"--platform={','.join(PLATFORMS)}",
+    command = ["docker", "buildx", "build", f"--platform={args.platform}",
                "--provenance=false", "--sbom=false"]
     command += [f"--label={k}={v}" for k, v in image_labels(args.version, args.revision, args.contract).items()]
     command += [f"--output=type=oci,dest={out},tar=false", str(REPO_ROOT)]
@@ -367,8 +449,25 @@ def cmd_release_absent(args):
     print(f"ok release {args.tag} does not exist yet")
 
 
+def create_tag(tag, revision):
+    """The tag at `revision`, made now, or already there from an earlier attempt of this run."""
+    result = run(["gh", "api", "--method", "POST", "repos/{owner}/{repo}/git/refs",
+                  "-f", f"ref=refs/tags/{tag}", "-f", f"sha={revision}"])
+    if result.returncode == 0:
+        print(f"ok tag {tag} {revision}")
+        return
+    existing = run(["gh", "api", f"repos/{{owner}}/{{repo}}/git/ref/tags/{tag}", "--jq", ".object.sha"])
+    if existing.returncode != 0:
+        raise Fail("release", f"cannot create tag {tag}: {stderr_text(result)}")
+    sha = existing.stdout.decode().strip()
+    if sha != revision:
+        raise Fail("release", f"tag {tag} exists at {sha}, want {revision}")
+    print(f"ok tag {tag} already at {revision}")
+
+
 def cmd_release_create(args):
     tag = f"v{args.version}"
+    create_tag(tag, args.revision)
     notes = release_notes(args.version, args.contract, args.digest, args.revision, args.repo)
     result = run(["gh", "release", "create", tag, "--verify-tag", "--title", tag, "--notes", notes])
     if result.returncode != 0:
@@ -380,9 +479,9 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="command", required=True)
 
-    s = sub.add_parser("version", help="print X.Y.Z of a refs/tags/vX.Y.Z ref")
-    s.add_argument("ref")
-    s.set_defaults(func=cmd_version)
+    s = sub.add_parser("next-version", help="print the version after the highest vX.Y.Z tag for the commit")
+    s.add_argument("commit")
+    s.set_defaults(func=cmd_next_version)
 
     s = sub.add_parser("contract", help="print the label contract version from compose.yaml")
     s.add_argument("--compose", default=str(REPO_ROOT / "compose.yaml"))
@@ -402,10 +501,16 @@ def parser():
         s.add_argument(flag, required=True)
     s.set_defaults(func=cmd_check)
 
-    s = sub.add_parser("build", help="build both platforms into a new OCI layout directory")
+    s = sub.add_parser("build", help="build one platform into a new OCI layout directory")
     for flag in ("--version", "--revision", "--contract", "--out"):
         s.add_argument(flag, required=True)
+    s.add_argument("--platform", required=True, choices=PLATFORMS)
     s.set_defaults(func=cmd_build)
+
+    s = sub.add_parser("combine", help="combine one-platform layouts into a new multi-arch layout")
+    s.add_argument("out")
+    s.add_argument("layouts", nargs="+")
+    s.set_defaults(func=cmd_combine)
 
     registry = argparse.ArgumentParser(add_help=False)
     registry.add_argument("--repo", required=True)
@@ -425,7 +530,7 @@ def parser():
     s.add_argument("--tag", required=True)
     s.set_defaults(func=cmd_release_absent)
 
-    s = sub.add_parser("release-create", help="create the GitHub Release for v<version>")
+    s = sub.add_parser("release-create", help="create the tag v<version> at the revision and its GitHub Release")
     for flag in ("--version", "--contract", "--digest", "--revision", "--repo"):
         s.add_argument(flag, required=True)
     s.set_defaults(func=cmd_release_create)

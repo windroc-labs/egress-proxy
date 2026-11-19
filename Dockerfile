@@ -1,7 +1,7 @@
 # The egress proxy image: one smokescreen per caller network, started and supervised by
 # the Rust entrypoint /proxy, which generates each network's policy at start from the
-# mounted local config. CI publishes it for both architectures on a version tag
-# (README.md › Release). It also carries its runtime files and installer in /egress:
+# mounted local config. CI publishes it for both architectures on each push to main that
+# changes it (README.md › Release). It also carries its runtime files and installer in /egress:
 # egress-install copies them out and runs install.sh, which writes them to ~/.egress
 # (README.md › Setup). Only start.sh in a checkout builds it, for development.
 ARG TARGETARCH
