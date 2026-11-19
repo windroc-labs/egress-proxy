@@ -40,7 +40,7 @@ a caller that pins it, never from a tag lookup.
   needed, e.g. to reinstall the same version offline.
 - Else it pulls the image by digest, never by tag. The package is private: the pull uses
   the machine's GitHub login, `gh`, whose account must be able to read the package
-  `ghcr.io/windroc/egress-proxy`, with scope `read:packages`
+  `ghcr.io/windroc-labs/egress-proxy`, with scope `read:packages`
   (`gh auth refresh -h github.com -s read:packages`). A credential helper in a throwaway
   Docker client config asks `gh` at pull time, so the token is never written to a file or
   printed, and the Docker login is left alone.
@@ -51,7 +51,7 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
    [label contract](docs/label-contract.md) (exit 10) or when it is a newer version to
    keep: healthy, of the same contract, with a higher version label, and published, i.e.
    pulled by the digest `~/.egress/state/installed` names as current (a local build, even
-   tagged `ghcr.io/windroc/egress-proxy:<higher>`, is replaced). Keeping it, it says so
+   tagged `ghcr.io/windroc-labs/egress-proxy:<higher>`, is replaced). Keeping it, it says so
    and exits 0. A newer version is never downgraded, so callers pinning an older one
    share the newest;
 2. writes the runtime files as one set under `~/.egress/state/` and switches the
@@ -69,8 +69,8 @@ It then copies the image's `/egress` out and runs its `install.sh`, which:
    Callers' connections drop once more for the rollback;
 5. records the version, digest and image as current, and the one before as previous, in
    `~/.egress/state/installed`;
-6. removes the other `ghcr.io/windroc/egress-proxy` images, so only the current and the
-   previous one stay (`docker images ghcr.io/windroc/egress-proxy`). An image a container
+6. removes the other `ghcr.io/windroc-labs/egress-proxy` images, so only the current and the
+   previous one stay (`docker images ghcr.io/windroc-labs/egress-proxy`). An image a container
    still uses stays too. A rollback leaves this to the next install.
 
 An install from source checkouts, as callers' installers made it before the image (e.g.
@@ -141,7 +141,7 @@ directory of this install, and never pulls the image: unless the target has it a
 `egress-install` fetches the target platform's image from the registry by digest on the
 caller (with the caller's `gh` login for `ghcr.io`, the token kept in memory), checks the
 digest of the index, the manifest, the config and every layer, and loads it there as
-`ghcr.io/windroc/egress-proxy:sha256-<hex of the digest>` (a loaded image has no digest
+`ghcr.io/windroc-labs/egress-proxy:sha256-<hex of the digest>` (a loaded image has no digest
 reference); the tag's image ID must then be the verified config or manifest digest. The
 caller needs `python3` for that fetch and Docker Compose 2.24.4 or later (`!override` in
 `compose.remote.yaml`). Only versions that ship `compose.remote.yaml` install remotely; an
@@ -348,7 +348,7 @@ egress-proxy-proxy`, and in a checkout where you built the entrypoint, `rm -rf g
 
 ## Release
 
-A release is the image `ghcr.io/windroc/egress-proxy:X.Y.Z` for `linux/amd64` and
+A release is the image `ghcr.io/windroc-labs/egress-proxy:X.Y.Z` for `linux/amd64` and
 `linux/arm64`, plus the GitHub Release `vX.Y.Z` that gives its index digest. Install and pin
 it by that digest, never by the tag ([Setup](#setup)).
 
